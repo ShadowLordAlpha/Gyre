@@ -1,0 +1,50 @@
+# CMake / CLion
+/build/
+/cmake-build-*/
+/out/
+CMakeUserPresets.json
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+*.ninja
+.ninja_deps
+.ninja_log
+
+# MSVC / binaries
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+*.dll
+*.idb
+*.ipdb
+*.iobj
+
+# vcpkg
+/vcpkg_installed/
+vcpkg-manifest-install.log
+
+# IDE
+.idea/
+.vs/
+.vscode/
+*.user
+
+# Local weights / Hub shards (too large for git)
+data/*.gyre
+data/*.gyre1
+data/*.onnx
+data/grok2/*.safetensors
+data/grok2/*.wpack
+data/grok-mini/
+data/hf-tok/
+
+# Keep corpus helper; fetch if missing
+# data/shakespeare.txt is tracked when present and small
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
