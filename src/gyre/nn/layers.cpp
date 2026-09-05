@@ -1,28 +1,9 @@
 #include "gyre/nn/layers.hpp"
 
 #include <cmath>
+#include <vector>
 
 namespace gyre {
-namespace {
-
-Result<Tensor> flatten_leading(const Tensor& x) {
-  if (x.rank() == 1) {
-    std::int64_t sh[2] = {1, x.shape()[0]};
-    auto c = x.clone();
-    if (!c) return c;
-    return reshape(*c, sh);
-  }
-  if (x.rank() == 2) return x.clone();
-  if (x.rank() == 3) {
-    std::int64_t sh[2] = {x.shape()[0] * x.shape()[1], x.shape()[2]};
-    auto c = x.clone();
-    if (!c) return c;
-    return reshape(*c, sh);
-  }
-  return std::unexpected(make_error(Errc::invalid_shape, "linear expects rank 1–3"));
-}
-
-}  // namespace
 
 Result<Linear> Linear::create(std::int64_t in, std::int64_t out, std::shared_ptr<Device> dev, Rng& rng,
                               float std, float residual_scale) {
@@ -45,36 +26,14 @@ Result<Linear> Linear::create(std::int64_t in, std::int64_t out, std::shared_ptr
 }
 
 Result<Tensor> Linear::forward(const Tensor& x, ForwardCtx& ctx) {
-  ctx.saved.clear();
-  auto xc = x.clone();
-  if (!xc) return xc;
-  ctx.saved.push_back(std::move(*xc));
-  auto xf = flatten_leading(x);
-  if (!xf) return xf;
-  auto y = matmul(*xf, params_[0].value);
-  if (!y) return y;
-  auto bias = params_[1].value.host_span<float>();
-  auto yp = y->host_span<float>();
-  if (!bias || !yp) return std::unexpected(make_error(Errc::not_cpu, "host"));
-  const auto out = params_[0].value.shape()[1];
-  const auto rows = y->shape()[0];
-  for (std::int64_t r = 0; r < rows; ++r)
-    for (std::int64_t j = 0; j < out; ++j)
-      (*yp)[static_cast<std::size_t>(r * out + j)] += (*bias)[static_cast<std::size_t>(j)];
-  if (x.rank() == 3) {
-    std::int64_t sh[3] = {x.shape()[0], x.shape()[1], out};
-    return reshape(*y, sh);
-  }
-  if (x.rank() == 1) {
-    std::int64_t sh[1] = {out};
-    return reshape(*y, sh);
-  }
-  return y;
+  if (ctx.train) saved_x_ = x;
+  else saved_x_.reset();
+  return linear(x, params_[0].value, params_[1].value);
 }
 
 Result<void> Linear::backward(const Tensor& d_out, ForwardCtx& ctx) {
-  if (ctx.saved.empty()) return std::unexpected(make_error(Errc::unsupported, "no saved x"));
-  const Tensor& x = ctx.saved[0];
+  if (!saved_x_) return std::unexpected(make_error(Errc::unsupported, "no saved x"));
+  const Tensor& x = *saved_x_;
   auto xf = flatten_leading(x);
   auto df = flatten_leading(d_out);
   if (!xf || !df) return std::unexpected(xf ? df.error() : xf.error());
@@ -92,19 +51,9 @@ Result<void> Linear::backward(const Tensor& d_out, ForwardCtx& ctx) {
   if (!Wt) return std::unexpected(Wt.error());
   auto dx2 = matmul(*df, *Wt);
   if (!dx2) return std::unexpected(dx2.error());
-  if (x.rank() == 3) {
-    std::int64_t sh[3] = {x.shape()[0], x.shape()[1], x.shape()[2]};
-    auto r = reshape(*dx2, sh);
-    if (!r) return std::unexpected(r.error());
-    ctx.dx = std::make_unique<Tensor>(std::move(*r));
-  } else if (x.rank() == 1) {
-    std::int64_t sh[1] = {x.shape()[0]};
-    auto r = reshape(*dx2, sh);
-    if (!r) return std::unexpected(r.error());
-    ctx.dx = std::make_unique<Tensor>(std::move(*r));
-  } else {
-    ctx.dx = std::make_unique<Tensor>(std::move(*dx2));
-  }
+  auto dx = unflatten_like(std::move(*dx2), x);
+  if (!dx) return std::unexpected(dx.error());
+  ctx.dx = std::make_unique<Tensor>(std::move(*dx));
   return {};
 }
 
@@ -126,16 +75,14 @@ Result<LayerNorm> LayerNorm::create(std::int64_t n, std::shared_ptr<Device> dev,
 }
 
 Result<Tensor> LayerNorm::forward(const Tensor& x, ForwardCtx& ctx) {
-  ctx.saved.clear();
-  auto xc = x.clone();
-  if (!xc) return xc;
-  ctx.saved.push_back(std::move(*xc));
+  if (ctx.train) saved_x_ = x;
+  else saved_x_.reset();
   return layer_norm(x, params_[0].value, params_[1].value, eps_);
 }
 
 Result<void> LayerNorm::backward(const Tensor& d_out, ForwardCtx& ctx) {
-  if (ctx.saved.empty()) return std::unexpected(make_error(Errc::unsupported, "no saved x"));
-  const Tensor& x = ctx.saved[0];
+  if (!saved_x_) return std::unexpected(make_error(Errc::unsupported, "no saved x"));
+  const Tensor& x = *saved_x_;
   auto px = x.host_span<float>();
   auto pd = d_out.host_span<float>();
   auto pw = params_[0].value.host_span<float>();
@@ -182,6 +129,45 @@ Result<void> LayerNorm::backward(const Tensor& d_out, ForwardCtx& ctx) {
     }
   }
   ctx.dx = std::make_unique<Tensor>(std::move(*dx));
+  return {};
+}
+
+Result<Embedding> Embedding::create(std::int64_t vocab, std::int64_t d, std::shared_ptr<Device> dev,
+                                   Rng& rng, float std) {
+  std::int64_t sh[2] = {vocab, d};
+  auto W = Tensor::empty(sh, DType::f32, dev);
+  if (!W) return std::unexpected(W.error());
+  auto p = W->host_span<float>();
+  if (!p) return std::unexpected(p.error());
+  for (auto& v : *p) v = rng.normal(0.f, std);
+  auto pw = make_param(std::move(*W));
+  if (!pw) return std::unexpected(pw.error());
+  std::vector<Param> ps;
+  ps.push_back(std::move(*pw));
+  return Embedding(std::move(ps));
+}
+
+Result<Tensor> Embedding::forward(const Tensor& idx, ForwardCtx& ctx) {
+  if (ctx.train) saved_idx_ = idx;
+  else saved_idx_.reset();
+  return embedding(params_[0].value, idx);
+}
+
+Result<void> Embedding::backward(const Tensor& d_out, ForwardCtx& ctx) {
+  if (!saved_idx_) return std::unexpected(make_error(Errc::unsupported, "no saved idx"));
+  auto g = params_[0].grad.host_span<float>();
+  auto i = saved_idx_->host_span<std::int32_t>();
+  auto d = d_out.host_span<float>();
+  if (!g || !i || !d) return std::unexpected(make_error(Errc::not_cpu, "host"));
+  const auto dim = params_[0].value.shape()[1];
+  const auto V = params_[0].value.shape()[0];
+  for (std::int64_t n = 0; n < saved_idx_->numel(); ++n) {
+    auto id = (*i)[static_cast<std::size_t>(n)];
+    if (id < 0 || id >= V) return std::unexpected(make_error(Errc::invalid_shape, "emb idx"));
+    for (std::int64_t c = 0; c < dim; ++c)
+      (*g)[static_cast<std::size_t>(id * dim + c)] += (*d)[static_cast<std::size_t>(n * dim + c)];
+  }
+  ctx.dx.reset();
   return {};
 }
 

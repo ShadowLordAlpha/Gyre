@@ -6,7 +6,7 @@ Human-facing docs: `README.md`, Helix embed `docs/helix.md`, index `docs/README.
 
 ## Checkpoints and train
 
-- User-facing extension is `.gyre`. Magic inside the file is `GYRE1`.
+- User-facing extension is `.gyre` (binary `GYRE1` v2: JSON document first, then aligned payloads). Twin `*.gyre.json` is the same document (inline `data` only for small models). Spec: `docs/gyre-file.md`. Magic inside the binary is `GYRE1`. v1 trailer files still load.
 - Default tokenizer is **BPE** (`--tokenizer bpe|chars|bytes|unigram`, `--vocab-size`, default 2000). Chars/bytes are BPE with **no merges**. Full write-up: `docs/tokenizer.md`.
 - Reuse: `--tok FILE.gyre.json` (document `{"gyre":"tokenizer","version":1,"tokenizer":{pretoken,model,merges|vocab|scores}}`). `gyre-cli tok train|export|import`. Hugging Face dir and SentencePiece `.model` (unigram/char only). Train without `--tok` also writes `ckpt` with extension `.gyre.json`. Frozen copy in the GYRE1 trailer. Legacy `"tokenizer":"bpe","merges":…` still loads.
 - Default recency is **ALiBi** (`--recency alibi|none`): per-head slope `2^{-8(h+1)/H}` on causal scores, **token distance only**. Checkpoints without `"recency":"alibi"` generate without ALiBi (old files stay compatible).

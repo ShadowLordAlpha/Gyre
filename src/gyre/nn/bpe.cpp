@@ -1,5 +1,7 @@
 #include "gyre/nn/bpe.hpp"
 
+#include "json_parse.hpp"
+
 #include <cstdlib>
 #include <fstream>
 #include <set>
@@ -84,17 +86,10 @@ Result<void> BpeModel::encode_span(std::string_view span, const PieceTable& piec
 }
 
 std::string BpeModel::to_json() const {
-  std::string j = "\"merges\":[";
-  for (std::size_t i = 0; i < merges_.size(); ++i) {
-    if (i) j += ',';
-    j += '[';
-    j += std::to_string(merges_[i].first);
-    j += ',';
-    j += std::to_string(merges_[i].second);
-    j += ']';
-  }
-  j += ']';
-  return j;
+  nlohmann::json j;
+  j["merges"] = nlohmann::json::array();
+  for (auto [a, b] : merges_) j["merges"].push_back({a, b});
+  return j.dump();
 }
 
 Result<void> BpeModel::write_huggingface(const std::filesystem::path& dir, const Pretokenizer& pretok,
@@ -106,12 +101,9 @@ Result<void> BpeModel::write_huggingface(const std::filesystem::path& dir, const
   auto tok_path = dir / "tokenizer.json";
   std::ofstream v(vocab_path, std::ios::binary);
   if (!v) return std::unexpected(make_error(Errc::io, "vocab.json"));
-  v << '{';
-  for (std::size_t i = 0; i < pieces.pieces.size(); ++i) {
-    if (i) v << ',';
-    v << json_escape(pieces.pieces[i]) << ':' << i;
-  }
-  v << '}';
+  nlohmann::json vocab = nlohmann::json::object();
+  for (std::size_t i = 0; i < pieces.pieces.size(); ++i) vocab[bytes_to_json_text(pieces.pieces[i])] = i;
+  v << vocab.dump();
   std::ofstream m(merges_path, std::ios::binary);
   if (!m) return std::unexpected(make_error(Errc::io, "merges.txt"));
   m << "#version: 0.2\n";
@@ -124,24 +116,25 @@ Result<void> BpeModel::write_huggingface(const std::filesystem::path& dir, const
   }
   std::ofstream t(tok_path, std::ios::binary);
   if (!t) return std::unexpected(make_error(Errc::io, "tokenizer.json"));
-  t << "{\"version\":\"1.0\",\"truncation\":null,\"padding\":null,\"added_tokens\":[],"
-       "\"normalizer\":null,\"pre_tokenizer\":{\"type\":\"";
-  t << (std::string(pretok.name()) == "bytelevel" ? "ByteLevel" : "Sequence");
-  t << "\"},\"model\":{\"type\":\"BPE\",\"dropout\":null,\"unk_token\":null,\"continuing_subword_prefix\":null,"
-       "\"end_of_word_suffix\":null,\"fuse_unk\":false,\"vocab\":{";
-  for (std::size_t i = 0; i < pieces.pieces.size(); ++i) {
-    if (i) t << ',';
-    t << json_escape(pieces.pieces[i]) << ':' << i;
+  nlohmann::json tok;
+  tok["version"] = "1.0";
+  tok["truncation"] = nullptr;
+  tok["padding"] = nullptr;
+  tok["added_tokens"] = nlohmann::json::array();
+  tok["normalizer"] = nullptr;
+  tok["pre_tokenizer"] = {{"type", std::string(pretok.name()) == "bytelevel" ? "ByteLevel" : "Sequence"}};
+  nlohmann::json model;
+  model["type"] = "BPE";
+  model["dropout"] = nullptr;
+  model["unk_token"] = nullptr;
+  model["vocab"] = vocab;
+  model["merges"] = nlohmann::json::array();
+  for (auto [a, b] : merges_) {
+    model["merges"].push_back(bytes_to_json_text(pieces.pieces[static_cast<std::size_t>(a)] + " " +
+                                                pieces.pieces[static_cast<std::size_t>(b)]));
   }
-  t << "},\"merges\":[";
-  for (std::size_t i = 0; i < merges_.size(); ++i) {
-    if (i) t << ',';
-    auto [a, b] = merges_[i];
-    std::string pair = pieces.pieces[static_cast<std::size_t>(a)] + " " +
-                       pieces.pieces[static_cast<std::size_t>(b)];
-    t << json_escape(pair);
-  }
-  t << "]}}";
+  tok["model"] = std::move(model);
+  t << tok.dump();
   return {};
 }
 
@@ -220,42 +213,19 @@ Result<std::pair<std::unique_ptr<BpeModel>, PieceTable>> BpeModel::train(
 }
 
 Result<std::vector<std::pair<std::int32_t, std::int32_t>>> BpeModel::parse_merges(std::string_view json) {
-  auto p = json.find("\"merges\"");
-  if (p == std::string_view::npos)
+  auto parsed = parse_json(json);
+  if (!parsed) {
+    parsed = parse_json(std::string("{") + std::string(json) + "}");
+  }
+  if (!parsed) return std::vector<std::pair<std::int32_t, std::int32_t>>{};
+  if (!parsed->contains("merges") || !(*parsed)["merges"].is_array()) {
     return std::vector<std::pair<std::int32_t, std::int32_t>>{};
-  p = json.find('[', p);
-  if (p == std::string_view::npos)
-    return std::unexpected(make_error(Errc::ckpt_corrupt, "merges array"));
+  }
   std::vector<std::pair<std::int32_t, std::int32_t>> m;
-  auto n = json.size();
-  std::size_t i = p + 1;
-  while (i < n) {
-    while (i < n && (json[i] == ' ' || json[i] == '\n' || json[i] == ',')) ++i;
-    if (i < n && json[i] == ']') break;
-    if (i >= n || json[i] != '[') {
-      // HF style: "a b" strings
-      if (i < n && json[i] == '"') {
-        std::string s;
-        if (!json_unescape_string(json, i, s)) break;
-        auto sp = s.find(' ');
-        if (sp != std::string::npos) {
-          // cannot resolve to ids here
-        }
-        continue;
-      }
-      break;
+  for (auto& row : (*parsed)["merges"]) {
+    if (row.is_array() && row.size() == 2 && row[0].is_number()) {
+      m.emplace_back(row[0].get<std::int32_t>(), row[1].get<std::int32_t>());
     }
-    ++i;
-    char* end = nullptr;
-    auto a = static_cast<std::int32_t>(std::strtoll(json.data() + i, &end, 10));
-    i = static_cast<std::size_t>(end - json.data());
-    while (i < n && json[i] != ',') ++i;
-    if (i < n && json[i] == ',') ++i;
-    auto b = static_cast<std::int32_t>(std::strtoll(json.data() + i, &end, 10));
-    i = static_cast<std::size_t>(end - json.data());
-    m.emplace_back(a, b);
-    while (i < n && json[i] != ']') ++i;
-    if (i < n && json[i] == ']') ++i;
   }
   return m;
 }

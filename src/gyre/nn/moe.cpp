@@ -9,24 +9,9 @@
 namespace gyre {
 namespace {
 
-Result<Tensor> as_2d(const Tensor& x) {
-  if (x.rank() == 2) return x.clone();
-  if (x.rank() == 3) {
-    std::int64_t sh[2] = {x.shape()[0] * x.shape()[1], x.shape()[2]};
-    auto c = x.clone();
-    if (!c) return c;
-    return reshape(*c, sh);
-  }
-  return std::unexpected(make_error(Errc::invalid_shape, "moe as_2d"));
-}
+Result<Tensor> as_2d(const Tensor& x) { return flatten_leading(x); }
 
-Result<Tensor> restore_like(Tensor y, const Tensor& like) {
-  if (like.rank() == 3) {
-    std::int64_t sh[3] = {like.shape()[0], like.shape()[1], y.shape()[1]};
-    return reshape(y, sh);
-  }
-  return y;
-}
+Result<Tensor> restore_like(Tensor y, const Tensor& like) { return unflatten_like(std::move(y), like); }
 
 }  // namespace
 

@@ -7,6 +7,8 @@
 
 #include <filesystem>
 #include <functional>
+#include <string>
+#include <vector>
 
 namespace gyre {
 
@@ -29,6 +31,7 @@ struct TrainConfig {
   std::filesystem::path ckpt_path;  // if set, also overwrite this file each checkpoint
   std::uint64_t seed{1};
   std::string ckpt_json;
+  std::vector<std::string> param_names;
 };
 
 inline float scheduled_lr(const TrainConfig& cfg, std::uint32_t step) {

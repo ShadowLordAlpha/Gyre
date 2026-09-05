@@ -18,8 +18,8 @@ namespace gyre {
 class Tensor {
  public:
   Tensor() = delete;
-  Tensor(const Tensor&) = delete;
-  Tensor& operator=(const Tensor&) = delete;
+  Tensor(const Tensor&) = default;
+  Tensor& operator=(const Tensor&) = default;
   Tensor(Tensor&&) noexcept = default;
   Tensor& operator=(Tensor&&) noexcept = default;
 

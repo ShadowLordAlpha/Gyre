@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gyre/checkpoint.hpp"
 #include "gyre/module.hpp"
 #include "gyre/rng.hpp"
 
@@ -79,6 +80,8 @@ class GrokLM final : public Module {
 
   Result<void> save_weights(const std::filesystem::path& dir) const;
   static Result<GrokLM> load_weights(const std::filesystem::path& dir, std::shared_ptr<Device> d);
+  Result<void> save_gyre(const std::filesystem::path& path, GyreCodec codec = GyreCodec::identity) const;
+  static Result<GrokLM> load_gyre(const std::filesystem::path& path, std::shared_ptr<Device> d);
   Result<void> set_lora(GrokLora lora);
   Result<void> save_lora(const std::filesystem::path& dir) const;
   Result<void> load_lora(const std::filesystem::path& dir, std::shared_ptr<Device> d);
@@ -97,5 +100,9 @@ class GrokLM final : public Module {
   std::vector<Param> params_;
   std::optional<GrokLora> lora_;
 };
+
+// Hugging Face / safetensors directory → `.gyre`. Tiny/mini only (create() RAM gate).
+Result<void> import_safetensors_to_gyre(const std::filesystem::path& dir, const std::filesystem::path& out,
+                                       std::shared_ptr<Device> d, GyreCodec codec = GyreCodec::identity);
 
 }  // namespace gyre

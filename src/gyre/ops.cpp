@@ -652,4 +652,119 @@ Result<void> add_(Tensor& dst, const Tensor& src) {
   return {};
 }
 
+Result<Tensor> flatten_leading(const Tensor& x) {
+  if (x.rank() == 1) {
+    std::int64_t sh[2] = {1, x.shape()[0]};
+    return reshape(x, sh);
+  }
+  if (x.rank() == 2) return x;
+  if (x.rank() == 3) {
+    std::int64_t sh[2] = {x.shape()[0] * x.shape()[1], x.shape()[2]};
+    return reshape(x, sh);
+  }
+  return std::unexpected(make_error(Errc::invalid_shape, "flatten_leading rank 1–3"));
+}
+
+Result<Tensor> unflatten_like(Tensor y, const Tensor& like) {
+  if (like.rank() == 3) {
+    std::int64_t sh[3] = {like.shape()[0], like.shape()[1], y.shape()[1]};
+    return reshape(y, sh);
+  }
+  if (like.rank() == 1) {
+    std::int64_t sh[1] = {y.shape()[1]};
+    return reshape(y, sh);
+  }
+  return y;
+}
+
+Result<Tensor> linear(const Tensor& x, const Tensor& W, const Tensor& b) {
+  auto x2 = flatten_leading(x);
+  if (!x2) return x2;
+  auto y = matmul(*x2, W);
+  if (!y) return y;
+  auto yp = y->host_span<float>();
+  auto bp = b.host_span<float>();
+  if (!yp || !bp) return std::unexpected(make_error(Errc::not_cpu, "host"));
+  const auto out = W.shape()[1];
+  const auto rows = y->shape()[0];
+  for (std::int64_t r = 0; r < rows; ++r)
+    for (std::int64_t j = 0; j < out; ++j)
+      (*yp)[static_cast<std::size_t>(r * out + j)] += (*bp)[static_cast<std::size_t>(j)];
+  return unflatten_like(std::move(*y), x);
+}
+
+Result<Tensor> gelu_backward(const Tensor& x, const Tensor& dy) {
+  auto out = Tensor::empty(x.shape(), DType::f32, x.device());
+  if (!out) return out;
+  auto px = f32c(x);
+  auto pd = f32c(dy);
+  auto po = f32(*out);
+  if (!px || !pd || !po) return std::unexpected(make_error(Errc::not_cpu, "host"));
+  constexpr float c = 0.044715f;
+  constexpr float s = 0.7978845608028654f;
+  for (std::size_t i = 0; i < px->size(); ++i) {
+    float xv = (*px)[i];
+    float u = s * (xv + c * xv * xv * xv);
+    float th = std::tanh(u);
+    float du = s * (1.f + 3.f * c * xv * xv);
+    float dgelu = 0.5f * (1.f + th) + 0.5f * xv * (1.f - th * th) * du;
+    (*po)[i] = (*pd)[i] * dgelu;
+  }
+  return out;
+}
+
+Result<Tensor> softmax_last_backward(const Tensor& softmax, const Tensor& d_out) {
+  auto out = Tensor::empty(softmax.shape(), DType::f32, softmax.device());
+  if (!out) return out;
+  auto ps = f32c(softmax);
+  auto pd = f32c(d_out);
+  auto po = f32(*out);
+  if (!ps || !pd || !po) return std::unexpected(make_error(Errc::not_cpu, "host"));
+  const auto last = softmax.shape()[softmax.rank() - 1];
+  const auto rows = softmax.numel() / last;
+  for (std::int64_t r = 0; r < rows; ++r) {
+    const float* sv = ps->data() + r * last;
+    const float* dv = pd->data() + r * last;
+    float* ov = po->data() + r * last;
+    float dot = 0;
+    for (std::int64_t i = 0; i < last; ++i) dot += sv[i] * dv[i];
+    for (std::int64_t i = 0; i < last; ++i) ov[i] = sv[i] * (dv[i] - dot);
+  }
+  return out;
+}
+
+Result<std::int32_t> sample_logit_row(std::span<const float> logits, float temperature, Rng* rng) {
+  if (logits.empty()) return std::unexpected(make_error(Errc::invalid_shape, "empty logits"));
+  const auto V = static_cast<std::int32_t>(logits.size());
+  if (temperature <= 0.f || !rng) {
+    std::int32_t next = 0;
+    float m = logits[0];
+    for (std::int32_t i = 1; i < V; ++i)
+      if (logits[static_cast<std::size_t>(i)] > m) {
+        m = logits[static_cast<std::size_t>(i)];
+        next = i;
+      }
+    return next;
+  }
+  float maxv = logits[0];
+  for (std::int32_t i = 1; i < V; ++i) maxv = std::max(maxv, logits[static_cast<std::size_t>(i)]);
+  std::vector<float> pr(static_cast<std::size_t>(V));
+  float sum = 0;
+  for (std::int32_t i = 0; i < V; ++i) {
+    pr[static_cast<std::size_t>(i)] = std::exp((logits[static_cast<std::size_t>(i)] - maxv) / temperature);
+    sum += pr[static_cast<std::size_t>(i)];
+  }
+  float u = rng->uniform01() * sum;
+  float acc = 0;
+  std::int32_t next = V - 1;
+  for (std::int32_t i = 0; i < V; ++i) {
+    acc += pr[static_cast<std::size_t>(i)];
+    if (u <= acc) {
+      next = i;
+      break;
+    }
+  }
+  return next;
+}
+
 }  // namespace gyre

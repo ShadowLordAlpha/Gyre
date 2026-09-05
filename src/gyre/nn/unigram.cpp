@@ -1,5 +1,7 @@
 #include "gyre/nn/unigram.hpp"
 
+#include "json_parse.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -73,14 +75,10 @@ Result<void> UnigramModel::encode_span(std::string_view span, const PieceTable& 
 }
 
 std::string UnigramModel::to_json() const {
-  std::string j = "\"scores\":[";
-  for (std::size_t i = 0; i < scores_.size(); ++i) {
-    if (i) j += ',';
-    j += std::to_string(scores_[i]);
-  }
-  j += "],\"byte_fallback\":";
-  j += byte_fallback_ ? "true" : "false";
-  return j;
+  nlohmann::json j;
+  j["scores"] = scores_;
+  j["byte_fallback"] = byte_fallback_;
+  return j.dump();
 }
 
 Result<void> UnigramModel::write_huggingface(const std::filesystem::path& dir,
@@ -89,14 +87,16 @@ Result<void> UnigramModel::write_huggingface(const std::filesystem::path& dir,
   std::filesystem::create_directories(dir, ec);
   std::ofstream t(dir / "tokenizer.json", std::ios::binary);
   if (!t) return std::unexpected(make_error(Errc::io, "tokenizer.json"));
-  t << "{\"version\":\"1.0\",\"pre_tokenizer\":{\"type\":\"" << pretok.name()
-    << "\"},\"model\":{\"type\":\"Unigram\",\"unk_id\":0,\"vocab\":[";
+  nlohmann::json tok;
+  tok["version"] = "1.0";
+  tok["pre_tokenizer"] = {{"type", pretok.name()}};
+  nlohmann::json vocab = nlohmann::json::array();
   for (std::size_t i = 0; i < pieces.pieces.size(); ++i) {
-    if (i) t << ',';
     float sc = i < scores_.size() ? scores_[i] : 0.f;
-    t << '[' << json_escape(pieces.pieces[i]) << ',' << sc << ']';
+    vocab.push_back({bytes_to_json_text(pieces.pieces[i]), sc});
   }
-  t << "]}}";
+  tok["model"] = {{"type", "Unigram"}, {"unk_id", 0}, {"vocab", std::move(vocab)}};
+  t << tok.dump();
   return {};
 }
 

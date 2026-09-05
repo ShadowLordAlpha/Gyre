@@ -36,7 +36,7 @@ Result<void> TrainLoop::run(Module& model, Dataset& data, const TrainConfig& cfg
       log(LogLevel::info, "step loss logged");
     }
     if (cfg.ckpt_every && step % cfg.ckpt_every == 0) {
-      CheckpointMeta meta{cfg.seed, step, cfg.ckpt_json};
+      CheckpointMeta meta{cfg.seed, step, cfg.ckpt_json, cfg.param_names};
       if (!cfg.ckpt_dir.empty()) {
         auto p = cfg.ckpt_dir / ("step-" + std::to_string(step) + ".gyre");
         auto s = save_gyre1(p, model.parameters(), &*opt, meta);

@@ -1,7 +1,11 @@
 #pragma once
 
-#include "gyre/nn/layers.hpp"
+#include "gyre/nn/attention.hpp"
 #include "gyre/nn/tokenize.hpp"
+
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace gyre {
 
@@ -12,7 +16,7 @@ struct CharLMConfig {
   std::int64_t n_head{4};
   std::int64_t d_model{64};
   std::int64_t d_ff{256};
-  bool recency_alibi{true};  // token-distance bias on attention (not wall-clock)
+  bool recency_alibi{true};
 
   static CharLMConfig tiny() {
     CharLMConfig c;
@@ -34,7 +38,6 @@ struct CharLMConfig {
     return c;
   }
 
-  // TinyGPT-style: byte vocab, CPU-realistic (~3M weights), not a 10M gate.
   static CharLMConfig tinygpt() {
     CharLMConfig c;
     c.vocab = 256;
@@ -46,7 +49,6 @@ struct CharLMConfig {
     return c;
   }
 
-  // nanoGPT shakespeare-char scale (~10.7M at V≈65, T=256, 6×384).
   static CharLMConfig nanogpt() {
     CharLMConfig c;
     c.block_size = 256;
@@ -58,13 +60,35 @@ struct CharLMConfig {
   }
 };
 
+class DecoderBlock final : public Module {
+ public:
+  static Result<DecoderBlock> create(const CharLMConfig& c, std::shared_ptr<Device> d, Rng& rng,
+                                     float resid_scale);
+  Result<Tensor> forward(const Tensor& x, ForwardCtx& ctx) override;
+  Result<void> backward(const Tensor& d_out, ForwardCtx& ctx) override;
+  std::span<Param> parameters() noexcept override { return flat_; }
+
+  DecoderBlock(DecoderBlock&&) noexcept = default;
+  DecoderBlock& operator=(DecoderBlock&&) noexcept = default;
+
+ private:
+  DecoderBlock(LayerNorm ln1, CausalSelfAttention attn, LayerNorm ln2, Linear fc1, Linear fc2);
+  void rebind();
+
+  LayerNorm ln1_;
+  CausalSelfAttention attn_;
+  LayerNorm ln2_;
+  Linear fc1_, fc2_;
+  std::vector<Param> flat_;
+  std::optional<Tensor> saved_x_, saved_h1_, saved_fc1_;
+};
+
 class CharLM final : public Module {
  public:
   static Result<CharLM> create(CharLMConfig c, std::shared_ptr<Device> d, Rng& rng);
   Result<Tensor> forward(const Tensor& idx, ForwardCtx& ctx) override;
   Result<void> backward(const Tensor& d_out, ForwardCtx& ctx) override;
   std::span<Param> parameters() noexcept override { return params_; }
-  // temperature <= 0: greedy argmax. temperature > 0: sample softmax(logits/T); rng required.
   Result<std::vector<std::int32_t>> generate(std::vector<std::int32_t> prefix, int max_new,
                                              std::shared_ptr<Device> d, Rng* rng = nullptr,
                                              float temperature = 0.f);
@@ -75,12 +99,21 @@ class CharLM final : public Module {
   std::int64_t vocab() const { return cfg_.vocab; }
   std::int64_t block_size() const { return cfg_.block_size; }
   const CharLMConfig& config() const { return cfg_; }
+  std::vector<std::string> param_names() const;
 
  private:
-  explicit CharLM(CharLMConfig c) : cfg_(c) {}
+  CharLM(CharLMConfig c, Embedding wte, Embedding wpe, std::vector<DecoderBlock> blocks, LayerNorm ln_f,
+         Linear lm_head);
+  void rebind();
+
   CharLMConfig cfg_{};
-  std::vector<Param> params_;  // wte, wpe, then per layer, then ln_f, lm_head
-  std::int64_t n_head_{4};
+  Embedding wte_;
+  Embedding wpe_;
+  std::vector<DecoderBlock> blocks_;
+  LayerNorm ln_f_;
+  Linear lm_head_;
+  std::vector<Param> params_;
+  std::optional<Tensor> saved_idx_;
 };
 
 }  // namespace gyre

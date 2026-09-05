@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace gyre {
@@ -24,6 +25,7 @@ class Linear final : public Module {
  private:
   Linear(std::vector<Param> p) : params_(std::move(p)) {}
   std::vector<Param> params_;  // W [in,out], b [out]
+  std::optional<Tensor> saved_x_;
 };
 
 class LayerNorm final : public Module {
@@ -40,6 +42,24 @@ class LayerNorm final : public Module {
   LayerNorm(std::vector<Param> p, float eps) : params_(std::move(p)), eps_(eps) {}
   std::vector<Param> params_;
   float eps_{1e-5f};
+  std::optional<Tensor> saved_x_;
+};
+
+class Embedding final : public Module {
+ public:
+  static Result<Embedding> create(std::int64_t vocab, std::int64_t d, std::shared_ptr<Device> dev,
+                                  Rng& rng, float std = 0.02f);
+  Result<Tensor> forward(const Tensor& idx, ForwardCtx& ctx) override;
+  Result<void> backward(const Tensor& d_out, ForwardCtx& ctx) override;
+  std::span<Param> parameters() noexcept override { return params_; }
+
+  Embedding(Embedding&&) noexcept = default;
+  Embedding& operator=(Embedding&&) noexcept = default;
+
+ private:
+  explicit Embedding(std::vector<Param> p) : params_(std::move(p)) {}
+  std::vector<Param> params_;
+  std::optional<Tensor> saved_idx_;
 };
 
 }  // namespace gyre

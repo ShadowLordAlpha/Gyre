@@ -11,6 +11,25 @@
 
 #include <gtest/gtest.h>
 
+TEST(GrokIO, GyreSaveLoadGenerateMatches) {
+  auto d = gyre::Device::cpu();
+  gyre::Rng rng(1);
+  auto a = gyre::GrokLM::create(gyre::GrokConfig::mini(), *d, rng);
+  ASSERT_TRUE(a);
+  auto dir = std::filesystem::temp_directory_path() / "gyre_grok_gyre";
+  std::filesystem::create_directories(dir);
+  auto path = dir / "mini.gyre";
+  auto s = a->save_gyre(path);
+  ASSERT_TRUE(s) << s.error().message;
+  auto b = gyre::GrokLM::load_gyre(path, *d);
+  ASSERT_TRUE(b) << b.error().message;
+  std::vector<std::int32_t> prefix{1, 2};
+  auto ga = a->generate(prefix, 8, *d);
+  auto gb = b->generate(prefix, 8, *d);
+  ASSERT_TRUE(ga && gb);
+  EXPECT_EQ(*ga, *gb);
+}
+
 TEST(GrokIO, SaveLoadGenerateMatches) {
   auto d = gyre::Device::cpu();
   gyre::Rng rng(3);

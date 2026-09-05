@@ -87,7 +87,7 @@ gyre-cli tok train|export|import|encode ...
 gyre-cli grok info|inspect|compress-probe|pack|save|gen ...
 ```
 
-Checkpoints use extension **`.gyre`**; magic inside is **`GYRE1`**. Default tokenizer is **BPE** (vocab 2000). Chars/bytes are BPE with **no merges**. Default recency is **ALiBi** (token distance only). Train **holdout** default `0.1` (last raw-byte fraction unused for BPE/LM). Fair LM scores: **nats/char or BPC**, not nats/token across tokenizers.
+Checkpoints use extension **`.gyre`** (binary `GYRE1` v2: JSON document first, then aligned weights). Small models also write a readable **`.gyre.json`** twin of the same document. Spec: [docs/gyre-file.md](docs/gyre-file.md). Default tokenizer is **BPE** (vocab 2000). Chars/bytes are BPE with **no merges**. Default recency is **ALiBi** (token distance only). Train **holdout** default `0.1` (last raw-byte fraction unused for BPE/LM). Fair LM scores: **nats/char or BPC**, not nats/token across tokenizers.
 
 Presets:
 

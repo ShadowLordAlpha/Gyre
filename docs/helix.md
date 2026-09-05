@@ -58,7 +58,7 @@ struct Action {
 };
 
 struct StepResult {
-  Tensor observation;  // CPU, f32, contiguous; Tensor is move-only
+  Tensor observation;  // CPU, f32, contiguous; copy shares Storage (view)
   float reward{0};
   bool done{false};
 };

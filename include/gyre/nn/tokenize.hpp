@@ -98,9 +98,4 @@ std::unique_ptr<Pretokenizer> make_metaspace_pretok(bool dummy_prefix = true);
 
 Result<std::unique_ptr<Pretokenizer>> pretok_from_name(std::string_view name);
 
-// JSON helpers used by models.
-std::string json_escape(std::string_view s);
-bool json_unescape_string(std::string_view in, std::size_t& i, std::string& out);
-std::string_view json_object_field(std::string_view json, std::string_view key);
-
 }  // namespace gyre

@@ -72,6 +72,8 @@ Versioned nested document (not a flat `"tokenizer":"bpe"` string):
 | `tokenizer.scores` | Unigram log scores, parallel to `vocab` |
 | `tokenizer.byte_fallback` | Unigram: if true, 1-byte fallback when Viterbi fails |
 
+A full model `.gyre` / `.gyre.json` nests this object under `"tokenizer"` (see [gyre-file.md](gyre-file.md)). Standalone tokenizer files keep `"gyre":"tokenizer"`.
+
 GYRE1 checkpoint trailers embed the same keys next to arch fields:
 
 ```json

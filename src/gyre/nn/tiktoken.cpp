@@ -1,5 +1,7 @@
 #include "gyre/nn/tiktoken.hpp"
 
+#include "json_parse.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <limits>
@@ -252,39 +254,6 @@ class TiktokenV1Pretok final : public Pretokenizer {
   std::vector<std::string> specials_;
 };
 
-void skip_ws(std::string_view j, std::size_t& i) {
-  while (i < j.size() && std::isspace(static_cast<unsigned char>(j[i]))) ++i;
-}
-
-bool parse_int_field(std::string_view obj, std::string_view key, std::int64_t& out) {
-  auto v = json_object_field(obj, key);
-  if (v.empty()) return false;
-  char* end = nullptr;
-  out = std::strtoll(v.data(), &end, 10);
-  return end != v.data();
-}
-
-Result<void> parse_bytes_array(std::string_view arr, std::string& bytes) {
-  bytes.clear();
-  std::size_t i = 0;
-  while (i < arr.size() && arr[i] != '[') ++i;
-  if (i >= arr.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "bytes"));
-  ++i;
-  while (i < arr.size()) {
-    skip_ws(arr, i);
-    if (i < arr.size() && arr[i] == ']') break;
-    char* end = nullptr;
-    long v = std::strtol(arr.data() + i, &end, 10);
-    if (end == arr.data() + i) break;
-    if (v < 0 || v > 255) return std::unexpected(make_error(Errc::ckpt_corrupt, "byte"));
-    bytes.push_back(static_cast<char>(static_cast<unsigned char>(v)));
-    i = static_cast<std::size_t>(end - arr.data());
-    skip_ws(arr, i);
-    if (i < arr.size() && arr[i] == ',') ++i;
-  }
-  return {};
-}
-
 }  // namespace
 
 std::unique_ptr<Pretokenizer> make_tiktoken_v1_pretok(std::vector<std::string> specials) {
@@ -349,7 +318,11 @@ Result<void> TiktokenModel::encode_span(std::string_view span, const PieceTable&
   return {};
 }
 
-std::string TiktokenModel::to_json() const { return "\"ranks\":null"; }
+std::string TiktokenModel::to_json() const {
+  nlohmann::json j;
+  j["ranks"] = nullptr;
+  return j.dump();
+}
 
 Result<void> TiktokenModel::write_huggingface(const std::filesystem::path&, const Pretokenizer&,
                                               const PieceTable&) const {
@@ -357,52 +330,36 @@ Result<void> TiktokenModel::write_huggingface(const std::filesystem::path&, cons
 }
 
 Result<std::unique_ptr<Tokenizer>> load_tiktoken_json(std::string_view json) {
-  if (!is_tiktoken_tok_json(json)) {
+  auto parsed = parse_json(json);
+  if (!parsed) return std::unexpected(parsed.error());
+  auto& j = *parsed;
+  if (!j.contains("regular_tokens") || !j.contains("word_split")) {
     return std::unexpected(make_error(Errc::ckpt_corrupt, "not tiktoken tok.json"));
   }
-  auto ws = json_object_field(json, "word_split");
-  std::string wss(ws.begin(), ws.end());
-  if (wss.find("V1") == std::string::npos) {
+  auto ws = j["word_split"].dump();
+  if (ws.find("V1") == std::string::npos) {
     return std::unexpected(make_error(Errc::unsupported, "word_split"));
   }
-  std::int64_t vocab = 0;
-  parse_int_field(json, "vocab_size", vocab);
-
+  std::int64_t vocab = j.value("vocab_size", std::int64_t{0});
   PieceTable table;
   if (vocab > 0) table.pieces.assign(static_cast<std::size_t>(vocab), {});
   std::unordered_map<std::string, std::int32_t> ranks;
   std::vector<std::string> specials;
 
-  auto parse_token_list = [&](std::string_view arr, bool special) -> Result<void> {
-    std::size_t i = 0;
-    while (i < arr.size() && arr[i] != '[') ++i;
-    if (i >= arr.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "token list"));
-    ++i;
-    while (i < arr.size()) {
-      skip_ws(arr, i);
-      if (i < arr.size() && arr[i] == ']') break;
-      if (i >= arr.size() || arr[i] != '{') break;
-      std::size_t start = i;
-      int depth = 0;
-      for (; i < arr.size(); ++i) {
-        if (arr[i] == '{') ++depth;
-        else if (arr[i] == '}') {
-          --depth;
-          if (depth == 0) {
-            ++i;
-            break;
-          }
-        }
+  auto parse_token_list = [&](const nlohmann::json& arr, bool special) -> Result<void> {
+    if (!arr.is_array()) return std::unexpected(make_error(Errc::ckpt_corrupt, "token list"));
+    for (auto& obj : arr) {
+      if (!obj.is_object() || !obj.contains("bytes") || !obj["bytes"].is_array()) {
+        return std::unexpected(make_error(Errc::ckpt_corrupt, "token"));
       }
-      auto obj = arr.substr(start, i - start);
-      auto bytesv = json_object_field(obj, "bytes");
       std::string bytes;
-      auto pb = parse_bytes_array(bytesv, bytes);
-      if (!pb) return pb;
-      std::int64_t tok = -1;
-      if (!parse_int_field(obj, "token", tok) || tok < 0) {
-        return std::unexpected(make_error(Errc::ckpt_corrupt, "token id"));
+      for (auto& b : obj["bytes"]) {
+        auto v = b.get<int>();
+        if (v < 0 || v > 255) return std::unexpected(make_error(Errc::ckpt_corrupt, "byte"));
+        bytes.push_back(static_cast<char>(static_cast<unsigned char>(v)));
       }
+      auto tok = obj.value("token", std::int64_t{-1});
+      if (tok < 0) return std::unexpected(make_error(Errc::ckpt_corrupt, "token id"));
       auto id = static_cast<std::int32_t>(tok);
       if (static_cast<std::size_t>(id) >= table.pieces.size()) {
         table.pieces.resize(static_cast<std::size_t>(id) + 1);
@@ -410,17 +367,13 @@ Result<std::unique_ptr<Tokenizer>> load_tiktoken_json(std::string_view json) {
       table.pieces[static_cast<std::size_t>(id)] = bytes;
       if (special) specials.push_back(bytes);
       else ranks.emplace(bytes, id);
-      skip_ws(arr, i);
-      if (i < arr.size() && arr[i] == ',') ++i;
     }
     return {};
   };
 
-  auto rt = json_object_field(json, "regular_tokens");
-  auto st = json_object_field(json, "special_tokens");
-  auto pr = parse_token_list(rt, false);
+  auto pr = parse_token_list(j["regular_tokens"], false);
   if (!pr) return std::unexpected(pr.error());
-  auto ps = parse_token_list(st, true);
+  auto ps = parse_token_list(j["special_tokens"], true);
   if (!ps) return std::unexpected(ps.error());
 
   if (vocab <= 0) vocab = static_cast<std::int64_t>(table.pieces.size());

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "gyre/ga/population.hpp"
+#include "gyre/io/codec.hpp"
+#include "gyre/nn/grok.hpp"
 #include "gyre/nn/tokenize.hpp"
 #include "gyre/nn/transformer.hpp"
 #include "gyre/train/loop.hpp"
@@ -78,5 +80,30 @@ Result<void> run_tok_train(const CharLMOpts& opts, const std::filesystem::path& 
 Result<void> run_tok_export_hf(const std::filesystem::path& tok, const std::filesystem::path& hf_dir,
                                LogFn log);
 Result<void> run_tok_import(const CharLMOpts& opts, const std::filesystem::path& out, LogFn log);
+
+struct GrokCliOpts {
+  std::filesystem::path config{"data/grok2/config.json"};
+  std::filesystem::path weights{"data/grok2"};
+  std::filesystem::path out;
+  std::string file_substr;
+  std::string preset{"mini"};
+  std::string prompt{"To be"};
+  int max_new{32};
+  std::filesystem::path tok;
+  std::filesystem::path lora;
+  std::uint64_t pack_max{2ull << 20};
+  int max_tensors{32};
+  std::uint64_t chunk_bytes{1ull << 20};
+  std::string codec{"identity"};  // identity | alp | zfp
+};
+
+Result<void> run_grok_info(const GrokCliOpts& o, LogFn log);
+Result<void> run_grok_inspect(const GrokCliOpts& o, LogFn log);
+Result<void> run_grok_compress_probe(const GrokCliOpts& o, LogFn log);
+Result<void> run_grok_pack(const GrokCliOpts& o, LogFn log);
+Result<void> run_grok_save(const GrokCliOpts& o, LogFn log);
+Result<void> run_grok_gen(const GrokCliOpts& o, LogFn log);
+Result<void> run_grok_import(const GrokCliOpts& o, LogFn log);
+Result<void> run_ckpt_probe(const std::filesystem::path& ckpt, int max_tensors, LogFn log);
 
 }  // namespace gyre::app

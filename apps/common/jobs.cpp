@@ -2,11 +2,16 @@
 
 #include "gyre/checkpoint.hpp"
 #include "gyre/data.hpp"
+#include "json_parse.hpp"
 #include "gyre/export/onnx.hpp"
+#include "gyre/io/compress_probe.hpp"
+#include "gyre/io/safetensors.hpp"
+#include "gyre/io/wpack.hpp"
 #include "gyre/nn/tokenize.hpp"
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <cstring>
 #include <memory>
@@ -94,18 +99,43 @@ Result<void> run_onemax(const GaOpts& opts, LogFn log) {
   return {};
 }
 
-static std::string sidecar_json(const CharLMOpts& o, std::int64_t vocab, const Tokenizer& tok) {
-  std::ostringstream ss;
-  ss << "{\"arch\":\"char-lm\",\"preset\":\"" << o.preset << "\""
-     << ",\"n_layer\":" << o.n_layer << ",\"n_head\":" << o.n_head
-     << ",\"d_model\":" << o.d_model << ",\"d_ff\":" << o.d_ff
-     << ",\"block_size\":" << o.block << ",\"vocab_size\":" << vocab
-     << ",\"holdout\":" << o.holdout
-     << ",\"recency\":\"" << (o.recency_alibi ? "alibi" : "none") << "\",";
-  auto tj = tok.to_json();
-  if (tj.size() >= 2 && tj.front() == '{') ss << tj.substr(1);
-  else ss << "\"gyre\":\"tokenizer\",\"version\":1,\"tokenizer\":{}}}";
-  return ss.str();
+static GyreDoc make_charlm_doc(const CharLMOpts& o, std::int64_t vocab, const Tokenizer& tok) {
+  nlohmann::json cfg;
+  cfg["preset"] = o.preset;
+  cfg["n_layer"] = o.n_layer;
+  cfg["n_head"] = o.n_head;
+  cfg["d_model"] = o.d_model;
+  cfg["d_ff"] = o.d_ff;
+  cfg["block_size"] = o.block;
+  cfg["vocab_size"] = vocab;
+  cfg["holdout"] = o.holdout;
+  cfg["recency"] = o.recency_alibi ? "alibi" : "none";
+  GyreDoc d;
+  d.arch = "char-lm";
+  d.config_json = cfg.dump();
+  if (auto tj = parse_json(tok.to_json()); tj && tj->contains("tokenizer")) {
+    d.tokenizer_json = (*tj)["tokenizer"].dump();
+  }
+  return d;
+}
+
+static CharLMConfig charlm_cfg_from_doc(const GyreDoc& d, const CharLMOpts& opts, std::int64_t vocab) {
+  CharLMConfig cfg;
+  cfg.vocab = vocab;
+  cfg.block_size = opts.block;
+  cfg.n_layer = opts.n_layer;
+  cfg.n_head = opts.n_head;
+  cfg.d_model = opts.d_model;
+  cfg.d_ff = opts.d_ff;
+  cfg.recency_alibi = d.recency_alibi();
+  if (auto c = parse_json(d.config_json); c) {
+    cfg.block_size = c->value("block_size", cfg.block_size);
+    cfg.n_layer = c->value("n_layer", cfg.n_layer);
+    cfg.n_head = c->value("n_head", cfg.n_head);
+    cfg.d_model = c->value("d_model", cfg.d_model);
+    cfg.d_ff = c->value("d_ff", cfg.d_ff);
+  }
+  return cfg;
 }
 
 static Result<std::unique_ptr<Tokenizer>> load_existing_tok(const CharLMOpts& opts) {
@@ -190,7 +220,8 @@ Result<std::string> run_charlm_train(const CharLMOpts& opts, LogFn log) {
         std::to_string(cfg.vocab) + " T=" + std::to_string(opts.block) + " L=" + std::to_string(opts.n_layer) +
         " d=" + std::to_string(opts.d_model) + (cfg.recency_alibi ? " recency=alibi" : " recency=none"));
 
-  auto meta_json = sidecar_json(opts, cfg.vocab, **tok);
+  auto doc = make_charlm_doc(opts, cfg.vocab, **tok);
+  auto meta_json = doc.to_json();
   TrainConfig tc;
   tc.steps = opts.steps;
   tc.batch = opts.batch;
@@ -201,6 +232,7 @@ Result<std::string> run_charlm_train(const CharLMOpts& opts, LogFn log) {
   tc.log_every = opts.log_every;
   tc.ckpt_every = opts.ckpt_every;
   tc.ckpt_json = meta_json;
+  tc.param_names = model->param_names();
   if (!opts.ckpt.empty()) {
     auto dir = opts.ckpt.parent_path();
     std::filesystem::create_directories(dir.empty() ? "." : dir);
@@ -223,14 +255,17 @@ Result<std::string> run_charlm_train(const CharLMOpts& opts, LogFn log) {
   if (!r) return std::unexpected(r.error());
 
   if (!opts.ckpt.empty()) {
-    CheckpointMeta meta{1, opts.steps, meta_json};
+    CheckpointMeta meta{1, opts.steps, meta_json, model->param_names()};
     auto s = save_gyre1(opts.ckpt, model->parameters(), nullptr, meta);
     if (!s) return std::unexpected(s.error());
     if (log) log("saved " + opts.ckpt.string());
-    auto tok_path = opts.ckpt;
-    tok_path.replace_extension(".gyre.json");
-    auto ts = (*tok)->save(tok_path);
-    if (ts && log) log("saved " + tok_path.string());
+    auto json_path = opts.ckpt;
+    json_path.replace_extension(".gyre.json");
+    std::uint64_t nbytes = 0;
+    for (auto& p : model->parameters()) nbytes += static_cast<std::uint64_t>(p.value.nbytes());
+    auto js = save_gyre_json(json_path, model->parameters(), nullptr, doc, model->param_names(),
+                             nbytes <= kGyreJsonDataLimit);
+    if (js && log) log("saved " + json_path.string());
   }
 
   std::vector<std::int32_t> prefix = {ids->front()};
@@ -248,10 +283,10 @@ Result<std::string> run_charlm_generate(const CharLMOpts& opts_in, std::string p
   apply_charlm_preset(opts);
   auto dev = Device::cpu();
   if (!dev) return std::unexpected(dev.error());
-  auto peek = peek_gyre1(opts.ckpt);
+  auto peek = peek_gyre(opts.ckpt);
   if (!peek) return std::unexpected(peek.error());
   std::unique_ptr<Tokenizer> tok;
-  if (auto t = Tokenizer::from_json(peek->json); t) {
+  if (auto t = Tokenizer::from_json(peek->to_json()); t) {
     tok = std::move(*t);
   } else if (!opts.tok.empty() || !opts.hf_dir.empty() || !opts.sp_model.empty()) {
     auto t2 = load_existing_tok(opts);
@@ -263,14 +298,7 @@ Result<std::string> run_charlm_generate(const CharLMOpts& opts_in, std::string p
     if (!t) return std::unexpected(t.error());
     tok = std::move(*t);
   }
-  CharLMConfig cfg;
-  cfg.vocab = tok->vocab_size();
-  cfg.block_size = opts.block;
-  cfg.n_layer = opts.n_layer;
-  cfg.n_head = opts.n_head;
-  cfg.d_model = opts.d_model;
-  cfg.d_ff = opts.d_ff;
-  cfg.recency_alibi = peek->json.find("\"recency\":\"alibi\"") != std::string::npos;
+  auto cfg = charlm_cfg_from_doc(*peek, opts, tok->vocab_size());
   Rng rng(1);
   auto model = CharLM::create(cfg, *dev, rng);
   if (!model) return std::unexpected(model.error());
@@ -333,16 +361,14 @@ Result<EvalReport> run_charlm_eval(const CharLMOpts& opts_in, double split, LogF
   apply_charlm_preset(opts);
   auto dev = Device::cpu();
   if (!dev) return std::unexpected(dev.error());
-  auto peek = peek_gyre1(opts.ckpt);
+  auto peek = peek_gyre(opts.ckpt);
   if (!peek) return std::unexpected(peek.error());
   if (split <= 0.0 || split >= 1.0) {
-    auto p = peek->json.find("\"holdout\":");
-    if (p != std::string::npos) split = std::strtod(peek->json.c_str() + p + 10, nullptr);
-    else if (opts.holdout > 0.0 && opts.holdout < 1.0) split = opts.holdout;
-    else split = 0.1;
+    split = peek->holdout();
+    if (split <= 0.0 || split >= 1.0) split = 0.1;
   }
   std::unique_ptr<Tokenizer> tok;
-  if (auto t = Tokenizer::from_json(peek->json); t) {
+  if (auto t = Tokenizer::from_json(peek->to_json()); t) {
     tok = std::move(*t);
   } else {
     auto text0 = load_text(opts.data);
@@ -350,20 +376,7 @@ Result<EvalReport> run_charlm_eval(const CharLMOpts& opts_in, double split, LogF
     if (!t2) return std::unexpected(t2.error());
     tok = std::move(*t2);
   }
-  auto json_i64 = [&](const char* key, std::int64_t fb) {
-    auto n = std::string("\"") + key + "\":";
-    auto p = peek->json.find(n);
-    if (p == std::string::npos) return fb;
-    return static_cast<std::int64_t>(std::strtoll(peek->json.c_str() + p + n.size(), nullptr, 10));
-  };
-  CharLMConfig cfg;
-  cfg.vocab = tok->vocab_size();
-  cfg.block_size = json_i64("block_size", opts.block);
-  cfg.n_layer = json_i64("n_layer", opts.n_layer);
-  cfg.n_head = json_i64("n_head", opts.n_head);
-  cfg.d_model = json_i64("d_model", opts.d_model);
-  cfg.d_ff = json_i64("d_ff", opts.d_ff);
-  cfg.recency_alibi = peek->json.find("\"recency\":\"alibi\"") != std::string::npos;
+  auto cfg = charlm_cfg_from_doc(*peek, opts, tok->vocab_size());
   Rng rng(1);
   auto model = CharLM::create(cfg, *dev, rng);
   if (!model) return std::unexpected(model.error());
@@ -473,6 +486,152 @@ Result<void> run_tok_import(const CharLMOpts& opts, const std::filesystem::path&
   auto s = (*t)->save(path);
   if (!s) return s;
   if (log) log("imported vocab=" + std::to_string((*t)->vocab_size()) + " -> " + path.string());
+  return {};
+}
+
+Result<void> run_grok_info(const GrokCliOpts& o, LogFn log) {
+  auto c = GrokConfig::from_file(o.config);
+  if (!c) {
+    c = GrokConfig::full();
+    if (log) log("(no file " + o.config.string() + ", using built-in full())");
+  }
+  if (log) {
+    log(c->to_string());
+    log(std::string("create_ok=") + (c->fits_in_ram_create() ? "yes" : "no (tiny only until bind)"));
+  }
+  return {};
+}
+
+Result<void> run_grok_inspect(const GrokCliOpts& o, LogFn log) {
+  auto wdir = o.weights.empty() ? std::filesystem::path("data/grok2") : o.weights;
+  if (!std::filesystem::exists(wdir)) return std::unexpected(make_error(Errc::io, "missing " + wdir.string()));
+  for (auto& ent : std::filesystem::directory_iterator(wdir)) {
+    if (!ent.is_regular_file() || ent.path().extension() != ".safetensors") continue;
+    auto f = safetensors_open(ent.path());
+    if (!f) {
+      if (log) log(ent.path().filename().string() + ": " + f.error().message);
+      continue;
+    }
+    if (log) log(ent.path().filename().string() + " tensors=" + std::to_string(f->tensors.size()));
+  }
+  return {};
+}
+
+Result<void> run_grok_compress_probe(const GrokCliOpts& o, LogFn log) {
+  auto wdir = o.weights.empty() ? std::filesystem::path("data/grok2") : o.weights;
+  CompressProbeOpts po;
+  po.file_substr = o.file_substr;
+  po.max_tensors = o.max_tensors;
+  po.chunk_bytes = o.chunk_bytes;
+  auto rows = compress_probe_dir(wdir, po);
+  if (!rows) return std::unexpected(rows.error());
+  auto js = compress_probe_json(*rows);
+  if (!o.out.empty()) {
+    std::ofstream f(o.out, std::ios::binary);
+    f << js;
+    if (log) log("wrote " + o.out.string() + " rows=" + std::to_string(rows->size()));
+  } else if (log) {
+    log(js);
+  }
+  return {};
+}
+
+Result<void> run_grok_pack(const GrokCliOpts& o, LogFn log) {
+  auto wdir = o.weights.empty() ? std::filesystem::path("data/grok2") : o.weights;
+  auto out = o.out.empty() ? std::filesystem::path("data/grok2/norm.gyre.wpack") : o.out;
+  WpackFile all;
+  all.source = wdir.string();
+  for (auto& ent : std::filesystem::directory_iterator(wdir)) {
+    if (!ent.is_regular_file() || ent.path().extension() != ".safetensors") continue;
+    auto fn = ent.path().filename().string();
+    if (!o.file_substr.empty() && fn.find(o.file_substr) == std::string::npos) continue;
+    auto st = safetensors_open(ent.path());
+    if (!st) return std::unexpected(st.error());
+    auto part = wpack_from_safetensors(*st, o.pack_max);
+    if (!part) return std::unexpected(part.error());
+    for (auto& t : part->tensors) all.tensors.push_back(std::move(t));
+  }
+  auto s = wpack_save(out, all);
+  if (!s) return s;
+  if (log) log("packed " + std::to_string(all.tensors.size()) + " tensors -> " + out.string());
+  return {};
+}
+
+Result<void> run_grok_save(const GrokCliOpts& o, LogFn log) {
+  auto out = o.out.empty() ? std::filesystem::path("data/grok-mini.gyre") : o.out;
+  auto c = o.preset == "tiny" ? GrokConfig::tiny() : GrokConfig::mini();
+  auto d = Device::cpu();
+  if (!d) return std::unexpected(d.error());
+  Rng rng(1);
+  auto m = GrokLM::create(c, *d, rng);
+  if (!m) return std::unexpected(m.error());
+  auto codec = gyre_codec_from_name(o.codec);
+  auto s = m->save_gyre(out, codec);
+  if (!s) return s;
+  if (log) log("saved " + c.to_string() + " -> " + out.string() + " codec=" + gyre_codec_name(codec));
+  return {};
+}
+
+Result<void> run_grok_gen(const GrokCliOpts& o, LogFn log) {
+  auto wdir = o.weights.empty() ? (o.out.empty() ? std::filesystem::path("data/grok-mini.gyre") : o.out)
+                                : o.weights;
+  auto d = Device::cpu();
+  if (!d) return std::unexpected(d.error());
+  auto m = GrokLM::load_weights(wdir, *d);
+  if (!m) return std::unexpected(m.error());
+  if (!o.lora.empty()) {
+    auto lr = m->load_lora(o.lora, *d);
+    if (!lr) return lr;
+  }
+  std::vector<std::int32_t> ids;
+  if (!o.tok.empty()) {
+    auto t = Tokenizer::load(o.tok);
+    if (!t) return std::unexpected(t.error());
+    auto e = (*t)->encode(o.prompt);
+    if (!e) return std::unexpected(e.error());
+    auto g = m->generate(*e, o.max_new, *d, nullptr, 0.f);
+    if (!g) return std::unexpected(g.error());
+    if (log) log((*t)->decode(*g));
+    return {};
+  }
+  ids = {1, 2};
+  auto g = m->generate(ids, o.max_new, *d, nullptr, 0.f);
+  if (!g) return std::unexpected(g.error());
+  if (log) {
+    std::string s;
+    for (std::size_t i = 0; i < g->size(); ++i) {
+      if (i) s += ' ';
+      s += std::to_string((*g)[i]);
+    }
+    log(s);
+  }
+  return {};
+}
+
+Result<void> run_grok_import(const GrokCliOpts& o, LogFn log) {
+  auto wdir = o.weights.empty() ? std::filesystem::path("data/grok2") : o.weights;
+  auto out = o.out.empty() ? std::filesystem::path("data/grok.gyre") : o.out;
+  auto d = Device::cpu();
+  if (!d) return std::unexpected(d.error());
+  auto codec = gyre_codec_from_name(o.codec);
+  auto s = import_safetensors_to_gyre(wdir, out, *d, codec);
+  if (!s) return s;
+  if (log) log("imported " + wdir.string() + " -> " + out.string() + " codec=" + gyre_codec_name(codec));
+  return {};
+}
+
+Result<void> run_ckpt_probe(const std::filesystem::path& ckpt, int max_tensors, LogFn log) {
+  auto f = GyreFile::open(ckpt);
+  if (!f) return std::unexpected(f.error());
+  auto rows = probe_gyre_codecs(*f, max_tensors);
+  if (!rows) return std::unexpected(rows.error());
+  for (auto& r : *rows) {
+    if (!log) continue;
+    log(r.name + " raw=" + std::to_string(r.raw_bytes) + " alp=" + std::to_string(r.alp_bytes) +
+        (r.alp_ok ? " ok" : " FAIL") + " zfp=" +
+        (r.zfp_bytes ? std::to_string(r.zfp_bytes) : std::string("n/a")) +
+        (r.zfp_ok ? " ok" : ""));
+  }
   return {};
 }
 

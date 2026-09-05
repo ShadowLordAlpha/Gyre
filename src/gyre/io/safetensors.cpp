@@ -1,6 +1,6 @@
 #include "gyre/io/safetensors.hpp"
 
-#include "gyre/nn/tokenize.hpp"
+#include "json_parse.hpp"
 
 #include <array>
 #include <cstring>
@@ -10,100 +10,6 @@
 #include <string>
 
 namespace gyre {
-namespace {
-
-void skip_ws(std::string_view s, std::size_t& i) {
-  while (i < s.size() && (s[i] == ' ' || s[i] == '\n' || s[i] == '\r' || s[i] == '\t')) ++i;
-}
-
-bool parse_string(std::string_view s, std::size_t& i, std::string& out) {
-  skip_ws(s, i);
-  return json_unescape_string(s, i, out);
-}
-
-bool parse_u64(std::string_view s, std::size_t& i, std::uint64_t& out) {
-  skip_ws(s, i);
-  char* end = nullptr;
-  out = std::strtoull(s.data() + i, &end, 10);
-  if (end == s.data() + i) return false;
-  i = static_cast<std::size_t>(end - s.data());
-  return true;
-}
-
-bool parse_i64_array(std::string_view s, std::size_t& i, std::vector<std::int64_t>& out) {
-  skip_ws(s, i);
-  if (i >= s.size() || s[i] != '[') return false;
-  ++i;
-  out.clear();
-  while (i < s.size()) {
-    skip_ws(s, i);
-    if (i < s.size() && s[i] == ']') {
-      ++i;
-      return true;
-    }
-    char* end = nullptr;
-    auto v = std::strtoll(s.data() + i, &end, 10);
-    if (end == s.data() + i) return false;
-    out.push_back(v);
-    i = static_cast<std::size_t>(end - s.data());
-    skip_ws(s, i);
-    if (i < s.size() && s[i] == ',') ++i;
-  }
-  return false;
-}
-
-bool skip_value(std::string_view s, std::size_t& i) {
-  skip_ws(s, i);
-  if (i >= s.size()) return false;
-  if (s[i] == '"') {
-    std::string tmp;
-    return parse_string(s, i, tmp);
-  }
-  if (s[i] == '{') {
-    int d = 0;
-    for (; i < s.size(); ++i) {
-      if (s[i] == '"') {
-        std::string tmp;
-        if (!parse_string(s, i, tmp)) return false;
-        --i;
-        continue;
-      }
-      if (s[i] == '{') ++d;
-      else if (s[i] == '}') {
-        --d;
-        if (d == 0) {
-          ++i;
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-  if (s[i] == '[') {
-    int d = 0;
-    for (; i < s.size(); ++i) {
-      if (s[i] == '"') {
-        std::string tmp;
-        if (!parse_string(s, i, tmp)) return false;
-        --i;
-        continue;
-      }
-      if (s[i] == '[') ++d;
-      else if (s[i] == ']') {
-        --d;
-        if (d == 0) {
-          ++i;
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-  while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ']') ++i;
-  return true;
-}
-
-}  // namespace
 
 DType safetensors_dtype(std::string_view s) {
   if (s == "F32" || s == "f32") return DType::f32;
@@ -117,76 +23,25 @@ DType safetensors_dtype(std::string_view s) {
 
 Result<SafetensorFile> safetensors_open_header(std::string_view header_json, std::uint64_t header_len,
                                                const std::filesystem::path& path) {
+  auto parsed = parse_json(header_json);
+  if (!parsed) return std::unexpected(parsed.error());
+  if (!parsed->is_object()) return std::unexpected(make_error(Errc::ckpt_corrupt, "st json"));
   SafetensorFile file;
   file.path = path;
   file.header_len = header_len;
   file.data_offset = 8 + header_len;
-  std::size_t i = 0;
-  skip_ws(header_json, i);
-  if (i >= header_json.size() || header_json[i] != '{') {
-    return std::unexpected(make_error(Errc::ckpt_corrupt, "st json"));
-  }
-  ++i;
-  while (i < header_json.size()) {
-    skip_ws(header_json, i);
-    if (i < header_json.size() && header_json[i] == '}') break;
-    std::string key;
-    if (!parse_string(header_json, i, key)) {
-      return std::unexpected(make_error(Errc::ckpt_corrupt, "st key"));
+  for (auto& [key, val] : parsed->items()) {
+    if (key == "__metadata__") continue;
+    if (!val.is_object()) continue;
+    SafetensorInfo info;
+    info.name = key;
+    info.dtype = safetensors_dtype(val.value("dtype", std::string{"F32"}));
+    if (val.contains("shape") && val["shape"].is_array()) info.shape = val["shape"].get<std::vector<std::int64_t>>();
+    if (val.contains("data_offsets") && val["data_offsets"].is_array() && val["data_offsets"].size() == 2) {
+      info.data_begin = val["data_offsets"][0].get<std::uint64_t>();
+      info.data_end = val["data_offsets"][1].get<std::uint64_t>();
     }
-    skip_ws(header_json, i);
-    if (i >= header_json.size() || header_json[i] != ':') {
-      return std::unexpected(make_error(Errc::ckpt_corrupt, "st colon"));
-    }
-    ++i;
-    if (key == "__metadata__") {
-      if (!skip_value(header_json, i)) {
-        return std::unexpected(make_error(Errc::ckpt_corrupt, "st meta"));
-      }
-    } else {
-      skip_ws(header_json, i);
-      auto obj = json_object_field(header_json.substr(i > 0 ? i - 1 : 0), "dtype");
-      // Parse this object from current '{'.
-      skip_ws(header_json, i);
-      if (i >= header_json.size() || header_json[i] != '{') {
-        return std::unexpected(make_error(Errc::ckpt_corrupt, "st tensor"));
-      }
-      std::size_t start = i;
-      if (!skip_value(header_json, i)) {
-        return std::unexpected(make_error(Errc::ckpt_corrupt, "st tensor obj"));
-      }
-      auto objv = header_json.substr(start, i - start);
-      SafetensorInfo info;
-      info.name = std::move(key);
-      auto dts = json_object_field(objv, "dtype");
-      std::string dt;
-      if (!dts.empty()) {
-        auto q = dts;
-        if (q.size() >= 2 && q.front() == '"') {
-          std::size_t qi = 0;
-          json_unescape_string(q, qi, dt);
-        } else
-          dt = std::string(q);
-      }
-      info.dtype = safetensors_dtype(dt);
-      auto shv = json_object_field(objv, "shape");
-      std::size_t si = 0;
-      if (!parse_i64_array(shv, si, info.shape)) {
-        return std::unexpected(make_error(Errc::ckpt_corrupt, "st shape"));
-      }
-      auto off = json_object_field(objv, "data_offsets");
-      std::vector<std::int64_t> oe;
-      std::size_t oi = 0;
-      if (!parse_i64_array(off, oi, oe) || oe.size() != 2) {
-        return std::unexpected(make_error(Errc::ckpt_corrupt, "st offsets"));
-      }
-      info.data_begin = static_cast<std::uint64_t>(oe[0]);
-      info.data_end = static_cast<std::uint64_t>(oe[1]);
-      file.tensors.push_back(std::move(info));
-      (void)obj;
-    }
-    skip_ws(header_json, i);
-    if (i < header_json.size() && header_json[i] == ',') ++i;
+    file.tensors.push_back(std::move(info));
   }
   return file;
 }
@@ -302,28 +157,18 @@ const char* safetensors_dtype_str(DType d) {
 Result<void> safetensors_save(const std::filesystem::path& path, std::span<const NamedTensor> tensors) {
   if (tensors.empty()) return std::unexpected(make_error(Errc::invalid_shape, "save empty"));
   std::uint64_t off = 0;
-  std::string json = "{";
+  nlohmann::json header = nlohmann::json::object();
   for (std::size_t i = 0; i < tensors.size(); ++i) {
     if (!tensors[i].t) return std::unexpected(make_error(Errc::invalid_shape, "null tensor"));
-    if (i) json += ',';
-    json += json_escape(tensors[i].name);
-    json += ":{\"dtype\":\"";
-    json += safetensors_dtype_str(tensors[i].t->dtype());
-    json += "\",\"shape\":[";
-    auto sh = tensors[i].t->shape();
-    for (std::size_t d = 0; d < sh.size(); ++d) {
-      if (d) json += ',';
-      json += std::to_string(sh[d]);
-    }
+    nlohmann::json sh = nlohmann::json::array();
+    for (auto d : tensors[i].t->shape()) sh.push_back(d);
     const auto n = tensors[i].t->nbytes();
-    json += "],\"data_offsets\":[";
-    json += std::to_string(off);
-    json += ',';
-    json += std::to_string(off + n);
-    json += "]}";
+    header[tensors[i].name] = {{"dtype", safetensors_dtype_str(tensors[i].t->dtype())},
+                               {"shape", sh},
+                               {"data_offsets", {off, off + n}}};
     off += n;
   }
-  json += '}';
+  auto json = header.dump();
   std::uint64_t hlen = json.size();
   auto parent = path.parent_path();
   if (!parent.empty()) std::filesystem::create_directories(parent);

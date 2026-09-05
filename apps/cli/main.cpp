@@ -1,12 +1,7 @@
 #include "jobs.hpp"
-#include "gyre/io/compress_probe.hpp"
-#include "gyre/io/safetensors.hpp"
-#include "gyre/io/wpack.hpp"
-#include "gyre/nn/grok.hpp"
 #include "gyre/nn/tokenize.hpp"
 
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -34,8 +29,10 @@ static void usage() {
       "  gyre-cli grok inspect DIR\n"
       "  gyre-cli grok compress-probe DIR [--file SUBSTR] [--max-tensors N] [--chunk-bytes N] [--out FILE]\n"
       "  gyre-cli grok pack DIR --out FILE.wpack [--file SUBSTR] [--max-bytes N]\n"
-      "  gyre-cli grok save --preset mini|tiny --out DIR\n"
-      "  gyre-cli grok gen --weights DIR [--prompt \"To be\"] [--max-new 32] [--tok FILE] [--lora DIR]\n"
+      "  gyre-cli grok save --preset mini|tiny --out FILE.gyre [--codec identity|alp|zfp]\n"
+      "  gyre-cli grok import DIR --out FILE.gyre [--codec identity|alp|zfp]\n"
+      "  gyre-cli grok gen --weights FILE.gyre|DIR [--prompt \"To be\"] [--max-new 32] [--tok FILE] [--lora DIR]\n"
+      "  gyre-cli ckpt probe FILE.gyre [--max-tensors N]\n"
       "  gyre-cli tui   (build gyre-tui with -DGYRE_ENABLE_TUI=ON)\n"
       "\n"
       "lm is a character-level transformer. Checkpoints use the .gyre extension\n"
@@ -150,234 +147,88 @@ int main(int argc, char** argv) {
     return 1;
   }
   if (cmd == "grok") {
-    std::filesystem::path cfg = "data/grok2/config.json";
-    std::filesystem::path wdir;
+    GrokCliOpts go;
     std::string sub = argc > 2 ? argv[2] : "info";
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--config" && i + 1 < argc) cfg = argv[++i];
-      else if (a == "info") sub = "info";
-      else if (a == "inspect") {
-        sub = "inspect";
-        if (i + 1 < argc && argv[i + 1][0] != '-') wdir = argv[++i];
-      } else if (a == "compress-probe") {
-        sub = "compress-probe";
-        if (i + 1 < argc && argv[i + 1][0] != '-') wdir = argv[++i];
-      } else if (a == "pack") {
-        sub = "pack";
-        if (i + 1 < argc && argv[i + 1][0] != '-') wdir = argv[++i];
-      } else if (a == "save") {
-        sub = "save";
-      } else if (a == "gen") {
-        sub = "gen";
-      }
-    }
-    gyre::CompressProbeOpts probe_opts;
-    std::filesystem::path probe_out;
-    std::uint64_t pack_max = 2ull << 20;
-    std::string preset = "mini";
-    std::string prompt = "To be";
-    int max_new = 32;
-    std::filesystem::path tok_path;
-    std::filesystem::path lora_dir;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--weights" && i + 1 < argc) wdir = argv[++i];
-      else if (a == "--file" && i + 1 < argc) probe_opts.file_substr = argv[++i];
-      else if (a == "--max-tensors" && i + 1 < argc) probe_opts.max_tensors = std::stoi(argv[++i]);
+      if (a == "info" || a == "inspect" || a == "compress-probe" || a == "pack" ||
+          a == "save" || a == "gen" || a == "import") {
+        sub = a;
+        if ((a == "inspect" || a == "compress-probe" || a == "pack" || a == "import" || a == "gen") &&
+            i + 1 < argc && argv[i + 1][0] != '-')
+          go.weights = argv[++i];
+      } else if (a == "--config" && i + 1 < argc)
+        go.config = argv[++i];
+      else if (a == "--weights" && i + 1 < argc)
+        go.weights = argv[++i];
+      else if (a == "--out" && i + 1 < argc)
+        go.out = argv[++i];
+      else if (a == "--file" && i + 1 < argc)
+        go.file_substr = argv[++i];
+      else if (a == "--preset" && i + 1 < argc)
+        go.preset = argv[++i];
+      else if (a == "--prompt" && i + 1 < argc)
+        go.prompt = argv[++i];
+      else if (a == "--max-new" && i + 1 < argc)
+        go.max_new = std::stoi(argv[++i]);
+      else if (a == "--tok" && i + 1 < argc)
+        go.tok = argv[++i];
+      else if (a == "--lora" && i + 1 < argc)
+        go.lora = argv[++i];
+      else if (a == "--codec" && i + 1 < argc)
+        go.codec = argv[++i];
+      else if (a == "--max-bytes" && i + 1 < argc)
+        go.pack_max = std::stoull(argv[++i]);
+      else if (a == "--max-tensors" && i + 1 < argc)
+        go.max_tensors = std::stoi(argv[++i]);
       else if (a == "--chunk-bytes" && i + 1 < argc)
-        probe_opts.chunk_bytes = static_cast<std::uint64_t>(std::stoull(argv[++i]));
-      else if (a == "--out" && i + 1 < argc) probe_out = argv[++i];
-      else if (a == "--max-bytes" && i + 1 < argc) pack_max = std::stoull(argv[++i]);
-      else if (a == "--preset" && i + 1 < argc) preset = argv[++i];
-      else if (a == "--prompt" && i + 1 < argc) prompt = argv[++i];
-      else if (a == "--max-new" && i + 1 < argc) max_new = std::stoi(argv[++i]);
-      else if (a == "--tok" && i + 1 < argc) tok_path = argv[++i];
-      else if (a == "--lora" && i + 1 < argc) lora_dir = argv[++i];
+        go.chunk_bytes = std::stoull(argv[++i]);
     }
-    if (sub == "save") {
-      if (probe_out.empty()) probe_out = "data/grok-mini";
-      auto c = preset == "tiny" ? gyre::GrokConfig::tiny() : gyre::GrokConfig::mini();
-      auto d = gyre::Device::cpu();
-      gyre::Rng rng(1);
-      auto m = gyre::GrokLM::create(c, *d, rng);
-      if (!m) {
-        std::cerr << m.error().message << '\n';
-        return 1;
-      }
-      auto s = m->save_weights(probe_out);
-      if (!s) {
-        std::cerr << s.error().message << '\n';
-        return 1;
-      }
-      std::cout << "saved " << c.to_string() << " -> " << probe_out.string() << '\n';
-      return 0;
+    gyre::Result<void> r;
+    if (sub == "info")
+      r = run_grok_info(go, log);
+    else if (sub == "inspect")
+      r = run_grok_inspect(go, log);
+    else if (sub == "compress-probe")
+      r = run_grok_compress_probe(go, log);
+    else if (sub == "pack")
+      r = run_grok_pack(go, log);
+    else if (sub == "save")
+      r = run_grok_save(go, log);
+    else if (sub == "gen")
+      r = run_grok_gen(go, log);
+    else if (sub == "import")
+      r = run_grok_import(go, log);
+    else {
+      usage();
+      return 1;
     }
-    if (sub == "gen") {
-      if (wdir.empty()) wdir = probe_out.empty() ? std::filesystem::path("data/grok-mini") : probe_out;
-      auto d = gyre::Device::cpu();
-      auto m = gyre::GrokLM::load_weights(wdir, *d);
-      if (!m) {
-        std::cerr << m.error().message << '\n';
-        return 1;
-      }
-      if (!lora_dir.empty()) {
-        auto lr = m->load_lora(lora_dir, *d);
-        if (!lr) {
-          std::cerr << lr.error().message << '\n';
-          return 1;
-        }
-      }
-      std::vector<std::int32_t> ids;
-      if (!tok_path.empty()) {
-        auto t = gyre::Tokenizer::load(tok_path);
-        if (!t) {
-          std::cerr << t.error().message << '\n';
-          return 1;
-        }
-        auto e = (*t)->encode(prompt);
-        if (!e) {
-          std::cerr << e.error().message << '\n';
-          return 1;
-        }
-        ids = std::move(*e);
-        auto g = m->generate(ids, max_new, *d, nullptr, 0.f);
-        if (!g) {
-          std::cerr << g.error().message << '\n';
-          return 1;
-        }
-        std::cout << (*t)->decode(*g) << '\n';
-        return 0;
-      }
-      ids = {1, 2};
-      auto g = m->generate(ids, max_new, *d, nullptr, 0.f);
-      if (!g) {
-        std::cerr << g.error().message << '\n';
-        return 1;
-      }
-      for (std::size_t i = 0; i < g->size(); ++i) {
-        if (i) std::cout << ' ';
-        std::cout << (*g)[i];
-      }
-      std::cout << '\n';
-      return 0;
+    if (!r) {
+      std::cerr << r.error().message << '\n';
+      return 1;
     }
-    if (sub == "pack") {
-      if (wdir.empty()) wdir = "data/grok2";
-      if (probe_out.empty()) probe_out = "data/grok2/norm.gyre.wpack";
-      gyre::WpackFile all;
-      all.source = wdir.string();
-      for (auto& ent : std::filesystem::directory_iterator(wdir)) {
-        if (!ent.is_regular_file() || ent.path().extension() != ".safetensors") continue;
-        auto fn = ent.path().filename().string();
-        if (!probe_opts.file_substr.empty() && fn.find(probe_opts.file_substr) == std::string::npos)
-          continue;
-        auto st = gyre::safetensors_open(ent.path());
-        if (!st) {
-          std::cerr << st.error().message << '\n';
-          return 1;
-        }
-        auto part = gyre::wpack_from_safetensors(*st, pack_max);
-        if (!part) {
-          std::cerr << part.error().message << '\n';
-          return 1;
-        }
-        for (auto& t : part->tensors) all.tensors.push_back(std::move(t));
-      }
-      auto s = gyre::wpack_save(probe_out, all);
-      if (!s) {
-        std::cerr << s.error().message << '\n';
-        return 1;
-      }
-      std::cout << "packed " << all.tensors.size() << " tensors -> " << probe_out.string() << '\n';
-      for (auto& t : all.tensors) {
-        std::cout << "  " << t.name << " codec=" << gyre::wpack_codec_name(t.codec)
-                  << " raw=" << t.raw_bytes << " packed=" << t.payload.size() << '\n';
-      }
-      return 0;
+    return 0;
+  }
+  if (cmd == "ckpt") {
+    if (argc < 3 || std::string(argv[2]) != "probe") {
+      usage();
+      return 1;
     }
-    if (sub == "compress-probe") {
-      if (wdir.empty()) wdir = "data/grok2";
-      auto rows = gyre::compress_probe_dir(wdir, probe_opts);
-      if (!rows) {
-        std::cerr << rows.error().message << '\n';
-        return 1;
-      }
-      auto js = gyre::compress_probe_json(*rows);
-      if (!probe_out.empty()) {
-        std::ofstream o(probe_out, std::ios::binary);
-        o << js;
-        std::cout << "wrote " << probe_out.string() << " rows=" << rows->size() << '\n';
-      } else {
-        std::cout << js << '\n';
-      }
-      for (auto& r : *rows) {
-        const double packed_ratio =
-            r.probed_bytes ? static_cast<double>(r.packed_bytes) / static_cast<double>(r.probed_bytes)
-                           : 1.0;
-        const double est_ratio =
-            r.probed_bytes ? static_cast<double>(r.estimate_bytes) / static_cast<double>(r.probed_bytes)
-                           : 1.0;
-        std::cout << r.file << " " << r.name << " family=" << r.family << " codec=" << r.packed_codec
-                  << " packed/probed=" << packed_ratio << " estimate/probed=" << est_ratio
-                  << " entropy_bpb=" << r.entropy_bpb << '\n';
-      }
-      return 0;
+    std::filesystem::path ckpt;
+    int max_t = 32;
+    for (int i = 3; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--max-tensors" && i + 1 < argc)
+        max_t = std::stoi(argv[++i]);
+      else if (!a.empty() && a[0] != '-')
+        ckpt = a;
     }
-    if (sub == "inspect") {
-      if (wdir.empty()) wdir = "data/grok2";
-      if (!std::filesystem::exists(wdir)) {
-        std::cerr << "missing " << wdir.string() << '\n';
-        return 1;
-      }
-      for (auto& ent : std::filesystem::directory_iterator(wdir)) {
-        if (!ent.is_regular_file() || ent.path().extension() != ".safetensors") continue;
-        auto f = gyre::safetensors_open(ent.path());
-        if (!f) {
-          std::cerr << ent.path().filename().string() << ": " << f.error().message << '\n';
-          continue;
-        }
-        std::cout << ent.path().filename().string() << " tensors=" << f->tensors.size() << '\n';
-        for (auto& t : f->tensors) {
-          std::cout << "  " << t.name << " ";
-          switch (t.dtype) {
-            case gyre::DType::bf16:
-              std::cout << "BF16";
-              break;
-            case gyre::DType::f32:
-              std::cout << "F32";
-              break;
-            case gyre::DType::f16:
-              std::cout << "F16";
-              break;
-            default:
-              std::cout << "dt=" << static_cast<int>(t.dtype);
-              break;
-          }
-          std::cout << " [";
-          for (std::size_t i = 0; i < t.shape.size(); ++i) {
-            if (i) std::cout << ',';
-            std::cout << t.shape[i];
-          }
-          std::cout << "]\n";
-        }
-      }
-      return 0;
+    auto r = run_ckpt_probe(ckpt, max_t, log);
+    if (!r) {
+      std::cerr << r.error().message << '\n';
+      return 1;
     }
-    if (sub == "info") {
-      auto c = gyre::GrokConfig::from_file(cfg);
-      if (!c) {
-        c = gyre::GrokConfig::full();
-        std::cout << "(no file " << cfg.string() << ", using built-in full())\n";
-      }
-      std::cout << c->to_string() << '\n';
-      std::cout << "rope_theta=" << c->rope_theta << " rope_scale=" << c->rope_scale
-                << " emb_scale=" << c->embedding_scale << " out_scale=" << c->output_scale << '\n';
-      std::cout << "create_ok=" << (c->fits_in_ram_create() ? "yes" : "no (tiny only until bind)") << '\n';
-      return 0;
-    }
-    usage();
-    return 1;
+    return 0;
   }
   if (cmd == "ga") {
     GaOpts o;

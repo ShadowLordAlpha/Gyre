@@ -3,7 +3,7 @@
 #include "gyre/io/safetensors.hpp"
 #include "gyre/nn/gqa.hpp"
 #include "gyre/nn/moe.hpp"
-#include "gyre/nn/tokenize.hpp"
+#include "json_parse.hpp"
 #include "gyre/ops.hpp"
 
 #include <algorithm>
@@ -11,6 +11,7 @@
 #include <fstream>
 #include <span>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
 namespace gyre {
@@ -57,40 +58,24 @@ Result<Tensor> scale_f32(const Tensor& x, float s) {
 }
 
 Result<Tensor> linear_nb(const Tensor& x, const Tensor& W) {
-  if (x.rank() == 2) return matmul(x, W);
-  if (x.rank() != 3) return std::unexpected(make_error(Errc::invalid_shape, "linear_nb"));
-  std::int64_t sh[2] = {x.shape()[0] * x.shape()[1], x.shape()[2]};
-  auto c = x.clone();
-  if (!c) return c;
-  auto x2 = reshape(*c, sh);
+  auto x2 = flatten_leading(x);
   if (!x2) return x2;
   auto y = matmul(*x2, W);
   if (!y) return y;
-  std::int64_t osh[3] = {x.shape()[0], x.shape()[1], y->shape()[1]};
-  return reshape(*y, osh);
+  return unflatten_like(std::move(*y), x);
 }
 
-std::int64_t ji(std::string_view json, std::string_view key, std::int64_t def) {
-  auto v = json_object_field(json, key);
-  if (v.empty()) return def;
-  char* end = nullptr;
-  auto n = std::strtoll(v.data(), &end, 10);
-  return end == v.data() ? def : n;
+std::int64_t ji(const nlohmann::json& j, const char* key, std::int64_t def) {
+  if (!j.contains(key)) return def;
+  return j[key].get<std::int64_t>();
 }
-
-float jf(std::string_view json, std::string_view key, float def) {
-  auto v = json_object_field(json, key);
-  if (v.empty()) return def;
-  char* end = nullptr;
-  auto n = std::strtof(v.data(), &end);
-  return end == v.data() ? def : n;
+float jf(const nlohmann::json& j, const char* key, float def) {
+  if (!j.contains(key)) return def;
+  return j[key].get<float>();
 }
-
-bool jbool(std::string_view json, std::string_view key, bool def) {
-  auto v = json_object_field(json, key);
-  if (v.find("true") != std::string_view::npos) return true;
-  if (v.find("false") != std::string_view::npos) return false;
-  return def;
+bool jbool(const nlohmann::json& j, const char* key, bool def) {
+  if (!j.contains(key)) return def;
+  return j[key].get<bool>();
 }
 
 constexpr int kLayerBase = 3;  // embed, lm_head, ln_f
@@ -163,29 +148,36 @@ GrokConfig GrokConfig::full() {
 }
 
 Result<GrokConfig> GrokConfig::from_json(std::string_view json) {
+  auto parsed = parse_json(json);
+  if (!parsed) return std::unexpected(parsed.error());
+  try {
+  auto& j = *parsed;
   GrokConfig c = full();
-  c.vocab = ji(json, "vocab_size", c.vocab);
-  c.block_size = ji(json, "max_position_embeddings", c.block_size);
-  c.n_layer = ji(json, "num_hidden_layers", c.n_layer);
-  c.n_q_head = ji(json, "num_attention_heads", c.n_q_head);
-  c.n_kv_head = ji(json, "num_key_value_heads", c.n_kv_head);
-  c.d_model = ji(json, "hidden_size", c.d_model);
-  c.head_dim = ji(json, "head_dim", c.head_dim);
-  c.d_ff = ji(json, "intermediate_size", c.d_ff);
-  c.moe_ff = ji(json, "moe_intermediate_size", c.moe_ff);
-  c.n_experts = ji(json, "num_local_experts", c.n_experts);
-  c.n_experts_per_tok = ji(json, "num_experts_per_tok", c.n_experts_per_tok);
-  c.rms_eps = jf(json, "rms_norm_eps", c.rms_eps);
-  c.rope_theta = jf(json, "rope_theta", c.rope_theta);
-  c.rope_scale = jf(json, "scaling_factor", c.rope_scale);
-  c.embedding_scale = jf(json, "embedding_multiplier_scale", c.embedding_scale);
-  c.output_scale = jf(json, "output_multiplier_scale", c.output_scale);
-  c.attn_softcap = jf(json, "attn_logit_softcapping", c.attn_softcap);
-  c.router_softcap = jf(json, "router_logit_softcapping", c.router_softcap);
-  c.final_softcap = jf(json, "final_logit_softcapping", c.final_softcap);
-  c.attn_temperature_len = ji(json, "attn_temperature_len", c.attn_temperature_len);
-  c.residual_moe = jbool(json, "residual_moe", c.residual_moe);
+  c.vocab = ji(j, "vocab_size", c.vocab);
+  c.block_size = ji(j, "max_position_embeddings", c.block_size);
+  c.n_layer = ji(j, "num_hidden_layers", c.n_layer);
+  c.n_q_head = ji(j, "num_attention_heads", c.n_q_head);
+  c.n_kv_head = ji(j, "num_key_value_heads", c.n_kv_head);
+  c.d_model = ji(j, "hidden_size", c.d_model);
+  c.head_dim = ji(j, "head_dim", c.head_dim);
+  c.d_ff = ji(j, "intermediate_size", c.d_ff);
+  c.moe_ff = ji(j, "moe_intermediate_size", c.moe_ff);
+  c.n_experts = ji(j, "num_local_experts", c.n_experts);
+  c.n_experts_per_tok = ji(j, "num_experts_per_tok", c.n_experts_per_tok);
+  c.rms_eps = jf(j, "rms_norm_eps", c.rms_eps);
+  c.rope_theta = jf(j, "rope_theta", c.rope_theta);
+  c.rope_scale = jf(j, "scaling_factor", c.rope_scale);
+  c.embedding_scale = jf(j, "embedding_multiplier_scale", c.embedding_scale);
+  c.output_scale = jf(j, "output_multiplier_scale", c.output_scale);
+  c.attn_softcap = jf(j, "attn_logit_softcapping", c.attn_softcap);
+  c.router_softcap = jf(j, "router_logit_softcapping", c.router_softcap);
+  c.final_softcap = jf(j, "final_logit_softcapping", c.final_softcap);
+  c.attn_temperature_len = ji(j, "attn_temperature_len", c.attn_temperature_len);
+  c.residual_moe = jbool(j, "residual_moe", c.residual_moe);
   return c;
+  } catch (const nlohmann::json::exception& e) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, std::string("json: ") + e.what()));
+  }
 }
 
 Result<GrokConfig> GrokConfig::from_file(const std::filesystem::path& path) {
@@ -223,22 +215,29 @@ std::string GrokConfig::to_string() const {
 }
 
 std::string GrokConfig::to_json() const {
-  std::ostringstream o;
-  o << "{\"vocab_size\":" << vocab << ",\"max_position_embeddings\":" << block_size
-    << ",\"num_hidden_layers\":" << n_layer << ",\"num_attention_heads\":" << n_q_head
-    << ",\"num_key_value_heads\":" << n_kv_head << ",\"hidden_size\":" << d_model
-    << ",\"head_dim\":" << head_dim << ",\"intermediate_size\":" << d_ff
-    << ",\"moe_intermediate_size\":" << moe_ff << ",\"num_local_experts\":" << n_experts
-    << ",\"num_experts_per_tok\":" << n_experts_per_tok << ",\"rms_norm_eps\":" << rms_eps
-    << ",\"rope_theta\":" << rope_theta << ",\"scaling_factor\":" << rope_scale
-    << ",\"embedding_multiplier_scale\":" << embedding_scale
-    << ",\"output_multiplier_scale\":" << output_scale
-    << ",\"attn_logit_softcapping\":" << attn_softcap
-    << ",\"router_logit_softcapping\":" << router_softcap
-    << ",\"final_logit_softcapping\":" << final_softcap
-    << ",\"attn_temperature_len\":" << attn_temperature_len
-    << ",\"residual_moe\":" << (residual_moe ? "true" : "false") << "}";
-  return o.str();
+  nlohmann::json j;
+  j["vocab_size"] = vocab;
+  j["max_position_embeddings"] = block_size;
+  j["num_hidden_layers"] = n_layer;
+  j["num_attention_heads"] = n_q_head;
+  j["num_key_value_heads"] = n_kv_head;
+  j["hidden_size"] = d_model;
+  j["head_dim"] = head_dim;
+  j["intermediate_size"] = d_ff;
+  j["moe_intermediate_size"] = moe_ff;
+  j["num_local_experts"] = n_experts;
+  j["num_experts_per_tok"] = n_experts_per_tok;
+  j["rms_norm_eps"] = rms_eps;
+  j["rope_theta"] = rope_theta;
+  j["scaling_factor"] = rope_scale;
+  j["embedding_multiplier_scale"] = embedding_scale;
+  j["output_multiplier_scale"] = output_scale;
+  j["attn_logit_softcapping"] = attn_softcap;
+  j["router_logit_softcapping"] = router_softcap;
+  j["final_logit_softcapping"] = final_softcap;
+  j["attn_temperature_len"] = attn_temperature_len;
+  j["residual_moe"] = residual_moe;
+  return j.dump();
 }
 
 Result<GrokLM> GrokLM::create(GrokConfig c, std::shared_ptr<Device> d, Rng& rng) {
@@ -424,36 +423,9 @@ Result<std::vector<std::int32_t>> GrokLM::generate(std::vector<std::int32_t> pre
     if (!p) return std::unexpected(make_error(Errc::not_cpu, "host"));
     const auto V = cfg_.vocab;
     const float* row = p->data() + (T - 1) * V;
-    std::int32_t tok = 0;
-    if (temperature <= 0.f || !rng) {
-      float m = row[0];
-      for (std::int64_t i = 1; i < V; ++i) {
-        if (row[i] > m) {
-          m = row[i];
-          tok = static_cast<std::int32_t>(i);
-        }
-      }
-    } else {
-      float mx = row[0];
-      for (std::int64_t i = 1; i < V; ++i) mx = std::max(mx, row[i]);
-      std::vector<float> pr(static_cast<std::size_t>(V));
-      float z = 0;
-      for (std::int64_t i = 0; i < V; ++i) {
-        pr[static_cast<std::size_t>(i)] = std::exp((row[i] - mx) / temperature);
-        z += pr[static_cast<std::size_t>(i)];
-      }
-      float u = rng->uniform01() * z;
-      float acc = 0;
-      tok = static_cast<std::int32_t>(V - 1);
-      for (std::int64_t i = 0; i < V; ++i) {
-        acc += pr[static_cast<std::size_t>(i)];
-        if (acc >= u) {
-          tok = static_cast<std::int32_t>(i);
-          break;
-        }
-      }
-    }
-    prefix.push_back(tok);
+    auto tok = sample_logit_row(std::span<const float>(row, static_cast<std::size_t>(V)), temperature, rng);
+    if (!tok) return std::unexpected(tok.error());
+    prefix.push_back(*tok);
   }
   return prefix;
 }
@@ -501,6 +473,7 @@ Result<Tensor> GrokLM::linear_lora(const Tensor& x, const Tensor& W, const GrokL
 }
 
 Result<void> GrokLM::save_weights(const std::filesystem::path& dir) const {
+  if (dir.extension() == ".gyre") return save_gyre(dir);
   std::filesystem::create_directories(dir);
   {
     std::ofstream cfg(dir / "config.json", std::ios::binary);
@@ -519,6 +492,7 @@ Result<void> GrokLM::save_weights(const std::filesystem::path& dir) const {
 }
 
 Result<GrokLM> GrokLM::load_weights(const std::filesystem::path& dir, std::shared_ptr<Device> d) {
+  if (std::filesystem::is_regular_file(dir)) return load_gyre(dir, d);
   auto c = GrokConfig::from_file(dir / "config.json");
   if (!c) return std::unexpected(c.error());
   Rng rng(1);
@@ -543,6 +517,62 @@ Result<GrokLM> GrokLM::load_weights(const std::filesystem::path& dir, std::share
     m->params_[i] = std::move(*p);
   }
   return m;
+}
+
+Result<void> GrokLM::save_gyre(const std::filesystem::path& path, GyreCodec codec) const {
+  GyreDoc d;
+  d.arch = "grok2";
+  d.config_json = cfg_.to_json();
+  auto names = param_names();
+  return gyre::save_gyre(path, params_, nullptr, d, names, codec);
+}
+
+Result<GrokLM> GrokLM::load_gyre(const std::filesystem::path& path, std::shared_ptr<Device> d) {
+  auto peek = peek_gyre(path);
+  if (!peek) return std::unexpected(peek.error());
+  auto cfg = GrokConfig::from_json(peek->config_json);
+  if (!cfg) return std::unexpected(cfg.error());
+  Rng rng(1);
+  auto m = create(*cfg, d, rng);
+  if (!m) return m;
+  auto f = GyreFile::open(path);
+  if (!f) return std::unexpected(f.error());
+  auto ld = f->load_params(m->params_, nullptr);
+  if (!ld) return std::unexpected(ld.error());
+  return m;
+}
+
+Result<void> import_safetensors_to_gyre(const std::filesystem::path& dir, const std::filesystem::path& out,
+                                       std::shared_ptr<Device> d, GyreCodec codec) {
+  auto c = GrokConfig::from_file(dir / "config.json");
+  if (!c) return std::unexpected(c.error());
+  Rng rng(1);
+  auto m = GrokLM::create(*c, d, rng);
+  if (!m) return std::unexpected(m.error());
+  auto names = m->param_names();
+  std::unordered_map<std::string, int> need;
+  for (int i = 0; i < static_cast<int>(names.size()); ++i) need[names[static_cast<std::size_t>(i)]] = i;
+  for (auto& ent : std::filesystem::directory_iterator(dir)) {
+    if (!ent.is_regular_file() || ent.path().extension() != ".safetensors") continue;
+    auto st = safetensors_open(ent.path());
+    if (!st) return std::unexpected(st.error());
+    for (auto& info : st->tensors) {
+      auto it = need.find(info.name);
+      if (it == need.end()) continue;
+      auto t = safetensors_load(*st, info.name, d, false);
+      if (!t) return std::unexpected(t.error());
+      if (t->dtype() != DType::f32) {
+        auto f = t->to_f32();
+        if (!f) return std::unexpected(f.error());
+        t = std::move(f);
+      }
+      auto p = make_param(std::move(*t));
+      if (!p) return std::unexpected(p.error());
+      m->parameters()[static_cast<std::size_t>(it->second)] = std::move(*p);
+      need.erase(it);
+    }
+  }
+  return m->save_gyre(out, codec);
 }
 
 Result<GrokLora> GrokLora::create(const GrokConfig& c, std::int64_t rank, float alpha,
@@ -590,9 +620,9 @@ Result<void> GrokLM::save_lora(const std::filesystem::path& dir) const {
   std::filesystem::create_directories(dir);
   std::ofstream meta(dir / "lora.json", std::ios::binary);
   if (!meta) return std::unexpected(make_error(Errc::io, "lora.json"));
-  auto js = std::string("{\"gyre\":\"lora\",\"base_arch\":\"grok2\",\"rank\":") +
-            std::to_string(lora_->rank) + ",\"alpha\":" + std::to_string(lora_->alpha) + "}";
-  meta.write(js.data(), static_cast<std::streamsize>(js.size()));
+  nlohmann::json js = {{"gyre", "lora"}, {"base_arch", "grok2"}, {"rank", lora_->rank}, {"alpha", lora_->alpha}};
+  auto s = js.dump();
+  meta.write(s.data(), static_cast<std::streamsize>(s.size()));
   std::vector<NamedTensor> nt;
   auto add = [&](const char* kind, const std::vector<GrokLoraPair>& v) {
     for (std::size_t i = 0; i < v.size(); ++i) {
@@ -620,10 +650,10 @@ Result<void> GrokLM::load_lora(const std::filesystem::path& dir, std::shared_ptr
   std::int64_t rank = 4;
   float alpha = 4.f;
   if (!js.empty()) {
-    auto rv = json_object_field(js, "rank");
-    if (!rv.empty()) rank = std::strtoll(rv.data(), nullptr, 10);
-    auto av = json_object_field(js, "alpha");
-    if (!av.empty()) alpha = std::strtof(av.data(), nullptr);
+    if (auto parsed = parse_json(js); parsed) {
+      rank = (*parsed).value("rank", rank);
+      alpha = (*parsed).value("alpha", alpha);
+    }
   }
   Rng rng(1);
   auto l = GrokLora::create(cfg_, rank, alpha, d, rng);

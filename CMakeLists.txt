@@ -19,6 +19,7 @@ add_library(gyre STATIC
   src/gyre/io/safetensors.cpp
   src/gyre/io/compress_probe.cpp
   src/gyre/io/wpack.cpp
+  src/gyre/io/codec.cpp
   src/gyre/ops.cpp
   src/gyre/rng.cpp
   src/gyre/module.cpp
@@ -29,6 +30,7 @@ add_library(gyre STATIC
   src/gyre/nn/unigram.cpp
   src/gyre/nn/pretok.cpp
   src/gyre/nn/sp_model.cpp
+  src/gyre/nn/attention.cpp
   src/gyre/nn/transformer.cpp
   src/gyre/nn/gqa.cpp
   src/gyre/nn/moe.cpp
@@ -45,6 +47,26 @@ target_include_directories(gyre PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
+
+find_package(nlohmann_json CONFIG QUIET)
+if(NOT nlohmann_json_FOUND)
+  include(FetchContent)
+  FetchContent_Declare(nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+  )
+  set(JSON_BuildTests OFF CACHE INTERNAL "")
+  set(JSON_Install OFF CACHE INTERNAL "")
+  FetchContent_MakeAvailable(nlohmann_json)
+endif()
+# Header-only: include path only so install(EXPORT) does not require exporting nlohmann.
+if(TARGET nlohmann_json::nlohmann_json)
+  get_target_property(_nlohmann_inc nlohmann_json::nlohmann_json INTERFACE_INCLUDE_DIRECTORIES)
+  target_include_directories(gyre PRIVATE ${_nlohmann_inc})
+elseif(DEFINED nlohmann_json_SOURCE_DIR)
+  target_include_directories(gyre PRIVATE ${nlohmann_json_SOURCE_DIR}/include)
+endif()
+target_include_directories(gyre PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/gyre)
 
 if(MSVC)
   target_compile_options(gyre PRIVATE /W4 /permissive-)
@@ -64,7 +86,14 @@ if(GYRE_ENABLE_OPENMP)
 endif()
 
 add_library(gyre-app-jobs STATIC apps/common/jobs.cpp)
-target_include_directories(gyre-app-jobs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/apps/common)
+target_include_directories(gyre-app-jobs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/apps/common
+                                        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/gyre)
+if(TARGET nlohmann_json::nlohmann_json)
+  get_target_property(_nlohmann_inc nlohmann_json::nlohmann_json INTERFACE_INCLUDE_DIRECTORIES)
+  target_include_directories(gyre-app-jobs PRIVATE ${_nlohmann_inc})
+elseif(DEFINED nlohmann_json_SOURCE_DIR)
+  target_include_directories(gyre-app-jobs PRIVATE ${nlohmann_json_SOURCE_DIR}/include)
+endif()
 target_link_libraries(gyre-app-jobs PUBLIC gyre)
 
 add_executable(gyre-cli apps/cli/main.cpp)

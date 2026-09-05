@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gyre/rng.hpp"
 #include "gyre/tensor.hpp"
 
 namespace gyre {
@@ -32,5 +33,16 @@ float attn_temperature_scale(std::int64_t seq_len, std::int64_t temp_len) noexce
 
 Result<void> fill_zero(Tensor& t);
 Result<void> add_(Tensor& dst, const Tensor& src);
+
+// Rank-3 [B,T,C] or rank-1 [C] → rank-2 rows×C sharing storage.
+Result<Tensor> flatten_leading(const Tensor& x);
+Result<Tensor> unflatten_like(Tensor y, const Tensor& like);
+// y = x @ W + b; x rank 1–3. W [in,out], b [out].
+Result<Tensor> linear(const Tensor& x, const Tensor& W, const Tensor& b);
+Result<Tensor> gelu_backward(const Tensor& x, const Tensor& dy);
+Result<Tensor> softmax_last_backward(const Tensor& softmax, const Tensor& d_out);
+
+// temperature <= 0: argmax. temperature > 0 requires rng.
+Result<std::int32_t> sample_logit_row(std::span<const float> logits, float temperature, Rng* rng);
 
 }  // namespace gyre
