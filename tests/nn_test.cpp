@@ -106,6 +106,38 @@ TEST(NN, TransformerForward) {
   EXPECT_EQ(y->shape()[2], 8);
 }
 
+TEST(NN, TransformerHiddenIsDModelAndBackward) {
+  auto d = gyre::Device::cpu();
+  gyre::Rng rng(3);
+  gyre::CharLMConfig c;
+  c.vocab = 8;
+  c.block_size = 8;
+  c.n_layer = 1;
+  c.n_head = 2;
+  c.d_model = 8;
+  c.d_ff = 16;
+  auto m = gyre::CharLM::create(c, *d, rng);
+  ASSERT_TRUE(m) << m.error().message;
+  std::int32_t ids[] = {1, 2, 3, 0};
+  std::int64_t sh[] = {1, 4};
+  auto x = gyre::Tensor::from_host(std::as_bytes(std::span(ids)), sh, gyre::DType::i32, *d);
+  gyre::ForwardCtx ctx;
+  ctx.train = true;
+  auto h = m->hidden(*x, ctx);
+  ASSERT_TRUE(h) << h.error().message;
+  ASSERT_EQ(h->rank(), 3);
+  EXPECT_EQ(h->shape()[0], 1);
+  EXPECT_EQ(h->shape()[1], 4);
+  EXPECT_EQ(h->shape()[2], 8);
+  auto dh = gyre::Tensor::zeros(h->shape(), gyre::DType::f32, *d);
+  ASSERT_TRUE(dh);
+  auto span = dh->host_span<float>();
+  ASSERT_TRUE(span);
+  (*span)[span->size() - 1] = 1.f;
+  auto rb = m->hidden_backward(*dh, ctx);
+  ASSERT_TRUE(rb) << rb.error().message;
+}
+
 TEST(NN, BpeRoundTrip) {
   const std::string text = "aaabdaaabac aaabdaaabac hello hello world world";
   auto bpe = gyre::Tokenizer::train_bpe(text, 280);

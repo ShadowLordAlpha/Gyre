@@ -89,6 +89,10 @@ class CharLM final : public Module {
   Result<Tensor> forward(const Tensor& idx, ForwardCtx& ctx) override;
   Result<void> backward(const Tensor& d_out, ForwardCtx& ctx) override;
   std::span<Param> parameters() noexcept override { return params_; }
+  // Hidden states after final LayerNorm: [B, T, d_model]. Skips lm_head.
+  Result<Tensor> hidden(const Tensor& idx, ForwardCtx& ctx);
+  // ∂L/∂hidden through the encoder. Pair with hidden() when CharLM is a trunk.
+  Result<void> hidden_backward(const Tensor& d_hidden, ForwardCtx& ctx);
   Result<std::vector<std::int32_t>> generate(std::vector<std::int32_t> prefix, int max_new,
                                              std::shared_ptr<Device> d, Rng* rng = nullptr,
                                              float temperature = 0.f);

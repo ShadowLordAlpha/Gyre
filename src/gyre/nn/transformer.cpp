@@ -136,7 +136,7 @@ Result<CharLM> CharLM::create(CharLMConfig c, std::shared_ptr<Device> d, Rng& rn
   return CharLM(c, std::move(*wte), std::move(*wpe), std::move(blocks), std::move(*lnf), std::move(*head));
 }
 
-Result<Tensor> CharLM::forward(const Tensor& idx, ForwardCtx& ctx) {
+Result<Tensor> CharLM::hidden(const Tensor& idx, ForwardCtx& ctx) {
   if (idx.rank() != 2) return std::unexpected(make_error(Errc::invalid_shape, "idx [B,T]"));
   const auto B = idx.shape()[0], T = idx.shape()[1];
   if (T > cfg_.block_size) return std::unexpected(make_error(Errc::invalid_shape, "T > block"));
@@ -171,16 +171,17 @@ Result<Tensor> CharLM::forward(const Tensor& idx, ForwardCtx& ctx) {
     if (!y) return y;
     h = std::move(*y);
   }
-  auto lnf = ln_f_.forward(h, ctx);
-  if (!lnf) return lnf;
-  return lm_head_.forward(*lnf, ctx);
+  return ln_f_.forward(h, ctx);
 }
 
-Result<void> CharLM::backward(const Tensor& d_out, ForwardCtx& ctx) {
-  auto rh = lm_head_.backward(d_out, ctx);
-  if (!rh || !ctx.dx) return rh ? std::unexpected(make_error(Errc::unsupported, "head dx")) : rh;
-  Tensor dlnf = std::move(*ctx.dx);
-  auto rl = ln_f_.backward(dlnf, ctx);
+Result<Tensor> CharLM::forward(const Tensor& idx, ForwardCtx& ctx) {
+  auto h = hidden(idx, ctx);
+  if (!h) return h;
+  return lm_head_.forward(*h, ctx);
+}
+
+Result<void> CharLM::hidden_backward(const Tensor& d_hidden, ForwardCtx& ctx) {
+  auto rl = ln_f_.backward(d_hidden, ctx);
   if (!rl || !ctx.dx) return rl ? std::unexpected(make_error(Errc::unsupported, "lnf dx")) : rl;
   Tensor dh = std::move(*ctx.dx);
   for (auto it = blocks_.rbegin(); it != blocks_.rend(); ++it) {
@@ -204,6 +205,13 @@ Result<void> CharLM::backward(const Tensor& d_out, ForwardCtx& ctx) {
         (*b)[static_cast<std::size_t>(t * C + c)] +=
             (*a)[static_cast<std::size_t>((bi * T + t) * C + c)];
   return wpe_.backward(*dpe, ctx);
+}
+
+Result<void> CharLM::backward(const Tensor& d_out, ForwardCtx& ctx) {
+  auto rh = lm_head_.backward(d_out, ctx);
+  if (!rh || !ctx.dx) return rh ? std::unexpected(make_error(Errc::unsupported, "head dx")) : rh;
+  Tensor dlnf = std::move(*ctx.dx);
+  return hidden_backward(dlnf, ctx);
 }
 
 std::vector<std::string> CharLM::param_names() const {
