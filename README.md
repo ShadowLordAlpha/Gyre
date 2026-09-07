@@ -1,6 +1,6 @@
 # Gyre
 
-C++23 library for **small neural models** (pre-LN decoder transformers) and **genetic algorithms** on CPU tensors. Product name is **Gyre**. Default `--data data/shakespeare.txt` is a corpus path, not the product name.
+C++23 library for **small neural models** (pre-LN decoder transformers) and **genetic algorithms**. Compute is **CPU by default**; optional **Vulkan** speeds up CharLM train/eval/generate. Product name is **Gyre**. Default `--data data/shakespeare.txt` is a corpus path, not the product name.
 
 **Helix / game hosts:** start at [docs/helix.md](docs/helix.md). Gyre is a **static in-process runtime** (`gyre.lib`). Helix schemas stay out of this tree.
 
@@ -22,7 +22,7 @@ Public headers live under `include/gyre/`. Umbrella: `gyre/gyre.hpp`.
 
 **Usable now**
 
-- CPU Device, f32 tensors, Linear / LayerNorm / CharLM transformer, Adam, GYRE1 `.gyre` checkpoints
+- CPU Device (default), optional Vulkan CharLM train/eval/generate, f32 tensors, Linear / LayerNorm / CharLM transformer, Adam, GYRE1 `.gyre` checkpoints
 - Tokenizers: BPE (default), chars, bytes, unigram; reuse `--tok FILE.gyre.json`
 - GA: tournament, elite, OneMax (`gyre-cli ga`)
 - Embed stub: `gyre::adapt::{Agent, Environment, PolicyAgent, GridWorld}`
@@ -33,7 +33,7 @@ Public headers live under `include/gyre/`. Umbrella: `gyre/gyre.hpp`.
 - Elman / leaky RNN
 - Island GA, neuroevolution flatten/unflatten
 - Helix or StarCraft observation schemas
-- Vulkan / OpenCL / CUDA
+- OpenCL / CUDA (Vulkan CharLM path is optional; Grok-2 GPU is not)
 - Full Grok-2 270B generate
 
 ## Build
@@ -53,7 +53,7 @@ Options:
 | `GYRE_ENABLE_TUI` | ON | Fetch FTXUI, build `gyre-tui` |
 | `GYRE_BUILD_EXAMPLE_BINS` | ON | charlm / OneMax examples |
 | `GYRE_ENABLE_OPENMP` | ON | Multi-thread matmul |
-| `GYRE_ENABLE_VULKAN` | OFF | Unimplemented |
+| `GYRE_ENABLE_VULKAN` | ON if SDK found | CharLM compute backend; runtime still defaults to CPU |
 
 Use **Release + OpenMP** for training. Debug `gyre-cli` is not a fair speed test.
 
@@ -74,12 +74,12 @@ gyre-cli ga [--gens 80] [--n 64] [--dim 64]
 gyre-cli lm train --data data/shakespeare.txt [--preset medium|tiny|tinygpt|nanogpt]
                  [--tokenizer bpe|chars|bytes|unigram] [--tok FILE.gyre.json]
                  [--vocab-size 2000] [--holdout 0.1] [--steps 2000] [--batch 4]
-                 [--ckpt data/charlm.gyre] [--recency alibi|none]
+                 [--ckpt data/charlm.gyre] [--recency alibi|none] [--device cpu|vulkan]
 
 gyre-cli lm generate --ckpt data/charlm.gyre --data data/shakespeare.txt
-                    [--prompt "To be"] [--chars 200] [--temp 0.8]
+                    [--prompt "To be"] [--chars 200] [--temp 0.8] [--device cpu|vulkan]
 
-gyre-cli lm eval --ckpt data/charlm.gyre --data data/shakespeare.txt [--split 0.1]
+gyre-cli lm eval --ckpt data/charlm.gyre --data data/shakespeare.txt [--split 0.1] [--device cpu|vulkan]
 
 gyre-cli lm export --ckpt data/charlm.gyre --onnx data/charlm.onnx
 
@@ -126,7 +126,8 @@ Index: [docs/README.md](docs/README.md).
 - [docs/design.md](docs/design.md) — design (some “v1 plan” text is historical; code has moved past the original stub)
 - [docs/tokenizer.md](docs/tokenizer.md)
 - [docs/grok.md](docs/grok.md)
+- [docs/vulkan.md](docs/vulkan.md) — optional GPU CharLM train/run (`--device vulkan`)
 
 ## Data not in git
 
-Large Hub shards and local `.gyre` training runs are gitignored (`data/grok2/*.safetensors`, `data/*.gyre`). Fetch or train locally. `data/shakespeare.txt` may be committed when present (~1 MiB).
+Large Hub shards and local `.gyre` training runs are gitignored (`data/grok2/*.safetensors`, `data/*.gyre`, `data/*.gyre.json`). Fetch or train locally. `data/shakespeare.txt` may be committed when present (~1 MiB).

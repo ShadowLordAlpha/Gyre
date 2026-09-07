@@ -138,32 +138,17 @@ Result<CharLM> CharLM::create(CharLMConfig c, std::shared_ptr<Device> d, Rng& rn
 
 Result<Tensor> CharLM::hidden(const Tensor& idx, ForwardCtx& ctx) {
   if (idx.rank() != 2) return std::unexpected(make_error(Errc::invalid_shape, "idx [B,T]"));
-  const auto B = idx.shape()[0], T = idx.shape()[1];
+  const auto T = idx.shape()[1];
   if (T > cfg_.block_size) return std::unexpected(make_error(Errc::invalid_shape, "T > block"));
   if (ctx.train) saved_idx_ = idx;
   auto tok = wte_.forward(idx, ctx);
   if (!tok) return tok;
-  std::int64_t psh[1] = {T};
-  auto pos = Tensor::empty(psh, DType::i32, idx.device());
+  auto pos = arange_i32(T, idx.device());
   if (!pos) return pos;
-  auto pp = pos->host_span<std::int32_t>();
-  if (!pp) return std::unexpected(pp.error());
-  for (std::int32_t i = 0; i < static_cast<std::int32_t>(T); ++i) (*pp)[static_cast<std::size_t>(i)] = i;
   auto pe = wpe_.forward(*pos, ctx);
   if (!pe) return pe;
-  auto x = Tensor::empty(tok->shape(), DType::f32, idx.device());
+  auto x = add_broadcast_time(*tok, *pe);
   if (!x) return x;
-  auto xp = x->host_span<float>();
-  auto tp = tok->host_span<float>();
-  auto pep = pe->host_span<float>();
-  if (!xp || !tp || !pep) return std::unexpected(make_error(Errc::not_cpu, "host"));
-  const auto C = cfg_.d_model;
-  for (std::int64_t b = 0; b < B; ++b)
-    for (std::int64_t t = 0; t < T; ++t)
-      for (std::int64_t c = 0; c < C; ++c)
-        (*xp)[static_cast<std::size_t>((b * T + t) * C + c)] =
-            (*tp)[static_cast<std::size_t>((b * T + t) * C + c)] +
-            (*pep)[static_cast<std::size_t>(t * C + c)];
 
   Tensor h = std::move(*x);
   for (auto& block : blocks_) {
@@ -192,18 +177,8 @@ Result<void> CharLM::hidden_backward(const Tensor& d_hidden, ForwardCtx& ctx) {
   // dh is d(tok + pe). tok is [B,T,C], pe is [T,C] broadcast.
   auto rtok = wte_.backward(dh, ctx);
   if (!rtok) return rtok;
-  const auto B = dh.shape()[0], T = dh.shape()[1], C = dh.shape()[2];
-  std::int64_t psh[2] = {T, C};
-  auto dpe = Tensor::zeros(psh, DType::f32, dh.device());
+  auto dpe = sum_batch_to_time(dh);
   if (!dpe) return std::unexpected(dpe.error());
-  auto a = dh.host_span<float>();
-  auto b = dpe->host_span<float>();
-  if (!a || !b) return std::unexpected(make_error(Errc::not_cpu, "host"));
-  for (std::int64_t bi = 0; bi < B; ++bi)
-    for (std::int64_t t = 0; t < T; ++t)
-      for (std::int64_t c = 0; c < C; ++c)
-        (*b)[static_cast<std::size_t>(t * C + c)] +=
-            (*a)[static_cast<std::size_t>((bi * T + t) * C + c)];
   return wpe_.backward(*dpe, ctx);
 }
 
@@ -265,7 +240,15 @@ Result<std::vector<std::int32_t>> CharLM::generate(std::vector<std::int32_t> pre
     ctx.train = false;
     auto logits = forward(*idx, ctx);
     if (!logits) return std::unexpected(logits.error());
-    auto p = logits->host_span<float>();
+    Tensor logits_h = std::move(*logits);
+    if (logits_h.device() && logits_h.device()->kind() != DeviceKind::cpu) {
+      auto cpu = Device::cpu();
+      if (!cpu) return std::unexpected(cpu.error());
+      auto c = logits_h.to(*cpu);
+      if (!c) return std::unexpected(c.error());
+      logits_h = std::move(*c);
+    }
+    auto p = logits_h.host_span<float>();
     if (!p) return std::unexpected(p.error());
     const auto V = cfg_.vocab;
     const float* last = p->data() + (ctx_n - 1) * V;

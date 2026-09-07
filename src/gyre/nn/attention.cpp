@@ -7,25 +7,6 @@
 namespace gyre {
 namespace {
 
-void apply_causal_recency(std::span<float> scores, std::int64_t B, std::int64_t H, std::int64_t T,
-                          bool alibi) {
-  for (std::int64_t b = 0; b < B; ++b) {
-    for (std::int64_t h = 0; h < H; ++h) {
-      const float slope =
-          alibi ? std::pow(2.f, -8.f * static_cast<float>(h + 1) / static_cast<float>(H)) : 0.f;
-      float* s = scores.data() + ((b * H + h) * T * T);
-      for (std::int64_t t = 0; t < T; ++t) {
-        for (std::int64_t j = 0; j < T; ++j) {
-          if (j > t)
-            s[t * T + j] += -1e9f;
-          else if (alibi)
-            s[t * T + j] += -slope * static_cast<float>(t - j);
-        }
-      }
-    }
-  }
-}
-
 void take(std::vector<Param>& flat, std::span<Param> s) {
   for (auto& p : s) flat.push_back(Param{p.value, p.grad});
 }
@@ -100,12 +81,12 @@ Result<Tensor> CausalSelfAttention::forward(const Tensor& x, ForwardCtx& ctx) {
   if (!kt) return kt;
   auto scores = bmm(*qh, *kt);
   if (!scores) return scores;
-  auto sp = scores->host_span<float>();
-  if (!sp) return std::unexpected(make_error(Errc::not_cpu, "host"));
   const float scale = 1.f / std::sqrt(static_cast<float>(dk));
-  for (auto& z : *sp) z *= scale;
-  apply_causal_recency(*sp, B, n_head_, T, recency_alibi_);
-  auto w = softmax_last(*scores);
+  auto scaled = mul_scalar(*scores, scale);
+  if (!scaled) return scaled;
+  auto mask = causal_alibi_(*scaled, recency_alibi_);
+  if (!mask) return std::unexpected(mask.error());
+  auto w = softmax_last(*scaled);
   if (!w) return w;
   if (ctx.train) saved_w_ = *w;
   auto y = bmm(*w, *vh);
@@ -145,12 +126,11 @@ Result<void> CausalSelfAttention::backward(const Tensor& d_att, ForwardCtx& ctx)
   if (!dvh) return std::unexpected(dvh.error());
   auto dz = softmax_last_backward(*saved_w_, *dw);
   if (!dz) return std::unexpected(dz.error());
-  auto dzp = dz->host_span<float>();
-  if (!dzp) return std::unexpected(dzp.error());
-  for (auto& z : *dzp) z *= scale;
-  auto dqh = bmm(*dz, *saved_kh_);
+  auto dzs = mul_scalar(*dz, scale);
+  if (!dzs) return std::unexpected(dzs.error());
+  auto dqh = bmm(*dzs, *saved_kh_);
   if (!dqh) return std::unexpected(dqh.error());
-  auto dzt = transpose_last2(*dz);
+  auto dzt = transpose_last2(*dzs);
   if (!dzt) return std::unexpected(dzt.error());
   auto dkh = bmm(*dzt, *saved_qh_);
   if (!dkh) return std::unexpected(dkh.error());

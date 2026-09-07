@@ -17,7 +17,7 @@ Intended runtime: Helix **links `gyre` in-process**. It is not a sidecar RPC ser
 | Recurrent controller (Elman) | **No** | Not implemented; ALiBi transformer used for sequence LMs instead |
 | Small transformer LM | **Yes** | CharLM presets `tiny` … `nanogpt`; BPE/chars/bytes/unigram |
 | ONNX export of CharLM | **Yes** | Write-only; no ORT link |
-| Vulkan / OpenCL | **No** | Reserved `DeviceKind` only |
+| Vulkan / OpenCL | **Train yes / tick no** | Optional CharLM `--device vulkan` (see [vulkan.md](vulkan.md)). Helix `act` stays CPU. OpenCL not implemented |
 | Full Grok-2 generate | **No** | Tiny/mini Grok-shaped nets + inspect/pack; 270B not runnable |
 
 **You do not need Elman RNN before Helix can try Gyre.** You need a Helix-side adapter and a policy sized to Helix obs/actions. **You need more GA only if Helix evolves network weights** (`flatten_params` is not in the tree).
@@ -40,7 +40,7 @@ cmake -S . -B cmake-build-release -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build cmake-build-release
 ```
 
-TUI is optional (`GYRE_ENABLE_TUI`). Tests: `GYRE_BUILD_TESTS`. Vulkan option exists and is unimplemented.
+TUI is optional (`GYRE_ENABLE_TUI`). Tests: `GYRE_BUILD_TESTS`. Vulkan CharLM compute is optional (`GYRE_ENABLE_VULKAN`, `--device vulkan`); default device is still CPU. OpenCL is not implemented.
 
 ## Adapter contract
 
@@ -131,7 +131,7 @@ There is **no** `nn/rnn.hpp`. Sequence memory for LMs is attention + ALiBi.
 
 Public fallible APIs return `gyre::Result<T>` (`std::expected`). Exceptions inside `.cpp` must not escape. Hosts see `expected` only.
 
-Kernels: CPU f32 (i32/u8 where needed). OpenMP GEMM when built with OpenMP. No CUDA.
+Kernels: CPU f32 (i32/u8 where needed). OpenMP GEMM when built with OpenMP. Optional Vulkan for CharLM train/eval/generate. No CUDA / OpenCL. Helix observations remain CPU f32.
 
 ## Suggested Helix spike (no new Gyre features)
 
@@ -140,4 +140,4 @@ Kernels: CPU f32 (i32/u8 where needed). OpenMP GEMM when built with OpenMP. No C
 3. Confirm tick latency on a dummy obs (design target: small nets, milliseconds on CPU).
 4. If you need evolved nets, file a request for param flatten; do not block the spike on islands or RNN.
 
-Further reading: [design.md](design.md) (architecture + GYRE1 bytes), [tokenizer.md](tokenizer.md), [grok.md](grok.md) (not required for Helix v1).
+Further reading: [design.md](design.md) (architecture + GYRE1 bytes; some “v1 plan” text is historical), [tokenizer.md](tokenizer.md), [vulkan.md](vulkan.md), [grok.md](grok.md) (not required for Helix v1).

@@ -4,14 +4,14 @@
 | --- | --- |
 | **Author** | Project owner (unassigned; design assumes **one sequential engineer**) |
 | **Date** | 2026-08-31 |
-| **Revised** | 2026-08-31 (v1 LM = Shakespeare-Tiny; ONNX v1.5; GPU future) |
-| **Status** | Draft |
+| **Revised** | 2026-09-06 (Vulkan CharLM train/eval/generate shipped; CPU remains default) |
+| **Status** | Historical v1/v1.5 plan plus later notes. **Current product:** `README.md`, [helix.md](helix.md), [vulkan.md](vulkan.md), [gyre-file.md](gyre-file.md). |
 | **Project** | Gyre (`E:\Github\Gyre`) |
 | **Language** | C++23 |
 | **License** | **MIT** (add `LICENSE` in PR 1; chosen for game/embed use) |
 | **Current tree** | `CMakeLists.txt`: `cmake_minimum_required(VERSION 4.3)`, `project(Gyre)`, `CMAKE_CXX_STANDARD 23`, `add_executable(Gyre main.cpp)`. `main.cpp` is a stub: `#include <iostream>` and empty `main()` (iostream unused). `vcpkg.json`: name `gyre`, `version-string` `1.0.0`, empty `dependencies`, `builtin-baseline` `18a4723aeb7adbbae84bcff0edf510883800f32f`. CLion `cmake-build-debug/` present. No library layout. |
 
-**Staffing / time box.** One engineer, sequential PRs. **v1** is PRs 1–12 (library, CPU tensor, GA OneMax, Linear/Adam, GYRE1, **Shakespeare-Tiny pre-LN transformer**, adapter stub). **v1.5**: Elman RNN (PR 13), TinyGPT, TUI, **ONNX export**, islands. **Future (unscheduled):** Vulkan then OpenCL compute backends; neuroevolution flatten is PR 17 in v1.5. Do not start TUI until v1 trains and checkpoints Shakespeare-Tiny.
+**Staffing / time box.** One engineer, sequential PRs. **v1** is PRs 1–12 (library, CPU tensor, GA OneMax, Linear/Adam, GYRE1, **Shakespeare-Tiny pre-LN transformer**, adapter stub). **v1.5**: Elman RNN (PR 13), TinyGPT, TUI, **ONNX export**, islands. **Shipped after v1.5:** Vulkan CharLM compute (`--device vulkan`, CPU default). **Still later:** OpenCL, neuroevolution flatten (PR 17 in v1.5). Do not start TUI until v1 trains and checkpoints Shakespeare-Tiny.
 
 ---
 
@@ -55,12 +55,12 @@ Elman RNN (PR 13), TinyGPT byte-level preset, optional `gyre-tui` (FTXUI), **ONN
 
 ### Future extensions (not v1.5)
 
-Vulkan compute backend, then OpenCL. `DeviceKind::vulkan` / `opencl` may exist as unused enumerants. `GYRE_ENABLE_VULKAN` remains **OFF** and unimplemented.
+**Vulkan CharLM compute is implemented** (`Device::vulkan()`, CLI `--device vulkan`, `docs/vulkan.md`). CPU remains the default. OpenCL is still later. `DeviceKind::opencl` stays unused.
 
 ### Non-goals
 
 - CUDA / cuDNN / TensorRT / DX12 compute (v1–v1.5 and not scheduled).
-- **Vulkan / OpenCL implementation in v1.5** (future extensions only).
+- OpenCL implementation (Vulkan CharLM is later than v1.5 and now in tree).
 - Distributed training.
 - Dynamic autograd tape as the primary API.
 - Hugging Face, Python bindings. **ONNX Runtime as a training/core dep** — export-only in v1.5, not a compute backend.
@@ -95,7 +95,7 @@ Vulkan compute backend, then OpenCL. `DeviceKind::vulkan` / `opencl` may exist a
 | Dataset I/O | `std::ifstream` whole file into `std::string` for char data **v1** (files ≤ 64 MiB). No mmap text | Simple |
 | Tokenizer | `Tokenizer` = Pretokenizer + VocabModel (`docs/tokenizer.md`). Chars/bytes = BPE with 0 merges. On-disk: `*.gyre.json` plus GYRE1 trailer | HF / SentencePiece import; no `CharTokenizer` class |
 | TUI | CMake `GYRE_ENABLE_TUI`, vcpkg feature `tui`, target `gyre-tui` | One name |
-| Device selection | **CLI only** parses `--device=cpu`. **No** `GYRE_DEVICE` inside `libgyre`. Vulkan/OpenCL CLI values are future | Core stays explicit |
+| Device selection | **CLI only** parses `--device=cpu` (default) or `--device=vulkan`. **No** `GYRE_DEVICE` inside `libgyre` | Core stays explicit |
 | CMake min | **3.28** in `cmake_minimum_required`; local CLion may still run 4.3 | Contributors/CI; do not require 4.3 |
 | vcpkg version | Align `version-string` to **0.1.0** in PR 1 (was placeholder 1.0.0) | Honest semver |
 | gtest | vcpkg `gtest` **with default features** | Avoid dropping the lib |
@@ -876,8 +876,8 @@ Assumes **one engineer**, each PR mergeable. **v1 = PR 1–12** (transformer gat
 
 Not in the v1.5 PR band. **Do not** schedule these as PR 16.
 
-1. **Vulkan `Device`:** `device_vulkan.cpp`, in-tree SPIR-V, `GYRE_ENABLE_VULKAN`, ports `vulkan-headers`/`vulkan-loader`. Same `Ops` names; CPU tests remain source of truth. Enumerant already reserved.
-2. **OpenCL `Device`:** after Vulkan proves the GPU `Ops` split. Enumerant already reserved.
+1. **Vulkan `Device` (shipped for CharLM):** `src/gyre/vk/`, in-tree GLSL → SPIR-V, `GYRE_ENABLE_VULKAN`, same `Ops` names; CPU tests remain source of truth. Grok RoPE/MoE/GQA GPU kernels are not in this pass. See [vulkan.md](vulkan.md).
+2. **OpenCL `Device`:** after Vulkan; enumerant already reserved.
 
 ---
 

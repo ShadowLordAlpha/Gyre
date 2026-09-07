@@ -1,5 +1,9 @@
 #include "gyre/module.hpp"
 
+#if defined(GYRE_VULKAN)
+#include "vk/ops.hpp"
+#endif
+
 #include <cmath>
 #include <cstring>
 
@@ -30,6 +34,11 @@ Result<LossPair> softmax_cross_entropy(const Tensor& logits, const Tensor& targe
   if (targets_i32.shape()[0] != B || targets_i32.shape()[1] != T) {
     return std::unexpected(make_error(Errc::invalid_shape, "CE target shape"));
   }
+#if defined(GYRE_VULKAN)
+  if (logits.device() && logits.device()->kind() == DeviceKind::vulkan) {
+    return vkops::softmax_cross_entropy(logits, targets_i32);
+  }
+#endif
   auto sm = softmax_last(logits);
   if (!sm) return std::unexpected(sm.error());
   auto p = sm->host_span<float>();

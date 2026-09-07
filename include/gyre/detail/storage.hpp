@@ -10,6 +10,11 @@
 
 namespace gyre {
 
+struct GpuAlloc {
+  virtual ~GpuAlloc() = default;
+  virtual std::size_t size() const noexcept = 0;
+};
+
 struct Storage {
   std::vector<std::byte> heap;
   std::byte* mapped{nullptr};
@@ -21,6 +26,8 @@ struct Storage {
   int posix_fd{-1};
 #endif
 
+  std::unique_ptr<GpuAlloc> gpu;
+
   Storage() = default;
   Storage(const Storage&) = delete;
   Storage& operator=(const Storage&) = delete;
@@ -28,7 +35,10 @@ struct Storage {
 
   std::byte* data() noexcept { return mapped ? mapped : heap.data(); }
   const std::byte* data() const noexcept { return mapped ? mapped : heap.data(); }
-  std::size_t size() const noexcept { return mapped ? mapped_len : heap.size(); }
+  std::size_t size() const noexcept {
+    if (gpu) return gpu->size();
+    return mapped ? mapped_len : heap.size();
+  }
 
   static Result<std::shared_ptr<Storage>> mmap_file(const std::filesystem::path& path);
 };

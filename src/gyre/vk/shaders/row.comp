@@ -1,0 +1,189 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer S0 { float s0[]; };
+layout(std430, binding = 1) buffer S1 { float s1[]; };
+layout(std430, binding = 2) buffer S2 { float s2[]; };
+layout(std430, binding = 3) buffer S3 { float s3[]; };
+layout(std430, binding = 4) buffer S4 { uint s4u[]; };
+layout(std430, binding = 5) buffer S5 { uint s5u[]; };
+layout(std430, binding = 6) buffer II { int ii[]; };
+
+layout(push_constant) uniform PC {
+  uint u0;
+  uint u1;
+  uint u2;
+  uint u3;
+  uint u4;
+  uint u5;
+  float f0;
+  float f1;
+  float f2;
+  float f3;
+  float f4;
+  float f5;
+} pc;
+
+shared float red[256];
+
+float reduce_max(float v) {
+  red[gl_LocalInvocationID.x] = v;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (gl_LocalInvocationID.x < s)
+      red[gl_LocalInvocationID.x] = max(red[gl_LocalInvocationID.x], red[gl_LocalInvocationID.x + s]);
+    barrier();
+  }
+  return red[0];
+}
+
+float reduce_sum(float v) {
+  red[gl_LocalInvocationID.x] = v;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (gl_LocalInvocationID.x < s) red[gl_LocalInvocationID.x] += red[gl_LocalInvocationID.x + s];
+    barrier();
+  }
+  return red[0];
+}
+
+void atomicAddU(uint i, float v) {
+  uint old = s4u[i];
+  for (;;) {
+    uint n = floatBitsToUint(uintBitsToFloat(old) + v);
+    uint r = atomicCompSwap(s4u[i], old, n);
+    if (r == old) return;
+    old = r;
+  }
+}
+
+void atomicAddU5(uint i, float v) {
+  uint old = s5u[i];
+  for (;;) {
+    uint n = floatBitsToUint(uintBitsToFloat(old) + v);
+    uint r = atomicCompSwap(s5u[i], old, n);
+    if (r == old) return;
+    old = r;
+  }
+}
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  uint lid = gl_LocalInvocationID.x;
+  uint cols = pc.u1;
+  uint op = pc.u2;
+  uint rows = pc.u0;
+
+  if (op == 6u) {
+    float sm = 0.0;
+    for (uint i = lid; i < cols; i += 256u) sm += s0[i];
+    sm = reduce_sum(sm);
+    if (lid == 0u) s1[0] = sm * pc.f1;
+    return;
+  }
+
+  if (row >= rows) return;
+  uint base = row * cols;
+
+  if (op == 0u) {
+    float m = -1.0e30;
+    for (uint i = lid; i < cols; i += 256u) m = max(m, s0[base + i]);
+    m = reduce_max(m);
+    float sm = 0.0;
+    for (uint i = lid; i < cols; i += 256u) {
+      float e = exp(s0[base + i] - m);
+      s1[base + i] = e;
+      sm += e;
+    }
+    sm = reduce_sum(sm);
+    for (uint i = lid; i < cols; i += 256u) s1[base + i] /= sm;
+    return;
+  }
+
+  if (op == 1u) {
+    float dot = 0.0;
+    for (uint i = lid; i < cols; i += 256u) dot += s0[base + i] * s1[base + i];
+    dot = reduce_sum(dot);
+    for (uint i = lid; i < cols; i += 256u) s2[base + i] = s0[base + i] * (s1[base + i] - dot);
+    return;
+  }
+
+  if (op == 2u) {
+    float mean = 0.0;
+    for (uint i = lid; i < cols; i += 256u) mean += s0[base + i];
+    mean = reduce_sum(mean) / float(cols);
+    float var = 0.0;
+    for (uint i = lid; i < cols; i += 256u) {
+      float d = s0[base + i] - mean;
+      var += d * d;
+    }
+    var = reduce_sum(var) / float(cols);
+    float inv = inversesqrt(var + pc.f0);
+    for (uint i = lid; i < cols; i += 256u)
+      s3[base + i] = (s0[base + i] - mean) * inv * s1[i] + s2[i];
+    return;
+  }
+
+  if (op == 3u) {
+    float mean = 0.0;
+    for (uint i = lid; i < cols; i += 256u) mean += s0[base + i];
+    mean = reduce_sum(mean) / float(cols);
+    float var = 0.0;
+    for (uint i = lid; i < cols; i += 256u) {
+      float d = s0[base + i] - mean;
+      var += d * d;
+    }
+    var = reduce_sum(var) / float(cols);
+    float inv = inversesqrt(var + pc.f0);
+    float sdx = 0.0;
+    float sdxh = 0.0;
+    for (uint i = lid; i < cols; i += 256u) {
+      float xhat = (s0[base + i] - mean) * inv;
+      float dxhat = s1[base + i] * s2[i];
+      atomicAddU(i, s1[base + i] * xhat);
+      atomicAddU5(i, s1[base + i]);
+      sdx += dxhat;
+      sdxh += dxhat * xhat;
+    }
+    sdx = reduce_sum(sdx);
+    sdxh = reduce_sum(sdxh);
+    float invC = inv / float(cols);
+    for (uint i = lid; i < cols; i += 256u) {
+      float xhat = (s0[base + i] - mean) * inv;
+      float dxhat = s1[base + i] * s2[i];
+      s3[base + i] = invC * (float(cols) * dxhat - sdx - xhat * sdxh);
+    }
+    return;
+  }
+
+  if (op == 4u) {
+    float m = -1.0e30;
+    for (uint i = lid; i < cols; i += 256u) m = max(m, s0[base + i]);
+    m = reduce_max(m);
+    float sm = 0.0;
+    for (uint i = lid; i < cols; i += 256u) sm += exp(s0[base + i] - m);
+    sm = reduce_sum(sm);
+    int t = ii[row];
+    if (lid == 0u) {
+      float pt = 1e-12;
+      if (t >= 0 && t < int(cols)) pt = max(exp(s0[base + uint(t)] - m) / sm, 1e-12);
+      s2[row] = -log(pt);
+    }
+    barrier();
+    float scale = pc.f1;
+    for (uint i = lid; i < cols; i += 256u) {
+      float p = exp(s0[base + i] - m) / sm;
+      if (int(i) == t) p -= 1.0;
+      s1[base + i] = p * scale;
+    }
+    return;
+  }
+
+  if (op == 5u) {
+    float ms = 0.0;
+    for (uint i = lid; i < cols; i += 256u) ms += s0[base + i] * s0[base + i];
+    ms = reduce_sum(ms) / float(cols);
+    float inv = inversesqrt(ms + pc.f0);
+    for (uint i = lid; i < cols; i += 256u) s2[base + i] = s0[base + i] * inv * s1[i];
+  }
+}

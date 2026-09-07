@@ -20,7 +20,8 @@ There is **no official small Grok**. Grok-1 is 314B; Grok-2 is ~270B (~500 GB). 
 - Residual stack + chunked 2 GB tensors; packed prefixes are ~0.75–0.81 (embed 1 MiB prefix ~0.61) — see `docs/grok-compress.md`. Target ~250 GB is a packer goal, not a CI gate.
 - Bind TP-8 Hub shards + expert paging for 270B generate
 - GrokLM full backward / 270B train
-- Vulkan, f16 GEMM, GGUF quant (lossy on purpose)
+- Grok-shaped nets on Vulkan (CharLM GPU path does not cover RoPE/MoE/GQA)
+- f16 GEMM, GGUF quant (lossy on purpose)
 
 ## CLI
 

@@ -37,6 +37,7 @@ struct CharLMOpts {
   std::uint32_t ckpt_every{100};
   float temperature{0.8f};  // 0 = greedy
   bool recency_alibi{true};  // ALiBi token-distance bias; off for old checkpoints
+  std::string device{"cpu"};  // cpu | vulkan
 };
 
 void apply_charlm_preset(CharLMOpts& o);

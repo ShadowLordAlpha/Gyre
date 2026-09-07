@@ -32,7 +32,16 @@ Result<Tensor> rope(const Tensor& x, const Tensor& positions_i32, float theta, f
 float attn_temperature_scale(std::int64_t seq_len, std::int64_t temp_len) noexcept;
 
 Result<void> fill_zero(Tensor& t);
+Result<void> fill(Tensor& t, float value);
 Result<void> add_(Tensor& dst, const Tensor& src);
+Result<Tensor> mul_scalar(const Tensor& a, float s);
+Result<void> causal_alibi_(Tensor& scores, bool alibi);
+Result<Tensor> add_broadcast_time(const Tensor& tok, const Tensor& pe);
+Result<Tensor> sum_batch_to_time(const Tensor& dh);
+Result<Tensor> arange_i32(std::int64_t n, std::shared_ptr<Device> d);
+Result<Tensor> layer_norm_backward(const Tensor& x, const Tensor& d_out, const Tensor& w, Tensor& gw,
+                                   Tensor& gb, float eps);
+Result<void> embedding_backward(Tensor& grad_W, const Tensor& idx, const Tensor& d_out);
 
 // Rank-3 [B,T,C] or rank-1 [C] → rank-2 rows×C sharing storage.
 Result<Tensor> flatten_leading(const Tensor& x);

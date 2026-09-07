@@ -12,6 +12,7 @@
 #include <memory>
 #include <span>
 #include <type_traits>
+#include <vector>
 
 namespace gyre {
 
@@ -34,6 +35,10 @@ class Tensor {
   Result<Tensor> clone() const;
   Result<Tensor> to(std::shared_ptr<Device> device) const;
   Result<Tensor> to_f32() const;
+  Result<void> copy_from_host(std::span<const std::byte> bytes);
+  Result<void> copy_to_host(std::span<std::byte> bytes) const;
+  Result<std::vector<std::byte>> to_host_vec() const;
+  Result<float> item_f32() const;
   static Result<Tensor> from_storage(std::shared_ptr<Storage> st, std::size_t byte_offset,
                                      std::span<const std::int64_t> shape, DType dtype,
                                      std::shared_ptr<Device> device);

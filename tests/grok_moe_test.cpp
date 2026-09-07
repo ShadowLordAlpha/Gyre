@@ -13,7 +13,7 @@ gyre::Result<gyre::Tensor> zeros2(std::int64_t r, std::int64_t c, std::shared_pt
   return gyre::Tensor::zeros(sh, gyre::DType::f32, d);
 }
 
-void fill(gyre::Tensor& t, float v) {
+void fill_const(gyre::Tensor& t, float v) {
   auto p = t.host_span<float>();
   for (auto& x : *p) x = v;
 }
@@ -47,21 +47,21 @@ TEST(GrokMoe, Expert0OnlyMatchesDensePlusExpert) {
   auto d = gyre::Device::cpu();
   const std::int64_t N = 2, Dim = 4, I = 8, E = 2, k = 1;
   auto x = zeros2(N, Dim, *d);
-  fill(*x, 0.2f);
+  fill_const(*x, 0.2f);
   auto dw1 = zeros2(Dim, I, *d);
   auto dw3 = zeros2(Dim, I, *d);
   auto dw2 = zeros2(I, Dim, *d);
-  fill(*dw1, 0.05f);
-  fill(*dw3, 0.04f);
-  fill(*dw2, 0.03f);
+  fill_const(*dw1, 0.05f);
+  fill_const(*dw3, 0.04f);
+  fill_const(*dw2, 0.03f);
   gyre::SwiGLUWeights dense{&*dw1, &*dw3, &*dw2};
 
   auto e0w1 = zeros2(Dim, I, *d);
   auto e0w3 = zeros2(Dim, I, *d);
   auto e0w2 = zeros2(I, Dim, *d);
-  fill(*e0w1, 0.1f);
-  fill(*e0w3, 0.1f);
-  fill(*e0w2, 0.1f);
+  fill_const(*e0w1, 0.1f);
+  fill_const(*e0w3, 0.1f);
+  fill_const(*e0w2, 0.1f);
   auto z1 = zeros2(Dim, I, *d);
   auto z3 = zeros2(Dim, I, *d);
   auto z2 = zeros2(I, Dim, *d);
@@ -70,7 +70,7 @@ TEST(GrokMoe, Expert0OnlyMatchesDensePlusExpert) {
   gyre::SwiGLUWeights experts[] = {exp0, exp1};
 
   auto rw = zeros2(Dim, E, *d);
-  fill(*rw, 0.f);
+  fill_const(*rw, 0.f);
   auto pr = rw->host_span<float>();
   for (std::int64_t i = 0; i < Dim; ++i) (*pr)[static_cast<std::size_t>(i * E + 0)] = 5.f;
 
@@ -92,13 +92,13 @@ TEST(GrokMoe, ResidualAblationChangesOutput) {
   auto d = gyre::Device::cpu();
   const std::int64_t N = 1, Dim = 4, I = 4, E = 2;
   auto x = zeros2(N, Dim, *d);
-  fill(*x, 0.3f);
+  fill_const(*x, 0.3f);
   auto dw1 = zeros2(Dim, I, *d);
   auto dw3 = zeros2(Dim, I, *d);
   auto dw2 = zeros2(I, Dim, *d);
-  fill(*dw1, 0.2f);
-  fill(*dw3, 0.2f);
-  fill(*dw2, 0.2f);
+  fill_const(*dw1, 0.2f);
+  fill_const(*dw3, 0.2f);
+  fill_const(*dw2, 0.2f);
   auto z1 = zeros2(Dim, I, *d);
   auto z3 = zeros2(Dim, I, *d);
   auto z2 = zeros2(I, Dim, *d);
@@ -118,9 +118,9 @@ TEST(GrokMoe, ResidualAblationChangesOutput) {
     d2 += e * e;
   }
   EXPECT_NEAR(d2, 0.f, 1e-8f);
-  fill(*dw1, 0.f);
-  fill(*dw3, 0.f);
-  fill(*dw2, 0.f);
+  fill_const(*dw1, 0.f);
+  fill_const(*dw3, 0.f);
+  fill_const(*dw2, 0.f);
   auto y2 = gyre::residual_moe(*x, dense, *rw, experts, 2, 0.f);
   ASSERT_TRUE(y2);
   auto p2 = y2->host_span<float>();
@@ -144,12 +144,12 @@ TEST(GrokMoe, TwoTokensDifferentExperts) {
   auto e1w1 = zeros2(Dim, I, *d);
   auto e1w3 = zeros2(Dim, I, *d);
   auto e1w2 = zeros2(I, Dim, *d);
-  fill(*e0w1, 1.f);
-  fill(*e0w3, 1.f);
-  fill(*e0w2, 1.f);
-  fill(*e1w1, 0.5f);
-  fill(*e1w3, 0.5f);
-  fill(*e1w2, 0.5f);
+  fill_const(*e0w1, 1.f);
+  fill_const(*e0w3, 1.f);
+  fill_const(*e0w2, 1.f);
+  fill_const(*e1w1, 0.5f);
+  fill_const(*e1w3, 0.5f);
+  fill_const(*e1w2, 0.5f);
   gyre::SwiGLUWeights dense{&*z1, &*z3, &*z2};
   gyre::SwiGLUWeights exp0{&*e0w1, &*e0w3, &*e0w2};
   gyre::SwiGLUWeights exp1{&*e1w1, &*e1w3, &*e1w2};

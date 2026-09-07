@@ -1,5 +1,9 @@
 #include "gyre/optim.hpp"
 
+#if defined(GYRE_VULKAN)
+#include "vk/ops.hpp"
+#endif
+
 #include <cmath>
 
 namespace gyre {
@@ -24,6 +28,17 @@ Result<void> Adam::step(std::span<Param> params) {
   ++t;
   const float b1t = 1.f - std::pow(beta1, static_cast<float>(t));
   const float b2t = 1.f - std::pow(beta2, static_cast<float>(t));
+#if defined(GYRE_VULKAN)
+  if (!params.empty() && params[0].value.device() &&
+      params[0].value.device()->kind() == DeviceKind::vulkan) {
+    for (std::size_t i = 0; i < params.size(); ++i) {
+      auto r = vkops::adam_step(params[i].value, params[i].grad, m[i], v[i], lr, beta1, beta2, eps, b1t,
+                                b2t);
+      if (!r) return r;
+    }
+    return {};
+  }
+#endif
   for (std::size_t i = 0; i < params.size(); ++i) {
     auto g = params[i].grad.host_span<float>();
     auto w = params[i].value.host_span<float>();

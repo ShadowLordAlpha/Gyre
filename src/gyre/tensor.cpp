@@ -1,8 +1,14 @@
 #include "gyre/tensor.hpp"
+#include "gyre/ops.hpp"
+
+#if defined(GYRE_VULKAN)
+#include "vk/runtime.hpp"
+#endif
 
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace gyre {
 namespace {
@@ -71,8 +77,8 @@ Tensor::Tensor(std::shared_ptr<Device> d, std::shared_ptr<Storage> s, std::size_
 Result<Tensor> Tensor::empty(std::span<const std::int64_t> shape, DType dtype,
                              std::shared_ptr<Device> device) {
   if (!device) return std::unexpected(make_error(Errc::unsupported, "null device"));
-  if (device->kind() != DeviceKind::cpu) {
-    return std::unexpected(make_error(Errc::unsupported, "v1 CPU only"));
+  if (device->kind() != DeviceKind::cpu && device->kind() != DeviceKind::vulkan) {
+    return std::unexpected(make_error(Errc::unsupported, "device not implemented"));
   }
   if (!v1_dtype(dtype)) {
     return std::unexpected(make_error(Errc::unsupported, "dtype not enabled in v1"));
@@ -80,21 +86,97 @@ Result<Tensor> Tensor::empty(std::span<const std::int64_t> shape, DType dtype,
   auto n = product_shape(shape);
   if (!n) return std::unexpected(n.error());
   const auto bytes = static_cast<std::size_t>(*n) * dtype_size(dtype);
-  auto st = std::make_shared<Storage>();
-  st->heap.resize(bytes);
+  std::shared_ptr<Storage> st;
+  if (device->kind() == DeviceKind::vulkan) {
+#if defined(GYRE_VULKAN)
+    auto* vk = vkrt::VulkanDevice::from(device.get());
+    if (!vk) return std::unexpected(make_error(Errc::unsupported, "vulkan device"));
+    auto gst = vk->alloc(bytes);
+    if (!gst) return std::unexpected(gst.error());
+    st = std::move(*gst);
+#else
+    return std::unexpected(make_error(Errc::unsupported, "built without Vulkan"));
+#endif
+  } else {
+    st = std::make_shared<Storage>();
+    st->heap.resize(bytes);
+  }
   std::array<std::int64_t, 8> sh{};
   for (std::size_t i = 0; i < shape.size(); ++i) sh[i] = shape[i];
   return Tensor(std::move(device), std::move(st), 0, dtype, sh,
                 static_cast<std::uint8_t>(shape.size()), *n);
 }
 
+Result<void> Tensor::copy_from_host(std::span<const std::byte> bytes) {
+  if (bytes.size() != nbytes()) {
+    return std::unexpected(make_error(Errc::invalid_shape, "copy_from_host size"));
+  }
+  if (!device_ || device_->kind() == DeviceKind::cpu) {
+    auto hb = host_bytes();
+    if (!hb) return std::unexpected(hb.error());
+    std::memcpy(hb->data(), bytes.data(), bytes.size());
+    return {};
+  }
+#if defined(GYRE_VULKAN)
+  if (device_->kind() == DeviceKind::vulkan) {
+    auto* vk = vkrt::VulkanDevice::from(device_.get());
+    if (!vk || !storage_) return std::unexpected(make_error(Errc::unsupported, "vulkan storage"));
+    return vk->upload(*storage_, offset_, bytes);
+  }
+#endif
+  return std::unexpected(make_error(Errc::unsupported, "copy_from_host device"));
+}
+
+Result<void> Tensor::copy_to_host(std::span<std::byte> bytes) const {
+  if (bytes.size() != nbytes()) {
+    return std::unexpected(make_error(Errc::invalid_shape, "copy_to_host size"));
+  }
+  if (!device_ || device_->kind() == DeviceKind::cpu) {
+    auto hb = host_bytes();
+    if (!hb) return std::unexpected(hb.error());
+    std::memcpy(bytes.data(), hb->data(), bytes.size());
+    return {};
+  }
+#if defined(GYRE_VULKAN)
+  if (device_->kind() == DeviceKind::vulkan) {
+    auto* vk = vkrt::VulkanDevice::from(device_.get());
+    if (!vk || !storage_) return std::unexpected(make_error(Errc::unsupported, "vulkan storage"));
+    return vk->download(*storage_, offset_, bytes);
+  }
+#endif
+  return std::unexpected(make_error(Errc::unsupported, "copy_to_host device"));
+}
+
+Result<std::vector<std::byte>> Tensor::to_host_vec() const {
+  std::vector<std::byte> b(nbytes());
+  auto r = copy_to_host(b);
+  if (!r) return std::unexpected(r.error());
+  return b;
+}
+
+Result<float> Tensor::item_f32() const {
+  if (dtype_ != DType::f32 || numel_ != 1) {
+    return std::unexpected(make_error(Errc::invalid_shape, "item_f32"));
+  }
+  if (device_ && device_->kind() == DeviceKind::cpu) {
+    auto p = host_span<float>();
+    if (!p) return std::unexpected(p.error());
+    return (*p)[0];
+  }
+  std::byte buf[4];
+  auto r = copy_to_host(std::span<std::byte>(buf, 4));
+  if (!r) return std::unexpected(r.error());
+  float f = 0;
+  std::memcpy(&f, buf, 4);
+  return f;
+}
+
 Result<Tensor> Tensor::zeros(std::span<const std::int64_t> shape, DType dtype,
                              std::shared_ptr<Device> device) {
   auto t = empty(shape, dtype, std::move(device));
   if (!t) return t;
-  auto hb = t->host_bytes();
-  if (!hb) return std::unexpected(hb.error());
-  std::memset(hb->data(), 0, hb->size());
+  auto z = fill_zero(*t);
+  if (!z) return std::unexpected(z.error());
   return t;
 }
 
@@ -102,28 +184,36 @@ Result<Tensor> Tensor::from_host(std::span<const std::byte> bytes, std::span<con
                                  DType dtype, std::shared_ptr<Device> device) {
   auto t = empty(shape, dtype, std::move(device));
   if (!t) return t;
-  if (bytes.size() != t->nbytes()) {
-    return std::unexpected(make_error(Errc::invalid_shape, "from_host size mismatch"));
-  }
-  auto hb = t->host_bytes();
-  if (!hb) return std::unexpected(hb.error());
-  std::memcpy(hb->data(), bytes.data(), bytes.size());
+  auto c = t->copy_from_host(bytes);
+  if (!c) return std::unexpected(c.error());
   return t;
 }
 
 Result<Tensor> Tensor::clone() const {
-  auto hb = host_bytes();
+  auto out = empty(shape(), dtype_, device_);
+  if (!out) return out;
+#if defined(GYRE_VULKAN)
+  if (device_ && device_->kind() == DeviceKind::vulkan && storage_ && out->storage_) {
+    auto* vk = vkrt::VulkanDevice::from(device_.get());
+    if (!vk) return std::unexpected(make_error(Errc::unsupported, "vulkan device"));
+    auto r = vk->copy(*out->storage_, out->offset_, *storage_, offset_, nbytes());
+    if (!r) return std::unexpected(r.error());
+    return out;
+  }
+#endif
+  auto hb = to_host_vec();
   if (!hb) return std::unexpected(hb.error());
-  return from_host(*hb, shape(), dtype_, device_);
+  auto c = out->copy_from_host(*hb);
+  if (!c) return std::unexpected(c.error());
+  return out;
 }
 
 Result<Tensor> Tensor::to(std::shared_ptr<Device> device) const {
   if (!device) return std::unexpected(make_error(Errc::unsupported, "null device"));
   if (device.get() == device_.get()) return clone();
-  if (device->kind() != DeviceKind::cpu || device_->kind() != DeviceKind::cpu) {
-    return std::unexpected(make_error(Errc::unsupported, "v1 CPU only"));
-  }
-  return clone();
+  auto bytes = to_host_vec();
+  if (!bytes) return std::unexpected(bytes.error());
+  return from_host(*bytes, shape(), dtype_, std::move(device));
 }
 
 Result<std::span<std::byte>> Tensor::host_bytes() {

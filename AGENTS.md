@@ -55,13 +55,27 @@ gyre-cli lm train --data data/shakespeare.txt --preset nanogpt --tok data/nanogp
 
 ## Speed and quality
 
-- Debug `cmake-build-debug/gyre-cli` is the first training-speed problem. Release + OpenMP GEMM (`omp_in_parallel()` guards nested matmul). Vulkan/OpenCL later for 10M+/T=512+; not CUDA.
+- Debug `cmake-build-debug/gyre-cli` is the first training-speed problem. Release + OpenMP GEMM (`omp_in_parallel()` guards nested matmul). Optional Vulkan: `--device vulkan` (CPU remains default). OpenCL/CUDA not in tree.
 - Sampling: temperature 0.65–0.75 + a cue prompt; greedy often loops.
 - LR: `lr_start` → `lr` over first 20% of steps unless `--lr-decay-steps` is set.
 - Compare only with matching holdout, same file, same tokenizer family.
 
+## Vulkan (CharLM only)
+
+- Runtime default is always CPU. CLI `--device cpu|vulkan` (`gpu` aliases vulkan). **No** `GYRE_DEVICE` env inside `libgyre`. Missing GPU/build is an **error**, not a silent CPU fallback.
+- CMake `GYRE_ENABLE_VULKAN`: ON in a fresh configure if the SDK + `glslangValidator` exist; auto-off otherwise. Old CMake caches that stored OFF need `-DGYRE_ENABLE_VULKAN=ON` once.
+- Implementation: `src/gyre/vk/` (raw `vulkan.h`, device-local buffers + staging, GLSL compute → SPIR-V at build). Same `ops.hpp` names; `host_span` stays CPU-only.
+- Train/eval/generate CharLM on GPU. Tokenizer, ONNX export, GA, Helix `act`, Grok RoPE/MoE stay CPU.
+- Tests: `tests/vulkan_ops_test.cpp` (skip if no device). Write-up: `docs/vulkan.md`.
+- Vulkan nanogpt can raise `--batch` vs CPU 2 if VRAM allows.
+
+```
+gyre-cli lm train --data data/shakespeare.txt --preset nanogpt --tokenizer chars \
+  --holdout 0.1 --steps 5000 --batch 8 --device vulkan --ckpt data/nanogpt-char.gyre
+```
+
 ## Stack / don’t do unless asked
 
-C++23, CPU Device singleton first, then Vulkan/OpenCL. Helix/StarCraft adapters later. Do not start Elman/leaky-state, island GA, or Vulkan unless requested. Recency-biased attention was chosen over RNN fade for v1.5.
+C++23, CPU Device is the default. Vulkan CharLM train/eval/generate is implemented behind `--device vulkan`. Helix/StarCraft adapters later. Do not start Elman/leaky-state, island GA, or OpenCL unless requested. Recency-biased attention was chosen over RNN fade for v1.5.
 
 Build: `vcvars64` then `cmake --build` the Ninja dir (`cmake-build-gyre` or `cmake-build-release`).

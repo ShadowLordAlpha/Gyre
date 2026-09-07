@@ -168,8 +168,9 @@ static Result<std::unique_ptr<Tokenizer>> make_tokenizer(const CharLMOpts& opts,
 }
 
 Result<std::string> run_charlm_train(const CharLMOpts& opts, LogFn log) {
-  auto dev = Device::cpu();
+  auto dev = Device::open(opts.device);
   if (!dev) return std::unexpected(dev.error());
+  if (log) log(std::string("device ") + ((*dev)->kind() == DeviceKind::vulkan ? "vulkan" : "cpu"));
   auto text = load_text(opts.data);
   if (text.size() < 200) {
     return std::unexpected(make_error(Errc::io, "need a text file at " + opts.data.string()));
@@ -281,7 +282,7 @@ Result<std::string> run_charlm_generate(const CharLMOpts& opts_in, std::string p
                                         LogFn log) {
   CharLMOpts opts = opts_in;
   apply_charlm_preset(opts);
-  auto dev = Device::cpu();
+  auto dev = Device::open(opts.device);
   if (!dev) return std::unexpected(dev.error());
   auto peek = peek_gyre(opts.ckpt);
   if (!peek) return std::unexpected(peek.error());
@@ -359,7 +360,7 @@ Result<void> run_charlm_export_onnx(const CharLMOpts& opts_in, const std::filesy
 Result<EvalReport> run_charlm_eval(const CharLMOpts& opts_in, double split, LogFn log) {
   CharLMOpts opts = opts_in;
   apply_charlm_preset(opts);
-  auto dev = Device::cpu();
+  auto dev = Device::open(opts.device);
   if (!dev) return std::unexpected(dev.error());
   auto peek = peek_gyre(opts.ckpt);
   if (!peek) return std::unexpected(peek.error());
@@ -412,9 +413,9 @@ Result<EvalReport> run_charlm_eval(const CharLMOpts& opts_in, double split, LogF
     if (!logits) return std::unexpected(logits.error());
     auto loss = softmax_cross_entropy(*logits, *y);
     if (!loss) return std::unexpected(loss.error());
-    auto lv = loss->value.host_span<float>();
+    auto lv = loss->value.item_f32();
     if (!lv) return std::unexpected(lv.error());
-    nll += static_cast<double>((*lv)[0]) * static_cast<double>(T);
+    nll += static_cast<double>(*lv) * static_cast<double>(T);
     n_pred += static_cast<std::uint64_t>(T);
     ++n_win;
     if (log && n_win % 4 == 0)

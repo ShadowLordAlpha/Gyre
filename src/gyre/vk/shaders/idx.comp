@@ -1,0 +1,150 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer A { uint au[]; };
+layout(std430, binding = 1) buffer B { uint bu[]; };
+layout(std430, binding = 2) buffer C { uint cu[]; };
+layout(std430, binding = 3) buffer IA { int ia[]; };
+layout(std430, binding = 4) buffer U { uint u[]; };
+layout(std430, binding = 5) buffer IB { int ib[]; };
+
+layout(push_constant) uniform PC {
+  uint u0;
+  uint u1;
+  uint u2;
+  uint u3;
+  uint u4;
+  uint u5;
+  float f0;
+  float f1;
+  float f2;
+  float f3;
+  float f4;
+  float f5;
+} pc;
+
+float af(uint i) { return uintBitsToFloat(au[i]); }
+float bf(uint i) { return uintBitsToFloat(bu[i]); }
+
+void atomicAddU(uint i, float v) {
+  uint old = u[i];
+  for (;;) {
+    uint nv = floatBitsToUint(uintBitsToFloat(old) + v);
+    uint r = atomicCompSwap(u[i], old, nv);
+    if (r == old) return;
+    old = r;
+  }
+}
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.u0) return;
+  uint op = pc.u1;
+
+  if (op == 0u) {
+    int id = ia[i];
+    uint d = pc.u2;
+    if (id < 0 || uint(id) >= pc.u3) return;
+    for (uint c = 0u; c < d; ++c) cu[i * d + c] = au[uint(id) * d + c];
+    return;
+  }
+
+  if (op == 1u) {
+    int id = ia[i];
+    uint d = pc.u2;
+    if (id < 0 || uint(id) >= pc.u3) return;
+    for (uint c = 0u; c < d; ++c) atomicAddU(uint(id) * d + c, bf(i * d + c));
+    return;
+  }
+
+  if (op == 2u) {
+    uint d0v = pc.u2;
+    uint d1v = pc.u3;
+    uint mat = d0v * d1v;
+    uint b = i / mat;
+    uint rem = i % mat;
+    uint r = rem / d1v;
+    uint c = rem % d1v;
+    uint di = b * mat + c * d0v + r;
+    cu[di] = au[i];
+    return;
+  }
+
+  if (op == 3u) {
+    uint T = pc.u3, H = pc.u4, D = pc.u5;
+    uint tmp = i;
+    uint dd = tmp % D; tmp /= D;
+    uint h = tmp % H; tmp /= H;
+    uint t = tmp % T;
+    uint b = tmp / T;
+    uint si = ((b * T + t) * H + h) * D + dd;
+    uint di = ((b * H + h) * T + t) * D + dd;
+    cu[di] = au[si];
+    return;
+  }
+
+  if (op == 4u) {
+    uint H = pc.u3, T = pc.u4, D = pc.u5;
+    uint tmp = i;
+    uint dd = tmp % D; tmp /= D;
+    uint t = tmp % T; tmp /= T;
+    uint h = tmp % H;
+    uint b = tmp / H;
+    uint si = ((b * H + h) * T + t) * D + dd;
+    uint di = ((b * T + t) * H + h) * D + dd;
+    cu[di] = au[si];
+    return;
+  }
+
+  if (op == 5u) {
+    uint T = pc.u2;
+    uint H = pc.u3;
+    uint tmp = i;
+    uint j = tmp % T; tmp /= T;
+    uint t = tmp % T; tmp /= T;
+    uint h = tmp % H;
+    float v = af(i);
+    if (j > t) {
+      v += -1.0e9;
+    } else if (pc.f0 > 0.5) {
+      float slope = pow(2.0, -8.0 * float(h + 1u) / float(H));
+      v += -slope * float(t - j);
+    }
+    au[i] = floatBitsToUint(v);
+    return;
+  }
+
+  if (op == 6u) {
+    uint C = pc.u2;
+    uint T = pc.u3;
+    uint t = (i / C) % T;
+    uint c = i % C;
+    cu[i] = floatBitsToUint(af(i) + bf(t * C + c));
+    return;
+  }
+
+  if (op == 7u) {
+    uint C = pc.u2;
+    uint T = pc.u3;
+    uint B = pc.u4;
+    uint t = i / C;
+    uint c = i % C;
+    float s = 0.0;
+    for (uint b = 0u; b < B; ++b) s += af((b * T + t) * C + c);
+    cu[i] = floatBitsToUint(s);
+    return;
+  }
+
+  if (op == 8u) {
+    ib[i] = int(i);
+    return;
+  }
+
+  if (op == 9u) {
+    uint rows = pc.u2;
+    uint cols = pc.u3;
+    float s = 0.0;
+    for (uint r = 0u; r < rows; ++r) s += af(r * cols + i);
+    cu[i] = floatBitsToUint(s);
+  }
+}

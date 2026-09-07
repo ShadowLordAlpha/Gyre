@@ -27,8 +27,9 @@ Result<void> TrainLoop::run(Module& model, Dataset& data, const TrainConfig& cfg
     opt->lr = scheduled_lr(cfg, step);
     auto st = opt->step(model.parameters());
     if (!st) return st;
-    float loss_v = 0.f;
-    if (auto lv = loss->value.host_span<float>()) loss_v = (*lv)[0];
+    auto item = loss->value.item_f32();
+    if (!item) return std::unexpected(item.error());
+    float loss_v = *item;
     Metrics m{step, loss_v, opt->lr};
     if (on_progress) on_progress(m);
     if (cfg.log_every && step % cfg.log_every == 0) {

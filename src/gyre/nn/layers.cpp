@@ -7,10 +7,12 @@ namespace gyre {
 
 Result<Linear> Linear::create(std::int64_t in, std::int64_t out, std::shared_ptr<Device> dev, Rng& rng,
                               float std, float residual_scale) {
+  auto cpu = Device::cpu();
+  if (!cpu) return std::unexpected(cpu.error());
   std::int64_t wsh[2] = {in, out};
   std::int64_t bsh[1] = {out};
-  auto W = Tensor::empty(wsh, DType::f32, dev);
-  auto b = Tensor::zeros(bsh, DType::f32, dev);
+  auto W = Tensor::empty(wsh, DType::f32, *cpu);
+  auto b = Tensor::zeros(bsh, DType::f32, *cpu);
   if (!W || !b) return std::unexpected(W ? b.error() : W.error());
   auto wp = W->host_span<float>();
   if (!wp) return std::unexpected(wp.error());
@@ -22,6 +24,15 @@ Result<Linear> Linear::create(std::int64_t in, std::int64_t out, std::shared_ptr
   std::vector<Param> ps;
   ps.push_back(std::move(*pw));
   ps.push_back(std::move(*pb));
+  if (dev && dev->kind() != DeviceKind::cpu) {
+    for (auto& p : ps) {
+      auto v = p.value.to(dev);
+      auto g = p.grad.to(dev);
+      if (!v || !g) return std::unexpected(v ? g.error() : v.error());
+      p.value = std::move(*v);
+      p.grad = std::move(*g);
+    }
+  }
   return Linear(std::move(ps));
 }
 
@@ -58,9 +69,11 @@ Result<void> Linear::backward(const Tensor& d_out, ForwardCtx& ctx) {
 }
 
 Result<LayerNorm> LayerNorm::create(std::int64_t n, std::shared_ptr<Device> dev, float eps) {
+  auto cpu = Device::cpu();
+  if (!cpu) return std::unexpected(cpu.error());
   std::int64_t sh[1] = {n};
-  auto w = Tensor::empty(sh, DType::f32, dev);
-  auto b = Tensor::zeros(sh, DType::f32, dev);
+  auto w = Tensor::empty(sh, DType::f32, *cpu);
+  auto b = Tensor::zeros(sh, DType::f32, *cpu);
   if (!w || !b) return std::unexpected(w ? b.error() : w.error());
   auto wp = w->host_span<float>();
   if (!wp) return std::unexpected(wp.error());
@@ -71,6 +84,15 @@ Result<LayerNorm> LayerNorm::create(std::int64_t n, std::shared_ptr<Device> dev,
   std::vector<Param> ps;
   ps.push_back(std::move(*pw));
   ps.push_back(std::move(*pb));
+  if (dev && dev->kind() != DeviceKind::cpu) {
+    for (auto& p : ps) {
+      auto v = p.value.to(dev);
+      auto g = p.grad.to(dev);
+      if (!v || !g) return std::unexpected(v ? g.error() : v.error());
+      p.value = std::move(*v);
+      p.grad = std::move(*g);
+    }
+  }
   return LayerNorm(std::move(ps), eps);
 }
 
@@ -82,60 +104,18 @@ Result<Tensor> LayerNorm::forward(const Tensor& x, ForwardCtx& ctx) {
 
 Result<void> LayerNorm::backward(const Tensor& d_out, ForwardCtx& ctx) {
   if (!saved_x_) return std::unexpected(make_error(Errc::unsupported, "no saved x"));
-  const Tensor& x = *saved_x_;
-  auto px = x.host_span<float>();
-  auto pd = d_out.host_span<float>();
-  auto pw = params_[0].value.host_span<float>();
-  auto gw = params_[0].grad.host_span<float>();
-  auto gb = params_[1].grad.host_span<float>();
-  if (!px || !pd || !pw || !gw || !gb) return std::unexpected(make_error(Errc::not_cpu, "host"));
-  const auto C = x.shape()[x.rank() - 1];
-  const auto rows = x.numel() / C;
-  auto dx = Tensor::empty(x.shape(), DType::f32, x.device());
+  auto dx = layer_norm_backward(*saved_x_, d_out, params_[0].value, params_[0].grad, params_[1].grad, eps_);
   if (!dx) return std::unexpected(dx.error());
-  auto pdx = dx->host_span<float>();
-  if (!pdx) return std::unexpected(pdx.error());
-  for (std::int64_t r = 0; r < rows; ++r) {
-    const float* xs = px->data() + r * C;
-    const float* gs = pd->data() + r * C;
-    float* dxs = pdx->data() + r * C;
-    float mean = 0;
-    for (std::int64_t i = 0; i < C; ++i) mean += xs[i];
-    mean /= static_cast<float>(C);
-    float var = 0;
-    for (std::int64_t i = 0; i < C; ++i) {
-      float d = xs[i] - mean;
-      var += d * d;
-    }
-    var /= static_cast<float>(C);
-    float inv = 1.f / std::sqrt(var + eps_);
-    std::vector<float> xhat(static_cast<std::size_t>(C));
-    std::vector<float> dxhat(static_cast<std::size_t>(C));
-    for (std::int64_t i = 0; i < C; ++i) {
-      xhat[static_cast<std::size_t>(i)] = (xs[i] - mean) * inv;
-      dxhat[static_cast<std::size_t>(i)] = gs[i] * (*pw)[static_cast<std::size_t>(i)];
-      (*gw)[static_cast<std::size_t>(i)] += gs[i] * xhat[static_cast<std::size_t>(i)];
-      (*gb)[static_cast<std::size_t>(i)] += gs[i];
-    }
-    float sdx = 0, sdxh = 0;
-    for (std::int64_t i = 0; i < C; ++i) {
-      sdx += dxhat[static_cast<std::size_t>(i)];
-      sdxh += dxhat[static_cast<std::size_t>(i)] * xhat[static_cast<std::size_t>(i)];
-    }
-    const float invC = inv / static_cast<float>(C);
-    for (std::int64_t i = 0; i < C; ++i) {
-      dxs[i] = invC * (static_cast<float>(C) * dxhat[static_cast<std::size_t>(i)] - sdx -
-                       xhat[static_cast<std::size_t>(i)] * sdxh);
-    }
-  }
   ctx.dx = std::make_unique<Tensor>(std::move(*dx));
   return {};
 }
 
 Result<Embedding> Embedding::create(std::int64_t vocab, std::int64_t d, std::shared_ptr<Device> dev,
                                    Rng& rng, float std) {
+  auto cpu = Device::cpu();
+  if (!cpu) return std::unexpected(cpu.error());
   std::int64_t sh[2] = {vocab, d};
-  auto W = Tensor::empty(sh, DType::f32, dev);
+  auto W = Tensor::empty(sh, DType::f32, *cpu);
   if (!W) return std::unexpected(W.error());
   auto p = W->host_span<float>();
   if (!p) return std::unexpected(p.error());
@@ -144,6 +124,15 @@ Result<Embedding> Embedding::create(std::int64_t vocab, std::int64_t d, std::sha
   if (!pw) return std::unexpected(pw.error());
   std::vector<Param> ps;
   ps.push_back(std::move(*pw));
+  if (dev && dev->kind() != DeviceKind::cpu) {
+    for (auto& prm : ps) {
+      auto v = prm.value.to(dev);
+      auto g = prm.grad.to(dev);
+      if (!v || !g) return std::unexpected(v ? g.error() : v.error());
+      prm.value = std::move(*v);
+      prm.grad = std::move(*g);
+    }
+  }
   return Embedding(std::move(ps));
 }
 
@@ -155,18 +144,8 @@ Result<Tensor> Embedding::forward(const Tensor& idx, ForwardCtx& ctx) {
 
 Result<void> Embedding::backward(const Tensor& d_out, ForwardCtx& ctx) {
   if (!saved_idx_) return std::unexpected(make_error(Errc::unsupported, "no saved idx"));
-  auto g = params_[0].grad.host_span<float>();
-  auto i = saved_idx_->host_span<std::int32_t>();
-  auto d = d_out.host_span<float>();
-  if (!g || !i || !d) return std::unexpected(make_error(Errc::not_cpu, "host"));
-  const auto dim = params_[0].value.shape()[1];
-  const auto V = params_[0].value.shape()[0];
-  for (std::int64_t n = 0; n < saved_idx_->numel(); ++n) {
-    auto id = (*i)[static_cast<std::size_t>(n)];
-    if (id < 0 || id >= V) return std::unexpected(make_error(Errc::invalid_shape, "emb idx"));
-    for (std::int64_t c = 0; c < dim; ++c)
-      (*g)[static_cast<std::size_t>(id * dim + c)] += (*d)[static_cast<std::size_t>(n * dim + c)];
-  }
+  auto r = embedding_backward(params_[0].grad, *saved_idx_, d_out);
+  if (!r) return r;
   ctx.dx.reset();
   return {};
 }

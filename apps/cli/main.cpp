@@ -12,14 +12,15 @@ static void usage() {
       "  gyre-cli lm train --data data/shakespeare.txt [--preset medium|tiny|tinygpt|nanogpt]\n"
       "                   [--tokenizer bpe|chars|bytes|unigram] [--tok FILE.gyre.json] [--vocab-size 2000]\n"
       "                   [--holdout 0.1] [--steps 2000] [--batch 4] [--ckpt data/charlm.gyre]\n"
-      "                   [--lr 3e-4] [--lr-start 1e-3] [--recency alibi|none]\n"
+      "                   [--lr 3e-4] [--lr-start 1e-3] [--recency alibi|none] [--device cpu|vulkan]\n"
       "                   [--hf-dir DIR] [--sp FILE.model]\n"
       "  gyre-cli lm generate --data data/shakespeare.txt --ckpt data/charlm.gyre\n"
       "                      [--preset medium|tiny|tinygpt] [--prompt \"To be\"] [--chars 200] [--temp 0.8]\n"
+      "                      [--device cpu|vulkan]\n"
       "  gyre-cli lm export --ckpt data/charlm.gyre --onnx data/charlm.onnx [--preset medium]\n"
       "                    [--data data/shakespeare.txt]\n"
       "  gyre-cli lm eval --ckpt data/charlm.gyre --data data/shakespeare.txt [--preset tinygpt]\n"
-      "                  [--split 0.1]\n"
+      "                  [--split 0.1] [--device cpu|vulkan]\n"
       "  gyre-cli tok train --data data/shakespeare.txt [--tokenizer bpe|chars|bytes|unigram]\n"
       "                    [--vocab-size 2000] --out data/tok.gyre.json\n"
       "  gyre-cli tok export --tok data/tok.gyre.json --hf-dir data/hf-tok\n"
@@ -317,6 +318,7 @@ int main(int argc, char** argv) {
         std::string r = argv[++i];
         o.recency_alibi = (r != "none" && r != "off" && r != "0");
       }
+      else if (a == "--device" && i + 1 < argc) o.device = argv[++i];
     }
     apply_charlm_preset(o);
     if (block_set) o.block = block_ov;

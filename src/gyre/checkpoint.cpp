@@ -7,6 +7,7 @@
 #include <cstring>
 #include <functional>
 #include <fstream>
+#include <optional>
 #include <span>
 #include <sstream>
 
@@ -150,27 +151,31 @@ void apply_named_to_doc(GyreDoc& doc, const std::vector<NamedRef>& items) {
 }
 
 Result<void> copy_bytes_into(Tensor& t, std::span<const std::byte> src) {
-  auto hb = t.host_bytes();
-  if (!hb) return std::unexpected(hb.error());
-  if (hb->size() != src.size()) {
-    return std::unexpected(make_error(Errc::invalid_shape, "tensor size"));
-  }
-  std::memcpy(hb->data(), src.data(), src.size());
-  return {};
+  return t.copy_from_host(src);
 }
 
 Result<nlohmann::json> tensor_data_json(const Tensor& t) {
+  const Tensor* tp = &t;
+  std::optional<Tensor> host;
+  if (t.device() && t.device()->kind() != DeviceKind::cpu) {
+    auto cpu = Device::cpu();
+    if (!cpu) return std::unexpected(cpu.error());
+    auto c = t.to(*cpu);
+    if (!c) return std::unexpected(c.error());
+    host = std::move(*c);
+    tp = &*host;
+  }
   nlohmann::json a = nlohmann::json::array();
-  if (t.dtype() == DType::f32) {
-    auto p = t.host_span<float>();
+  if (tp->dtype() == DType::f32) {
+    auto p = tp->host_span<float>();
     if (!p) return std::unexpected(p.error());
     for (auto v : *p) a.push_back(v);
-  } else if (t.dtype() == DType::i32) {
-    auto p = t.host_span<std::int32_t>();
+  } else if (tp->dtype() == DType::i32) {
+    auto p = tp->host_span<std::int32_t>();
     if (!p) return std::unexpected(p.error());
     for (auto v : *p) a.push_back(v);
-  } else if (t.dtype() == DType::u8) {
-    auto p = t.host_span<std::uint8_t>();
+  } else if (tp->dtype() == DType::u8) {
+    auto p = tp->host_span<std::uint8_t>();
     if (!p) return std::unexpected(p.error());
     for (auto v : *p) a.push_back(v);
   } else {
@@ -181,7 +186,9 @@ Result<nlohmann::json> tensor_data_json(const Tensor& t) {
 
 Result<Tensor> tensor_from_data_json(const GyreTensorDesc& d, const nlohmann::json& data,
                                      std::shared_ptr<Device> device) {
-  auto t = Tensor::empty(d.shape, d.dtype, device);
+  auto cpu = Device::cpu();
+  if (!cpu) return std::unexpected(cpu.error());
+  auto t = Tensor::empty(d.shape, d.dtype, *cpu);
   if (!t) return t;
   if (!data.is_array()) return std::unexpected(make_error(Errc::ckpt_corrupt, "data array"));
   if (d.dtype == DType::f32) {
@@ -201,6 +208,9 @@ Result<Tensor> tensor_from_data_json(const GyreTensorDesc& d, const nlohmann::js
     for (std::size_t i = 0; i < p->size(); ++i) (*p)[i] = data[i].get<std::uint8_t>();
   } else {
     return std::unexpected(make_error(Errc::unsupported, "json data dtype"));
+  }
+  if (device && device->kind() != DeviceKind::cpu) {
+    return t->to(std::move(device));
   }
   return t;
 }
@@ -483,7 +493,7 @@ Result<void> save_gyre(const std::filesystem::path& path, std::span<const Param>
   doc.tensors.clear();
   std::uint64_t rel = 0;
   for (auto& it : items) {
-    auto hb = it.t->host_bytes();
+    auto hb = it.t->to_host_vec();
     if (!hb) return std::unexpected(hb.error());
     auto cdc = (it.t->dtype() == DType::f32) ? codec : GyreCodec::identity;
     auto enc = gyre_compress(cdc, *hb, it.t->dtype(), it.t->shape());
@@ -626,6 +636,9 @@ Result<Tensor> GyreFile::load_tensor(std::string_view name, std::shared_ptr<Devi
   }
   auto slice = std::span<const std::byte>(storage_->data() + start, static_cast<std::size_t>(packed));
   if (desc->codec == GyreCodec::identity || packed == desc->nbytes) {
+    if (device && device->kind() != DeviceKind::cpu) {
+      return Tensor::from_host(slice, desc->shape, desc->dtype, std::move(device));
+    }
     return Tensor::from_storage(storage_, start, desc->shape, desc->dtype, std::move(device));
   }
   auto raw = gyre_decompress(desc->codec, slice, desc->dtype, desc->shape, static_cast<std::size_t>(desc->nbytes));
@@ -646,9 +659,9 @@ Result<void> GyreFile::load_params(std::span<Param> params, Adam* adam) const {
   auto copy_t = [&](const std::string& name, Tensor& dst) -> Result<void> {
     auto t = load_tensor(name, dst.device());
     if (!t) return std::unexpected(t.error());
-    auto hb = t->host_bytes();
+    auto hb = t->to_host_vec();
     if (!hb) return std::unexpected(hb.error());
-    return copy_bytes_into(dst, std::span<const std::byte>(hb->data(), hb->size()));
+    return copy_bytes_into(dst, *hb);
   };
   for (std::size_t i = 0; i < params.size(); ++i) {
     auto r = copy_t(weights[i]->name, params[i].value);

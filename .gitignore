@@ -34,6 +34,7 @@ vcpkg-manifest-install.log
 
 # Local weights / Hub shards (too large for git)
 data/*.gyre
+data/*.gyre.json
 data/*.gyre1
 data/*.onnx
 data/grok2/*.safetensors

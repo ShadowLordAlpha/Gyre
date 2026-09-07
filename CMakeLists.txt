@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(GYRE_BUILD_TESTS "Build tests" ON)
 option(GYRE_ENABLE_TUI "Build gyre-tui (FTXUI)" ON)
 option(GYRE_BUILD_EXAMPLE_BINS "Build gyre-charlm / gyre-ga-onemax example binaries" ON)
-option(GYRE_ENABLE_VULKAN "Vulkan backend (future; unimplemented)" OFF)
+option(GYRE_ENABLE_VULKAN "Vulkan compute backend (auto-off if SDK missing)" ON)
 option(GYRE_ENABLE_ASAN "Sanitize tests" OFF)
 option(GYRE_ENABLE_OPENMP "Multi-thread CPU kernels (matmul/bmm)" ON)
 
@@ -72,6 +72,48 @@ if(MSVC)
   target_compile_options(gyre PRIVATE /W4 /permissive-)
 else()
   target_compile_options(gyre PRIVATE -Wall -Wextra)
+endif()
+
+find_package(Vulkan QUIET)
+if(GYRE_ENABLE_VULKAN)
+  if(NOT Vulkan_FOUND)
+    message(STATUS "Gyre: Vulkan requested but not found; backend disabled")
+    set(GYRE_ENABLE_VULKAN OFF)
+  endif()
+endif()
+if(GYRE_ENABLE_VULKAN)
+  find_program(GLSLANG_VALIDATOR glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+  if(NOT GLSLANG_VALIDATOR)
+    message(STATUS "Gyre: glslangValidator not found; Vulkan backend disabled")
+    set(GYRE_ENABLE_VULKAN OFF)
+  endif()
+endif()
+
+if(GYRE_ENABLE_VULKAN)
+  set(GYRE_SPV_DIR ${CMAKE_CURRENT_BINARY_DIR}/vk_spv)
+  file(MAKE_DIRECTORY ${GYRE_SPV_DIR})
+  set(GYRE_SPV_HEADERS)
+  foreach(_shader elem gemm row idx adam)
+    set(_src ${CMAKE_CURRENT_SOURCE_DIR}/src/gyre/vk/shaders/${_shader}.comp)
+    set(_hdr ${GYRE_SPV_DIR}/${_shader}.spv.hpp)
+    add_custom_command(
+      OUTPUT ${_hdr}
+      COMMAND ${GLSLANG_VALIDATOR} -V --vn gyre_${_shader}_spv -o ${_hdr} ${_src}
+      DEPENDS ${_src}
+      COMMENT "SPIR-V ${_shader}.comp"
+      VERBATIM
+    )
+    list(APPEND GYRE_SPV_HEADERS ${_hdr})
+  endforeach()
+  target_sources(gyre PRIVATE
+    src/gyre/vk/runtime.cpp
+    src/gyre/vk/ops.cpp
+    ${GYRE_SPV_HEADERS}
+  )
+  target_include_directories(gyre PRIVATE ${GYRE_SPV_DIR})
+  target_link_libraries(gyre PUBLIC Vulkan::Vulkan)
+  target_compile_definitions(gyre PUBLIC GYRE_VULKAN=1)
+  message(STATUS "Gyre: Vulkan compute enabled")
 endif()
 
 if(GYRE_ENABLE_OPENMP)
@@ -155,6 +197,7 @@ if(GYRE_BUILD_TESTS)
     tests/tiktoken_test.cpp
     tests/ckpt_test.cpp
     tests/adapt_grid_test.cpp
+    tests/vulkan_ops_test.cpp
   )
   target_link_libraries(gyre-tests PRIVATE gyre GTest::gtest_main)
   target_compile_definitions(gyre-tests PRIVATE GYRE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

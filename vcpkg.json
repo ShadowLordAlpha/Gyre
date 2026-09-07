@@ -12,7 +12,7 @@
       "dependencies": ["ftxui"]
     },
     "vulkan": {
-      "description": "Vulkan compute (future; unused in v1.5)",
+      "description": "Vulkan compute backend (headers/loader)",
       "dependencies": ["vulkan-headers", "vulkan-loader"]
     }
   }

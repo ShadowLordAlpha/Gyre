@@ -1,5 +1,9 @@
 #include "gyre/ops.hpp"
 
+#if defined(GYRE_VULKAN)
+#include "vk/ops.hpp"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -12,6 +16,10 @@
 
 namespace gyre {
 namespace {
+
+bool is_vk(const Tensor& t) {
+  return t.device() && t.device()->kind() == DeviceKind::vulkan;
+}
 
 Result<void> same_dev_dtype_shape(const Tensor& a, const Tensor& b, bool check_shape) {
   if (a.device().get() != b.device().get()) {
@@ -93,6 +101,9 @@ Result<Tensor> add(const Tensor& a, const Tensor& b) {
   if (a.dtype() != DType::f32) {
     return std::unexpected(make_error(Errc::unsupported, "add f32 only"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(a)) return vkops::add(a, b);
+#endif
   auto out = Tensor::empty(a.shape(), DType::f32, a.device());
   if (!out) return out;
   auto pa = f32c(a);
@@ -116,6 +127,9 @@ Result<Tensor> mul(const Tensor& a, const Tensor& b) {
   if (a.dtype() != DType::f32) {
     return std::unexpected(make_error(Errc::unsupported, "mul f32 only"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(a)) return vkops::mul(a, b);
+#endif
   auto out = Tensor::empty(a.shape(), DType::f32, a.device());
   if (!out) return out;
   auto pa = f32c(a);
@@ -145,6 +159,9 @@ Result<Tensor> matmul(const Tensor& a, const Tensor& b) {
   }
   const auto M = a.shape()[0], K = a.shape()[1], K2 = b.shape()[0], N = b.shape()[1];
   if (K != K2) return std::unexpected(make_error(Errc::invalid_shape, "matmul inner dim"));
+#if defined(GYRE_VULKAN)
+  if (is_vk(a)) return vkops::matmul(a, b);
+#endif
   std::int64_t osh[2] = {M, N};
   auto out = Tensor::empty(osh, DType::f32, a.device());
   if (!out) return out;
@@ -174,6 +191,9 @@ Result<Tensor> bmm(const Tensor& a, const Tensor& b) {
   }
   const auto M = a.shape()[r - 2], K = a.shape()[r - 1], K2 = b.shape()[r - 2], N = b.shape()[r - 1];
   if (K != K2) return std::unexpected(make_error(Errc::invalid_shape, "bmm inner"));
+#if defined(GYRE_VULKAN)
+  if (is_vk(a)) return vkops::bmm(a, b);
+#endif
   std::int64_t batch = 1;
   std::array<std::int64_t, 8> osh{};
   for (int i = 0; i < r - 2; ++i) {
@@ -203,6 +223,9 @@ Result<Tensor> sum(const Tensor& a) {
   if (a.dtype() != DType::f32) {
     return std::unexpected(make_error(Errc::dtype_mismatch, "sum f32"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(a)) return vkops::sum(a);
+#endif
   std::int64_t sh[1] = {1};
   // rank-0: use shape {}
   auto out = Tensor::empty(std::span<const std::int64_t>(), DType::f32, a.device());
@@ -224,6 +247,9 @@ Result<Tensor> sum_dim(const Tensor& a, int axis, bool keepdim) {
   if (axis < 0 || axis >= a.rank()) {
     return std::unexpected(make_error(Errc::invalid_shape, "axis"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(a)) return vkops::sum_dim(a, axis, keepdim);
+#endif
   std::vector<std::int64_t> osh;
   for (int i = 0; i < a.rank(); ++i) {
     if (i == axis) {
@@ -283,6 +309,9 @@ Result<Tensor> transpose_last2(const Tensor& a) {
   if (a.dtype() != DType::f32 && a.dtype() != DType::i32) {
     return std::unexpected(make_error(Errc::unsupported, "transpose dtype"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(a)) return vkops::transpose_last2(a);
+#endif
   std::array<std::int64_t, 8> osh{};
   for (int i = 0; i < a.rank(); ++i) osh[i] = a.shape()[i];
   std::swap(osh[a.rank() - 2], osh[a.rank() - 1]);
@@ -317,6 +346,9 @@ Result<Tensor> embedding(const Tensor& weight, const Tensor& indices_i32) {
   if (weight.device().get() != indices_i32.device().get()) {
     return std::unexpected(make_error(Errc::mixed_device, "mixed"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(weight)) return vkops::embedding(weight, indices_i32);
+#endif
   const auto V = weight.shape()[0], d = weight.shape()[1];
   std::vector<std::int64_t> osh(indices_i32.shape().begin(), indices_i32.shape().end());
   osh.push_back(d);
@@ -341,6 +373,9 @@ Result<Tensor> permute_bthd_bhtd(const Tensor& x) {
   if (x.rank() != 4 || x.dtype() != DType::f32) {
     return std::unexpected(make_error(Errc::invalid_shape, "permute [B,T,H,d] f32"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(x)) return vkops::permute_bthd_bhtd(x);
+#endif
   const auto B = x.shape()[0], T = x.shape()[1], H = x.shape()[2], D = x.shape()[3];
   std::int64_t osh[4] = {B, H, T, D};
   auto out = Tensor::empty(osh, DType::f32, x.device());
@@ -361,6 +396,9 @@ Result<Tensor> permute_bhtd_bthd(const Tensor& x) {
   if (x.rank() != 4 || x.dtype() != DType::f32) {
     return std::unexpected(make_error(Errc::invalid_shape, "permute [B,H,T,d] f32"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(x)) return vkops::permute_bhtd_bthd(x);
+#endif
   const auto B = x.shape()[0], H = x.shape()[1], T = x.shape()[2], D = x.shape()[3];
   std::int64_t osh[4] = {B, T, H, D};
   auto out = Tensor::empty(osh, DType::f32, x.device());
@@ -383,6 +421,9 @@ Result<Tensor> narrow_rows(const Tensor& x, std::int64_t start, std::int64_t cou
   if (start < 0 || count < 0 || start + count > N) {
     return std::unexpected(make_error(Errc::invalid_shape, "narrow_rows range"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(x)) return vkops::narrow_rows(x, start, count);
+#endif
   std::int64_t osh[2] = {count, D};
   auto out = Tensor::empty(osh, x.dtype(), x.device());
   if (!out) return out;
@@ -399,6 +440,9 @@ Result<Tensor> gelu(const Tensor& a) {
   if (a.dtype() != DType::f32) {
     return std::unexpected(make_error(Errc::dtype_mismatch, "gelu f32"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(a)) return vkops::gelu(a);
+#endif
   auto out = Tensor::empty(a.shape(), DType::f32, a.device());
   if (!out) return out;
   auto pa = f32c(a);
@@ -423,6 +467,9 @@ Result<Tensor> silu(const Tensor& a) {
   if (a.dtype() != DType::f32) {
     return std::unexpected(make_error(Errc::dtype_mismatch, "silu f32"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(a)) return vkops::silu(a);
+#endif
   auto out = Tensor::empty(a.shape(), DType::f32, a.device());
   if (!out) return out;
   auto pa = f32c(a);
@@ -452,6 +499,9 @@ Result<Tensor> softmax_last(const Tensor& a) {
   if (a.dtype() != DType::f32 || a.rank() < 1) {
     return std::unexpected(make_error(Errc::invalid_shape, "softmax_last"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(a)) return vkops::softmax_last(a);
+#endif
   auto out = Tensor::empty(a.shape(), DType::f32, a.device());
   if (!out) return out;
   auto pa = f32c(a);
@@ -486,6 +536,9 @@ Result<Tensor> layer_norm(const Tensor& x, const Tensor& w, const Tensor& b, flo
       b.shape()[0] != w.shape()[0]) {
     return std::unexpected(make_error(Errc::invalid_shape, "ln shape"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(x)) return vkops::layer_norm(x, w, b, eps);
+#endif
   auto out = Tensor::empty(x.shape(), DType::f32, x.device());
   if (!out) return out;
   auto px = f32c(x);
@@ -527,6 +580,9 @@ Result<Tensor> rms_norm(const Tensor& x, const Tensor& w, float eps) {
   if (x.rank() < 1 || w.rank() != 1 || w.shape()[0] != x.shape()[x.rank() - 1]) {
     return std::unexpected(make_error(Errc::invalid_shape, "rms shape"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(x)) return vkops::rms_norm(x, w, eps);
+#endif
   auto out = Tensor::empty(x.shape(), DType::f32, x.device());
   if (!out) return out;
   auto px = f32c(x);
@@ -560,6 +616,9 @@ Result<Tensor> softcap(const Tensor& a, float cap) {
   if (!(cap > 0.f)) {
     return std::unexpected(make_error(Errc::invalid_shape, "softcap cap"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(a)) return vkops::softcap(a, cap);
+#endif
   auto out = Tensor::empty(a.shape(), DType::f32, a.device());
   if (!out) return out;
   auto pa = f32c(a);
@@ -599,6 +658,9 @@ Result<Tensor> rope(const Tensor& x, const Tensor& positions_i32, float theta, f
   if (!(theta > 0.f) || !(pos_scale > 0.f)) {
     return std::unexpected(make_error(Errc::invalid_shape, "rope theta/scale"));
   }
+  if (is_vk(x)) {
+    return std::unexpected(make_error(Errc::unsupported, "rope is CPU-only in this Vulkan build"));
+  }
   auto out = Tensor::empty(x.shape(), DType::f32, x.device());
   if (!out) return out;
   auto px = f32c(x);
@@ -633,6 +695,9 @@ Result<Tensor> rope(const Tensor& x, const Tensor& positions_i32, float theta, f
 }
 
 Result<void> fill_zero(Tensor& t) {
+#if defined(GYRE_VULKAN)
+  if (is_vk(t)) return vkops::fill_zero(t);
+#endif
   auto hb = t.host_bytes();
   if (!hb) return std::unexpected(hb.error());
   std::memset(hb->data(), 0, hb->size());
@@ -645,6 +710,9 @@ Result<void> add_(Tensor& dst, const Tensor& src) {
   if (dst.dtype() != DType::f32) {
     return std::unexpected(make_error(Errc::unsupported, "add_ f32"));
   }
+#if defined(GYRE_VULKAN)
+  if (is_vk(dst)) return vkops::add_(dst, src);
+#endif
   auto pd = dst.host_span<float>();
   auto ps = src.host_span<float>();
   if (!pd || !ps) return std::unexpected(pd ? ps.error() : pd.error());
@@ -682,6 +750,13 @@ Result<Tensor> linear(const Tensor& x, const Tensor& W, const Tensor& b) {
   if (!x2) return x2;
   auto y = matmul(*x2, W);
   if (!y) return y;
+#if defined(GYRE_VULKAN)
+  if (is_vk(*y)) {
+    auto ba = vkops::bias_add_(*y, b);
+    if (!ba) return std::unexpected(ba.error());
+    return unflatten_like(std::move(*y), x);
+  }
+#endif
   auto yp = y->host_span<float>();
   auto bp = b.host_span<float>();
   if (!yp || !bp) return std::unexpected(make_error(Errc::not_cpu, "host"));
@@ -694,6 +769,9 @@ Result<Tensor> linear(const Tensor& x, const Tensor& W, const Tensor& b) {
 }
 
 Result<Tensor> gelu_backward(const Tensor& x, const Tensor& dy) {
+#if defined(GYRE_VULKAN)
+  if (is_vk(x)) return vkops::gelu_backward(x, dy);
+#endif
   auto out = Tensor::empty(x.shape(), DType::f32, x.device());
   if (!out) return out;
   auto px = f32c(x);
@@ -714,6 +792,9 @@ Result<Tensor> gelu_backward(const Tensor& x, const Tensor& dy) {
 }
 
 Result<Tensor> softmax_last_backward(const Tensor& softmax, const Tensor& d_out) {
+#if defined(GYRE_VULKAN)
+  if (is_vk(softmax)) return vkops::softmax_last_backward(softmax, d_out);
+#endif
   auto out = Tensor::empty(softmax.shape(), DType::f32, softmax.device());
   if (!out) return out;
   auto ps = f32c(softmax);
@@ -731,6 +812,186 @@ Result<Tensor> softmax_last_backward(const Tensor& softmax, const Tensor& d_out)
     for (std::int64_t i = 0; i < last; ++i) ov[i] = sv[i] * (dv[i] - dot);
   }
   return out;
+}
+
+Result<void> fill(Tensor& t, float value) {
+#if defined(GYRE_VULKAN)
+  if (is_vk(t)) return vkops::fill(t, value);
+#endif
+  auto p = t.host_span<float>();
+  if (!p) return std::unexpected(p.error());
+  for (auto& v : *p) v = value;
+  return {};
+}
+
+Result<Tensor> mul_scalar(const Tensor& a, float s) {
+#if defined(GYRE_VULKAN)
+  if (is_vk(a)) return vkops::mul_scalar(a, s);
+#endif
+  auto out = Tensor::empty(a.shape(), DType::f32, a.device());
+  if (!out) return out;
+  auto pa = f32c(a);
+  auto po = f32(*out);
+  if (!pa || !po) return std::unexpected(pa ? po.error() : pa.error());
+  for (std::size_t i = 0; i < pa->size(); ++i) (*po)[i] = (*pa)[i] * s;
+  return out;
+}
+
+Result<void> causal_alibi_(Tensor& scores, bool alibi) {
+#if defined(GYRE_VULKAN)
+  if (is_vk(scores)) return vkops::causal_alibi_(scores, alibi);
+#endif
+  if (scores.rank() != 4 || scores.dtype() != DType::f32) {
+    return std::unexpected(make_error(Errc::invalid_shape, "causal scores [B,H,T,T]"));
+  }
+  auto sp = scores.host_span<float>();
+  if (!sp) return std::unexpected(sp.error());
+  const auto B = scores.shape()[0], H = scores.shape()[1], T = scores.shape()[2];
+  for (std::int64_t b = 0; b < B; ++b) {
+    for (std::int64_t h = 0; h < H; ++h) {
+      const float slope =
+          alibi ? std::pow(2.f, -8.f * static_cast<float>(h + 1) / static_cast<float>(H)) : 0.f;
+      float* srow = sp->data() + ((b * H + h) * T * T);
+      for (std::int64_t t = 0; t < T; ++t) {
+        for (std::int64_t j = 0; j < T; ++j) {
+          if (j > t)
+            srow[t * T + j] += -1e9f;
+          else if (alibi)
+            srow[t * T + j] += -slope * static_cast<float>(t - j);
+        }
+      }
+    }
+  }
+  return {};
+}
+
+Result<Tensor> add_broadcast_time(const Tensor& tok, const Tensor& pe) {
+#if defined(GYRE_VULKAN)
+  if (is_vk(tok)) return vkops::add_broadcast_time(tok, pe);
+#endif
+  if (tok.rank() != 3 || pe.rank() != 2) {
+    return std::unexpected(make_error(Errc::invalid_shape, "add_broadcast_time"));
+  }
+  auto out = Tensor::empty(tok.shape(), DType::f32, tok.device());
+  if (!out) return out;
+  auto xp = out->host_span<float>();
+  auto tp = tok.host_span<float>();
+  auto pep = pe.host_span<float>();
+  if (!xp || !tp || !pep) return std::unexpected(make_error(Errc::not_cpu, "host"));
+  const auto B = tok.shape()[0], T = tok.shape()[1], C = tok.shape()[2];
+  for (std::int64_t b = 0; b < B; ++b)
+    for (std::int64_t t = 0; t < T; ++t)
+      for (std::int64_t c = 0; c < C; ++c)
+        (*xp)[static_cast<std::size_t>((b * T + t) * C + c)] =
+            (*tp)[static_cast<std::size_t>((b * T + t) * C + c)] +
+            (*pep)[static_cast<std::size_t>(t * C + c)];
+  return out;
+}
+
+Result<Tensor> sum_batch_to_time(const Tensor& dh) {
+#if defined(GYRE_VULKAN)
+  if (is_vk(dh)) return vkops::sum_batch_to_time(dh);
+#endif
+  if (dh.rank() != 3) return std::unexpected(make_error(Errc::invalid_shape, "sum_batch_to_time"));
+  const auto B = dh.shape()[0], T = dh.shape()[1], C = dh.shape()[2];
+  std::int64_t psh[2] = {T, C};
+  auto dpe = Tensor::zeros(psh, DType::f32, dh.device());
+  if (!dpe) return dpe;
+  auto a = dh.host_span<float>();
+  auto b = dpe->host_span<float>();
+  if (!a || !b) return std::unexpected(make_error(Errc::not_cpu, "host"));
+  for (std::int64_t bi = 0; bi < B; ++bi)
+    for (std::int64_t t = 0; t < T; ++t)
+      for (std::int64_t c = 0; c < C; ++c)
+        (*b)[static_cast<std::size_t>(t * C + c)] +=
+            (*a)[static_cast<std::size_t>((bi * T + t) * C + c)];
+  return dpe;
+}
+
+Result<Tensor> arange_i32(std::int64_t n, std::shared_ptr<Device> d) {
+  if (n < 0) return std::unexpected(make_error(Errc::invalid_shape, "arange"));
+#if defined(GYRE_VULKAN)
+  if (d && d->kind() == DeviceKind::vulkan) return vkops::arange_i32(n, d);
+#endif
+  std::int64_t sh[1] = {n};
+  auto pos = Tensor::empty(sh, DType::i32, std::move(d));
+  if (!pos) return pos;
+  auto pp = pos->host_span<std::int32_t>();
+  if (!pp) return std::unexpected(pp.error());
+  for (std::int32_t i = 0; i < static_cast<std::int32_t>(n); ++i) (*pp)[static_cast<std::size_t>(i)] = i;
+  return pos;
+}
+
+Result<Tensor> layer_norm_backward(const Tensor& x, const Tensor& d_out, const Tensor& w, Tensor& gw,
+                                   Tensor& gb, float eps) {
+#if defined(GYRE_VULKAN)
+  if (is_vk(x)) return vkops::layer_norm_backward(x, d_out, w, gw, gb, eps);
+#endif
+  auto px = x.host_span<float>();
+  auto pd = d_out.host_span<float>();
+  auto pw = w.host_span<float>();
+  auto pgw = gw.host_span<float>();
+  auto pgb = gb.host_span<float>();
+  if (!px || !pd || !pw || !pgw || !pgb) return std::unexpected(make_error(Errc::not_cpu, "host"));
+  const auto C = x.shape()[x.rank() - 1];
+  const auto rows = x.numel() / C;
+  auto dx = Tensor::empty(x.shape(), DType::f32, x.device());
+  if (!dx) return dx;
+  auto pdx = dx->host_span<float>();
+  if (!pdx) return std::unexpected(pdx.error());
+  for (std::int64_t r = 0; r < rows; ++r) {
+    const float* xs = px->data() + r * C;
+    const float* gs = pd->data() + r * C;
+    float* dxs = pdx->data() + r * C;
+    float mean = 0;
+    for (std::int64_t i = 0; i < C; ++i) mean += xs[i];
+    mean /= static_cast<float>(C);
+    float var = 0;
+    for (std::int64_t i = 0; i < C; ++i) {
+      float dlt = xs[i] - mean;
+      var += dlt * dlt;
+    }
+    var /= static_cast<float>(C);
+    float inv = 1.f / std::sqrt(var + eps);
+    std::vector<float> xhat(static_cast<std::size_t>(C));
+    std::vector<float> dxhat(static_cast<std::size_t>(C));
+    for (std::int64_t i = 0; i < C; ++i) {
+      xhat[static_cast<std::size_t>(i)] = (xs[i] - mean) * inv;
+      dxhat[static_cast<std::size_t>(i)] = gs[i] * (*pw)[static_cast<std::size_t>(i)];
+      (*pgw)[static_cast<std::size_t>(i)] += gs[i] * xhat[static_cast<std::size_t>(i)];
+      (*pgb)[static_cast<std::size_t>(i)] += gs[i];
+    }
+    float sdx = 0, sdxh = 0;
+    for (std::int64_t i = 0; i < C; ++i) {
+      sdx += dxhat[static_cast<std::size_t>(i)];
+      sdxh += dxhat[static_cast<std::size_t>(i)] * xhat[static_cast<std::size_t>(i)];
+    }
+    const float invC = inv / static_cast<float>(C);
+    for (std::int64_t i = 0; i < C; ++i) {
+      dxs[i] = invC * (static_cast<float>(C) * dxhat[static_cast<std::size_t>(i)] - sdx -
+                       xhat[static_cast<std::size_t>(i)] * sdxh);
+    }
+  }
+  return dx;
+}
+
+Result<void> embedding_backward(Tensor& grad_W, const Tensor& idx, const Tensor& d_out) {
+#if defined(GYRE_VULKAN)
+  if (is_vk(grad_W)) return vkops::embedding_backward(grad_W, idx, d_out);
+#endif
+  auto g = grad_W.host_span<float>();
+  auto i = idx.host_span<std::int32_t>();
+  auto d = d_out.host_span<float>();
+  if (!g || !i || !d) return std::unexpected(make_error(Errc::not_cpu, "host"));
+  const auto dim = grad_W.shape()[1];
+  const auto V = grad_W.shape()[0];
+  for (std::int64_t n = 0; n < idx.numel(); ++n) {
+    auto id = (*i)[static_cast<std::size_t>(n)];
+    if (id < 0 || id >= V) return std::unexpected(make_error(Errc::invalid_shape, "emb idx"));
+    for (std::int64_t c = 0; c < dim; ++c)
+      (*g)[static_cast<std::size_t>(id * dim + c)] += (*d)[static_cast<std::size_t>(n * dim + c)];
+  }
+  return {};
 }
 
 Result<std::int32_t> sample_logit_row(std::span<const float> logits, float temperature, Rng* rng) {
