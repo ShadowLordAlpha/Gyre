@@ -11,6 +11,7 @@
 | [grok-compress.md](grok-compress.md) | Weight packing probe (not Helix-critical) |
 | [vulkan.md](vulkan.md) | Optional Vulkan CharLM train/eval/generate |
 | [connectome.md](connectome.md) | Optional prune → smaller dense CharLM |
+| [wire-evals.md](wire-evals.md) | Local prune evals + /10 ratings (checkpoints not in git) |
 | [interesting.md](interesting.md) | Research notes (fly connectome / model connectomes) |
 
 Agent notes for contributors in this repo: [../AGENTS.md](../AGENTS.md).

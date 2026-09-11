@@ -60,3 +60,5 @@ Eval `data/wire/parent.gyre` and `data/wire/child-g1.gyre` … `child-g8.gyre`. 
 Control: add `--shuffle-wire` on a short run; shuffled channels should not match the evolved subset.
 
 If 250 steps per gen is too little after a prune, use the same `--steps` as the parent each gen and say so (that is extra compute).
+
+Recorded Shakespeare runs (tiny / medium / nanogpt batch 8 / batch 64), nats/char, and /10 ratings: [wire-evals.md](wire-evals.md). Checkpoints stay in `data/wire/` (not git).

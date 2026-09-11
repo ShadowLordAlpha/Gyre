@@ -133,6 +133,7 @@ Index: [docs/README.md](docs/README.md).
 - [docs/grok.md](docs/grok.md)
 - [docs/vulkan.md](docs/vulkan.md) — optional GPU CharLM train/run (`--device vulkan`)
 - [docs/connectome.md](docs/connectome.md) — optional prune → smaller dense CharLM
+- [docs/wire-evals.md](docs/wire-evals.md) — local prune evals and /10 ratings
 - [docs/interesting.md](docs/interesting.md) — research notes (fly / model connectomes)
 
 ## Data not in git
