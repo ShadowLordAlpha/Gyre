@@ -8,6 +8,7 @@
 #include "gyre/io/safetensors.hpp"
 #include "gyre/io/wpack.hpp"
 #include "gyre/nn/tokenize.hpp"
+#include "gyre/train/connectome.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <fstream>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string_view>
 
@@ -99,17 +101,28 @@ Result<void> run_onemax(const GaOpts& opts, LogFn log) {
   return {};
 }
 
-static GyreDoc make_charlm_doc(const CharLMOpts& o, std::int64_t vocab, const Tokenizer& tok) {
+static GyreDoc make_charlm_doc(const CharLMOpts& o, const CharLMConfig& model_cfg, const Tokenizer& tok,
+                               std::uint32_t generation, std::uint64_t n_params,
+                               std::uint64_t n_params_parent) {
   nlohmann::json cfg;
   cfg["preset"] = o.preset;
-  cfg["n_layer"] = o.n_layer;
-  cfg["n_head"] = o.n_head;
-  cfg["d_model"] = o.d_model;
-  cfg["d_ff"] = o.d_ff;
-  cfg["block_size"] = o.block;
-  cfg["vocab_size"] = vocab;
+  cfg["n_layer"] = model_cfg.n_layer;
+  cfg["n_head"] = model_cfg.n_head;
+  cfg["d_model"] = model_cfg.d_model;
+  cfg["d_ff"] = model_cfg.d_ff;
+  cfg["block_size"] = model_cfg.block_size;
+  cfg["vocab_size"] = model_cfg.vocab;
   cfg["holdout"] = o.holdout;
-  cfg["recency"] = o.recency_alibi ? "alibi" : "none";
+  cfg["recency"] = model_cfg.recency_alibi ? "alibi" : "none";
+  cfg["dropout"] = o.dropout;
+  cfg["weight_decay"] = o.decay;
+  if (generation > 0 || o.prune > 0.f) {
+    cfg["connectome"] = {{"generation", generation},
+                         {"prune", o.prune},
+                         {"n_params", n_params},
+                         {"n_params_parent", n_params_parent},
+                         {"dense_compact", true}};
+  }
   GyreDoc d;
   d.arch = "char-lm";
   d.config_json = cfg.dump();
@@ -117,6 +130,28 @@ static GyreDoc make_charlm_doc(const CharLMOpts& o, std::int64_t vocab, const To
     d.tokenizer_json = (*tj)["tokenizer"].dump();
   }
   return d;
+}
+
+static std::uint32_t connectome_generation(const GyreDoc& d) {
+  auto c = parse_json(d.config_json);
+  if (!c || !c->contains("connectome")) return 0;
+  return (*c)["connectome"].value("generation", 0u);
+}
+
+static Result<void> save_charlm_ckpt(CharLM& model, const GyreDoc& doc, std::uint64_t step,
+                                     const Adam* adam, const std::filesystem::path& path, LogFn log) {
+  CheckpointMeta meta{1, step, doc.to_json(), model.param_names()};
+  auto s = save_gyre1(path, model.parameters(), adam, meta);
+  if (!s) return s;
+  if (log) log("saved " + path.string());
+  auto json_path = path;
+  json_path.replace_extension(".gyre.json");
+  std::uint64_t nbytes = 0;
+  for (auto& p : model.parameters()) nbytes += static_cast<std::uint64_t>(p.value.nbytes());
+  auto js = save_gyre_json(json_path, model.parameters(), nullptr, doc, model.param_names(),
+                           nbytes <= kGyreJsonDataLimit);
+  if (js && log) log("saved " + json_path.string());
+  return {};
 }
 
 static CharLMConfig charlm_cfg_from_doc(const GyreDoc& d, const CharLMOpts& opts, std::int64_t vocab) {
@@ -134,7 +169,11 @@ static CharLMConfig charlm_cfg_from_doc(const GyreDoc& d, const CharLMOpts& opts
     cfg.n_head = c->value("n_head", cfg.n_head);
     cfg.d_model = c->value("d_model", cfg.d_model);
     cfg.d_ff = c->value("d_ff", cfg.d_ff);
+    cfg.dropout = c->value("dropout", opts.dropout);
+  } else {
+    cfg.dropout = opts.dropout;
   }
+  if (opts.dropout > 0.f) cfg.dropout = opts.dropout;
   return cfg;
 }
 
@@ -175,7 +214,15 @@ Result<std::string> run_charlm_train(const CharLMOpts& opts, LogFn log) {
   if (text.size() < 200) {
     return std::unexpected(make_error(Errc::io, "need a text file at " + opts.data.string()));
   }
+  const auto init_path = !opts.wire.empty() ? opts.wire : (opts.resume ? opts.ckpt : std::filesystem::path{});
+  std::optional<GyreDoc> init_doc;
+  if (!init_path.empty()) {
+    auto peek = peek_gyre(init_path);
+    if (!peek) return std::unexpected(peek.error());
+    init_doc = std::move(*peek);
+  }
   double holdout = opts.holdout;
+  if (init_doc) holdout = init_doc->holdout();
   if (holdout < 0.0) holdout = 0.0;
   if (holdout >= 1.0) holdout = 0.1;
   const auto split_at =
@@ -189,7 +236,14 @@ Result<std::string> run_charlm_train(const CharLMOpts& opts, LogFn log) {
         std::to_string(train_text.size()) + " holdout=" + std::to_string(holdout) +
         " val_chars=" + std::to_string(text.size() - train_text.size()));
 
-  auto tok = make_tokenizer(opts, train_text, log);
+  Result<std::unique_ptr<Tokenizer>> tok = std::unexpected(make_error(Errc::unsupported, "tok"));
+  if (init_doc) {
+    if (auto t = Tokenizer::from_json(init_doc->to_json()); t) {
+      tok = std::move(t);
+      if (log) log("reusing tokenizer from " + init_path.string());
+    }
+  }
+  if (!tok) tok = make_tokenizer(opts, train_text, log);
   if (!tok) return std::unexpected(tok.error());
   if (log) log("encoding train split …");
   auto bprog = [&](int d, int t) {
@@ -202,7 +256,7 @@ Result<std::string> run_charlm_train(const CharLMOpts& opts, LogFn log) {
         " seq=" + std::to_string(ids->size()));
   auto data = CharDataset::from_ids(*ids, *dev);
   if (!data) return std::unexpected(data.error());
-  Rng rng(1);
+  bool already_trained = false;
   CharLMConfig cfg;
   cfg.vocab = (*tok)->vocab_size();
   cfg.block_size = opts.block;
@@ -211,62 +265,160 @@ Result<std::string> run_charlm_train(const CharLMOpts& opts, LogFn log) {
   cfg.d_model = opts.d_model;
   cfg.d_ff = opts.d_ff;
   cfg.recency_alibi = opts.recency_alibi;
-  auto model = CharLM::create(cfg, *dev, rng);
-  if (!model) return std::unexpected(model.error());
-  std::int64_t n = 0;
-  for (auto& p : model->parameters()) n += p.value.numel();
-  if (log)
-    log("preset " + opts.preset + " tok=" + std::string((*tok)->model_name()) + " params " +
-        std::to_string(n) + " vocab " +
-        std::to_string(cfg.vocab) + " T=" + std::to_string(opts.block) + " L=" + std::to_string(opts.n_layer) +
-        " d=" + std::to_string(opts.d_model) + (cfg.recency_alibi ? " recency=alibi" : " recency=none"));
+  cfg.dropout = opts.dropout;
+  std::uint32_t generation = 0;
+  std::uint64_t global_step = 0;
+  std::optional<CharLM> model;
+  Rng rng(1);
+  if (init_doc) {
+    cfg = charlm_cfg_from_doc(*init_doc, opts, (*tok)->vocab_size());
+    generation = connectome_generation(*init_doc);
+    global_step = init_doc->train_step;
+    auto m = CharLM::create(cfg, *dev, rng);
+    if (!m) return std::unexpected(m.error());
+    CheckpointMeta meta;
+    auto ld = load_gyre1(init_path, m->parameters(), nullptr, meta);
+    if (!ld) return std::unexpected(ld.error());
+    if (meta.train_step) global_step = meta.train_step;
+    model = std::move(*m);
+    already_trained = true;
+    if (log) log("loaded " + init_path.string());
+  } else {
+    auto m = CharLM::create(cfg, *dev, rng);
+    if (!m) return std::unexpected(m.error());
+    model = std::move(*m);
+  }
 
-  auto doc = make_charlm_doc(opts, cfg.vocab, **tok);
-  auto meta_json = doc.to_json();
-  TrainConfig tc;
-  tc.steps = opts.steps;
-  tc.batch = opts.batch;
-  tc.block = opts.block;
-  tc.lr = opts.lr;
-  tc.lr_start = opts.lr_start;
-  tc.lr_decay_steps = opts.lr_decay_steps;
-  tc.log_every = opts.log_every;
-  tc.ckpt_every = opts.ckpt_every;
-  tc.ckpt_json = meta_json;
-  tc.param_names = model->param_names();
+  auto log_model = [&] {
+    if (!log) return;
+    log("preset " + opts.preset + " tok=" + std::string((*tok)->model_name()) + " params " +
+        std::to_string(param_count(*model)) + " vocab " + std::to_string(cfg.vocab) + " T=" +
+        std::to_string(cfg.block_size) + " L=" + std::to_string(cfg.n_layer) + " d=" +
+        std::to_string(cfg.d_model) + " d_ff=" + std::to_string(cfg.d_ff) +
+        (cfg.recency_alibi ? " recency=alibi" : " recency=none") + " dropout=" +
+        std::to_string(cfg.dropout) + " decay=" + std::to_string(opts.decay) +
+        (generation ? " gen=" + std::to_string(generation) : std::string{}));
+  };
+  log_model();
+
   if (!opts.ckpt.empty()) {
     auto dir = opts.ckpt.parent_path();
     std::filesystem::create_directories(dir.empty() ? "." : dir);
-    tc.ckpt_dir = dir.empty() ? "." : dir;
-    tc.ckpt_path = opts.ckpt;
   }
-  TrainLoop loop;
-  auto r = loop.run(
-      *model, *data, tc, *dev,
-      [&](const Metrics& m) {
-        if (log)
-          log("step " + std::to_string(m.step) + " loss " + std::to_string(m.loss) + " lr " +
-              std::to_string(m.lr));
-      },
-      [&](const Metrics& m) {
-        if (log)
-          log(progress_bar("train", m.step, opts.steps,
-                           "loss=" + std::to_string(m.loss) + " lr=" + std::to_string(m.lr)));
-      });
-  if (!r) return std::unexpected(r.error());
 
-  if (!opts.ckpt.empty()) {
-    CheckpointMeta meta{1, opts.steps, meta_json, model->param_names()};
-    auto s = save_gyre1(opts.ckpt, model->parameters(), nullptr, meta);
+  auto run_steps = [&](std::uint32_t nsteps, Adam* adam) -> Result<void> {
+    if (nsteps == 0) return {};
+    auto doc = make_charlm_doc(opts, model->config(), **tok, generation, param_count(*model), 0);
+    doc.train_step = global_step;
+    TrainConfig tc;
+    tc.steps = nsteps;
+    tc.start_step = static_cast<std::uint32_t>(global_step);
+    tc.batch = opts.batch;
+    tc.block = static_cast<std::uint32_t>(model->config().block_size);
+    tc.lr = opts.lr;
+    tc.lr_start = opts.lr_start;
+    tc.lr_decay_steps = opts.lr_decay_steps;
+    tc.grad_clip = opts.grad_clip;
+    tc.weight_decay = opts.decay;
+    tc.log_every = opts.log_every;
+    tc.ckpt_every = opts.ckpt_every;
+    tc.ckpt_json = doc.to_json();
+    tc.param_names = model->param_names();
+    tc.adam = adam;
+    tc.save_adam = true;
+    if (!opts.ckpt.empty()) {
+      auto dir = opts.ckpt.parent_path();
+      tc.ckpt_dir = dir.empty() ? "." : dir;
+      tc.ckpt_path = opts.ckpt;
+    }
+    TrainLoop loop;
+    const auto goal = global_step + nsteps;
+    auto r = loop.run(
+        *model, *data, tc, *dev,
+        [&](const Metrics& m) {
+          if (log)
+            log("step " + std::to_string(m.step) + " loss " + std::to_string(m.loss) + " lr " +
+                std::to_string(m.lr) +
+                (m.gnorm > 0.f ? " gnorm " + std::to_string(m.gnorm) : std::string{}));
+        },
+        [&](const Metrics& m) {
+          if (log)
+            log(progress_bar("train", m.step, goal,
+                             "loss=" + std::to_string(m.loss) + " lr=" + std::to_string(m.lr) +
+                                 (m.gnorm > 0.f ? " gnorm=" + std::to_string(m.gnorm) : std::string{})));
+        });
+    if (!r) return r;
+    global_step += nsteps;
+    return {};
+  };
+
+  auto persist = [&](const std::filesystem::path& path, std::uint64_t parent_n,
+                     const Adam* adam) -> Result<void> {
+    if (path.empty()) return {};
+    auto doc = make_charlm_doc(opts, model->config(), **tok, generation, param_count(*model), parent_n);
+    doc.train_step = global_step;
+    return save_charlm_ckpt(*model, doc, global_step, adam, path, log);
+  };
+
+  if (!already_trained && opts.steps > 0) {
+    auto opt = Adam::create(model->parameters(), opts.lr);
+    if (!opt) return std::unexpected(opt.error());
+    opt->weight_decay = opts.decay;
+    auto r = run_steps(opts.steps, &*opt);
+    if (!r) return std::unexpected(r.error());
+    already_trained = true;
+    auto s = persist(opts.ckpt, 0, nullptr);
     if (!s) return std::unexpected(s.error());
-    if (log) log("saved " + opts.ckpt.string());
-    auto json_path = opts.ckpt;
-    json_path.replace_extension(".gyre.json");
-    std::uint64_t nbytes = 0;
-    for (auto& p : model->parameters()) nbytes += static_cast<std::uint64_t>(p.value.nbytes());
-    auto js = save_gyre_json(json_path, model->parameters(), nullptr, doc, model->param_names(),
-                             nbytes <= kGyreJsonDataLimit);
-    if (js && log) log("saved " + json_path.string());
+  } else if (already_trained && opts.prune <= 0.f && opts.steps > 0) {
+    auto opt = Adam::create(model->parameters(), opts.lr);
+    if (!opt) return std::unexpected(opt.error());
+    opt->weight_decay = opts.decay;
+    if (opts.resume) {
+      CheckpointMeta meta;
+      auto ld = load_gyre1(init_path, model->parameters(), &*opt, meta);
+      if (!ld) {
+        opt = Adam::create(model->parameters(), opts.lr);
+        if (!opt) return std::unexpected(opt.error());
+        opt->weight_decay = opts.decay;
+        if (log) log("resume: no Adam in checkpoint, fresh optimizer");
+      } else {
+        opt->t = global_step;
+      }
+    }
+    auto r = run_steps(opts.steps, &*opt);
+    if (!r) return std::unexpected(r.error());
+    auto s = persist(opts.ckpt, 0, &*opt);
+    if (!s) return std::unexpected(s.error());
+  }
+
+  if (opts.prune > 0.f) {
+    const auto gens = opts.prune_gens == 0 ? 1u : opts.prune_gens;
+    for (std::uint32_t g = 1; g <= gens; ++g) {
+      const auto parent_n = param_count(*model);
+      auto nxt = prune_compact_charlm(*model, opts.prune, opts.shuffle_wire, rng, *dev);
+      if (!nxt) return std::unexpected(nxt.error());
+      model = std::move(*nxt);
+      cfg = model->config();
+      ++generation;
+      if (log)
+        log("prune gen " + std::to_string(generation) + " d=" + std::to_string(cfg.d_model) +
+            " d_ff=" + std::to_string(cfg.d_ff) + " params " + std::to_string(param_count(*model)) +
+            " (from " + std::to_string(parent_n) + ")");
+      auto opt = Adam::create(model->parameters(), opts.lr);
+      if (!opt) return std::unexpected(opt.error());
+      opt->weight_decay = opts.decay;
+      auto r = run_steps(opts.steps, &*opt);
+      if (!r) return std::unexpected(r.error());
+      auto s = persist(opts.ckpt, parent_n, nullptr);
+      if (!s) return std::unexpected(s.error());
+      if (!opts.ckpt.empty()) {
+        auto gen_path = opts.ckpt;
+        gen_path.replace_filename(opts.ckpt.stem().string() + "-g" + std::to_string(generation) +
+                                  opts.ckpt.extension().string());
+        auto sg = persist(gen_path, parent_n, nullptr);
+        if (!sg) return std::unexpected(sg.error());
+      }
+    }
   }
 
   std::vector<std::int32_t> prefix = {ids->front()};
@@ -429,6 +581,13 @@ Result<EvalReport> run_charlm_eval(const CharLMOpts& opts_in, double split, LogF
   r.block = T;
   r.n_params = 0;
   for (auto& p : model->parameters()) r.n_params += static_cast<std::uint64_t>(p.value.numel());
+  r.d_model = cfg.d_model;
+  r.d_ff = cfg.d_ff;
+  r.connectome_generation = connectome_generation(*peek);
+  {
+    std::error_code ec;
+    r.file_bytes = std::filesystem::file_size(opts.ckpt, ec);
+  }
   r.nats_per_token = nll / static_cast<double>(n_pred);
   r.nats_per_char = nll / static_cast<double>(r.n_chars);
   r.bpc = r.nats_per_char / 0.6931471805599453;  // ln 2
@@ -436,7 +595,9 @@ Result<EvalReport> run_charlm_eval(const CharLMOpts& opts_in, double split, LogF
   if (log) {
     log("eval split=" + std::to_string(split) + " val_chars=" + std::to_string(r.n_chars) +
         " windows=" + std::to_string(r.n_windows));
-    log("params " + std::to_string(r.n_params) + " vocab " + std::to_string(r.vocab) + " T=" +
+    log("params " + std::to_string(r.n_params) + " d=" + std::to_string(r.d_model) + " d_ff=" +
+        std::to_string(r.d_ff) + " gen=" + std::to_string(r.connectome_generation) + " file_bytes=" +
+        std::to_string(r.file_bytes) + " vocab " + std::to_string(r.vocab) + " T=" +
         std::to_string(r.block));
     log("nats/token " + std::to_string(r.nats_per_token) + "  nats/char " +
         std::to_string(r.nats_per_char) + "  BPC " + std::to_string(r.bpc) + "  chars/tok " +

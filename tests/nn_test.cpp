@@ -6,12 +6,15 @@
 #include "gyre/nn/unigram.hpp"
 #include "gyre/nn/transformer.hpp"
 #include "gyre/ops.hpp"
+#include "gyre/optim.hpp"
 #include "gyre/train/loop.hpp"
 
 #include <filesystem>
 #include <memory>
 
 #include <cmath>
+#include <limits>
+#include <optional>
 #include <gtest/gtest.h>
 
 TEST(NN, LinearForwardShape) {
@@ -37,6 +40,121 @@ TEST(NN, SoftmaxLast) {
   auto p = s->host_span<float>();
   float sum = (*p)[0] + (*p)[1] + (*p)[2];
   EXPECT_NEAR(sum, 1.f, 1e-5);
+}
+
+TEST(NN, ClipGradNormScales) {
+  auto d = gyre::Device::cpu();
+  std::int64_t sh[] = {4};
+  float v[] = {3.f, 4.f, 0.f, 0.f};  // L2 = 5
+  auto t = gyre::Tensor::from_host(std::as_bytes(std::span(v)), sh, gyre::DType::f32, *d);
+  ASSERT_TRUE(t);
+  auto g = gyre::Tensor::from_host(std::as_bytes(std::span(v)), sh, gyre::DType::f32, *d);
+  ASSERT_TRUE(g);
+  gyre::Param p{std::move(*t), std::move(*g)};
+  auto n = gyre::clip_grad_norm(std::span<gyre::Param>(&p, 1), 1.f);
+  ASSERT_TRUE(n) << n.error().message;
+  EXPECT_NEAR(*n, 5.f, 1e-5f);
+  auto gs = p.grad.host_span<float>();
+  ASSERT_TRUE(gs);
+  EXPECT_NEAR((*gs)[0], 0.6f, 1e-5f);
+  EXPECT_NEAR((*gs)[1], 0.8f, 1e-5f);
+}
+
+TEST(NN, SoftmaxInfIsFinite) {
+  auto d = gyre::Device::cpu();
+  std::int64_t sh[] = {1, 3};
+  float inf = std::numeric_limits<float>::infinity();
+  float v[] = {inf, 0.f, inf};
+  auto t = gyre::Tensor::from_host(std::as_bytes(std::span(v)), sh, gyre::DType::f32, *d);
+  auto s = gyre::softmax_last(*t);
+  ASSERT_TRUE(s);
+  auto p = s->host_span<float>();
+  EXPECT_TRUE(std::isfinite((*p)[0]) && std::isfinite((*p)[1]) && std::isfinite((*p)[2]));
+  EXPECT_NEAR((*p)[0], 0.5f, 1e-5);
+  EXPECT_NEAR((*p)[1], 0.f, 1e-5);
+  EXPECT_NEAR((*p)[2], 0.5f, 1e-5);
+}
+
+TEST(NN, DropoutOffIsIdentity) {
+  auto d = gyre::Device::cpu();
+  gyre::Rng rng(1);
+  std::int64_t sh[] = {4};
+  float v[] = {1.f, 2.f, 3.f, 4.f};
+  auto t = gyre::Tensor::from_host(std::as_bytes(std::span(v)), sh, gyre::DType::f32, *d);
+  ASSERT_TRUE(t);
+  std::optional<gyre::Tensor> saved;
+  auto y = gyre::dropout(*t, 0.f, true, &rng, &saved);
+  ASSERT_TRUE(y);
+  EXPECT_FALSE(saved);
+  auto p = y->host_span<float>();
+  ASSERT_TRUE(p);
+  EXPECT_EQ((*p)[0], 1.f);
+  EXPECT_EQ((*p)[3], 4.f);
+}
+
+TEST(NN, DropoutTrainZerosAndScales) {
+  auto d = gyre::Device::cpu();
+  gyre::Rng rng(2);
+  std::int64_t sh[] = {8};
+  float v[] = {1, 1, 1, 1, 1, 1, 1, 1};
+  auto t = gyre::Tensor::from_host(std::as_bytes(std::span(v)), sh, gyre::DType::f32, *d);
+  ASSERT_TRUE(t);
+  std::optional<gyre::Tensor> saved;
+  auto y = gyre::dropout(*t, 0.5f, true, &rng, &saved);
+  ASSERT_TRUE(y);
+  ASSERT_TRUE(saved);
+  auto py = y->host_span<float>();
+  auto ps = saved->host_span<float>();
+  ASSERT_TRUE(py && ps);
+  int nz = 0;
+  for (std::size_t i = 0; i < py->size(); ++i) {
+    if ((*ps)[i] == 0.f) {
+      EXPECT_EQ((*py)[i], 0.f);
+    } else {
+      EXPECT_NEAR((*ps)[i], 2.f, 1e-5f);
+      EXPECT_NEAR((*py)[i], 2.f, 1e-5f);
+      ++nz;
+    }
+  }
+  EXPECT_GE(nz, 0);
+  EXPECT_LE(nz, 8);
+  auto dy = gyre::dropout_backward(*y, *saved);
+  ASSERT_TRUE(dy);
+}
+
+TEST(NN, DropoutEvalIgnoresP) {
+  auto d = gyre::Device::cpu();
+  gyre::Rng rng(3);
+  std::int64_t sh[] = {2};
+  float v[] = {9.f, 8.f};
+  auto t = gyre::Tensor::from_host(std::as_bytes(std::span(v)), sh, gyre::DType::f32, *d);
+  std::optional<gyre::Tensor> saved;
+  auto y = gyre::dropout(*t, 0.9f, false, &rng, &saved);
+  ASSERT_TRUE(y);
+  auto p = y->host_span<float>();
+  EXPECT_EQ((*p)[0], 9.f);
+}
+
+TEST(NN, AdamWDecaysRank2Only) {
+  auto d = gyre::Device::cpu();
+  gyre::Rng rng(4);
+  auto lin = gyre::Linear::create(2, 2, *d, rng);
+  ASSERT_TRUE(lin);
+  auto opt = gyre::Adam::create(lin->parameters(), 0.1f);
+  ASSERT_TRUE(opt);
+  opt->weight_decay = 0.5f;
+  auto w0 = lin->parameters()[0].value.host_span<float>();
+  auto b0 = lin->parameters()[1].value.host_span<float>();
+  ASSERT_TRUE(w0 && b0);
+  const float w00 = (*w0)[0];
+  const float b00 = (*b0)[0];
+  auto zg = lin->zero_grad();
+  ASSERT_TRUE(zg);
+  ASSERT_TRUE(opt->step(lin->parameters()));
+  w0 = lin->parameters()[0].value.host_span<float>();
+  b0 = lin->parameters()[1].value.host_span<float>();
+  EXPECT_NEAR((*w0)[0], w00 * (1.f - 0.1f * 0.5f), 1e-5f);
+  EXPECT_NEAR((*b0)[0], b00, 1e-5f);
 }
 
 TEST(NN, TransformerOverfitsTinyString) {

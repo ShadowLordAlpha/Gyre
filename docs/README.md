@@ -10,5 +10,7 @@
 | [grok.md](grok.md) | Grok-2-shaped nets, inspect, tiny generate |
 | [grok-compress.md](grok-compress.md) | Weight packing probe (not Helix-critical) |
 | [vulkan.md](vulkan.md) | Optional Vulkan CharLM train/eval/generate |
+| [connectome.md](connectome.md) | Optional prune → smaller dense CharLM |
+| [interesting.md](interesting.md) | Research notes (fly connectome / model connectomes) |
 
 Agent notes for contributors in this repo: [../AGENTS.md](../AGENTS.md).

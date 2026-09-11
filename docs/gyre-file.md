@@ -25,7 +25,9 @@ One **document** describes a model. Two encodings:
     "block_size": 64,
     "vocab_size": 65,
     "holdout": 0.1,
-    "recency": "alibi"
+    "recency": "alibi",
+    "dropout": 0.2,
+    "weight_decay": 0.1
   },
   "train": { "step": 2000, "rng_seed": 1 },
   "tokenizer": { "pretoken": "identity", "model": "bpe", "merges": [], "vocab": ["a"] },
@@ -45,7 +47,7 @@ One **document** describes a model. Two encodings:
 | Field | Meaning |
 | --- | --- |
 | `arch` | `char-lm`, `grok2`, `linear`, … |
-| `config` | Architecture knobs (nested object, not mixed into the root) |
+| `config` | Architecture knobs (nested object, not mixed into the root). Optional `connectome` after `--prune`: `generation`, `prune`, `n_params`, `n_params_parent`, `dense_compact`. `d_model` / `d_ff` shrink with each generation. |
 | `train` | `step`, `rng_seed` — updated when training overwrites the same path |
 | `tokenizer` | Nested tokenizer object (same as `*.gyre.json` tokenizer files) |
 | `tensors[].name` | Stable name (`wte.weight`, `blocks.0.attn.q.weight`, `m:wte.weight` for Adam) |

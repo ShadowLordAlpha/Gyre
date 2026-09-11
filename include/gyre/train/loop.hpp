@@ -16,6 +16,7 @@ struct Metrics {
   std::uint64_t step{0};
   float loss{0};
   float lr{0};
+  float gnorm{0};  // pre-clip L2; 0 if clipping is off
 };
 
 struct TrainConfig {
@@ -24,6 +25,8 @@ struct TrainConfig {
   std::uint32_t block{64};
   float lr{3e-4f};          // floor / "normal" rate
   float lr_start{0.f};      // 0 = constant lr. else linear decay lr_start -> lr
+  float grad_clip{0.f};     // global L2 clip; 0 = off. 1.0 is too tight for Gyre's batch.
+  float weight_decay{0.f};  // AdamW; 0 = off
   std::uint32_t lr_decay_steps{0};  // 0 = 1/5 of steps when lr_start > lr
   std::uint32_t log_every{10};
   std::uint32_t ckpt_every{0};
@@ -32,6 +35,9 @@ struct TrainConfig {
   std::uint64_t seed{1};
   std::string ckpt_json;
   std::vector<std::string> param_names;
+  std::uint32_t start_step{0};  // run start_step+1 .. start_step+steps
+  Adam* adam{nullptr};          // if null, the loop creates one
+  bool save_adam{true};
 };
 
 inline float scheduled_lr(const TrainConfig& cfg, std::uint32_t step) {

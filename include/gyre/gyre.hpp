@@ -25,4 +25,5 @@
 #include "gyre/optim.hpp"
 #include "gyre/rng.hpp"
 #include "gyre/tensor.hpp"
+#include "gyre/train/connectome.hpp"
 #include "gyre/train/loop.hpp"

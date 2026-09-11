@@ -13,12 +13,14 @@ void take(std::vector<Param>& flat, std::span<Param> s) {
 
 }  // namespace
 
-DecoderBlock::DecoderBlock(LayerNorm ln1, CausalSelfAttention attn, LayerNorm ln2, Linear fc1, Linear fc2)
+DecoderBlock::DecoderBlock(LayerNorm ln1, CausalSelfAttention attn, LayerNorm ln2, Linear fc1, Linear fc2,
+                           float dropout)
     : ln1_(std::move(ln1)),
       attn_(std::move(attn)),
       ln2_(std::move(ln2)),
       fc1_(std::move(fc1)),
-      fc2_(std::move(fc2)) {
+      fc2_(std::move(fc2)),
+      dropout_(dropout) {
   rebind();
 }
 
@@ -34,7 +36,8 @@ void DecoderBlock::rebind() {
 Result<DecoderBlock> DecoderBlock::create(const CharLMConfig& c, std::shared_ptr<Device> d, Rng& rng,
                                          float resid_scale) {
   auto ln1 = LayerNorm::create(c.d_model, d);
-  auto attn = CausalSelfAttention::create(c.d_model, c.n_head, d, rng, resid_scale, c.recency_alibi);
+  auto attn = CausalSelfAttention::create(c.d_model, c.n_head, d, rng, resid_scale, c.recency_alibi,
+                                          c.dropout);
   auto ln2 = LayerNorm::create(c.d_model, d);
   auto fc1 = Linear::create(c.d_model, c.d_ff, d, rng, 0.02f, 1.f);
   auto fc2 = Linear::create(c.d_ff, c.d_model, d, rng, 0.02f, resid_scale);
@@ -42,7 +45,8 @@ Result<DecoderBlock> DecoderBlock::create(const CharLMConfig& c, std::shared_ptr
     return std::unexpected(ln1 ? (attn ? (ln2 ? (fc1 ? fc2.error() : fc1.error()) : ln2.error()) : attn.error())
                                : ln1.error());
   }
-  return DecoderBlock(std::move(*ln1), std::move(*attn), std::move(*ln2), std::move(*fc1), std::move(*fc2));
+  return DecoderBlock(std::move(*ln1), std::move(*attn), std::move(*ln2), std::move(*fc1), std::move(*fc2),
+                      c.dropout);
 }
 
 Result<Tensor> DecoderBlock::forward(const Tensor& x, ForwardCtx& ctx) {
@@ -63,14 +67,22 @@ Result<Tensor> DecoderBlock::forward(const Tensor& x, ForwardCtx& ctx) {
   if (!g) return g;
   auto fc2 = fc2_.forward(*g, ctx);
   if (!fc2) return fc2;
-  return add(*h1, *fc2);
+  auto dropped = dropout(*fc2, dropout_, ctx.train, ctx.rng, &saved_drop_mlp_);
+  if (!dropped) return dropped;
+  return add(*h1, *dropped);
 }
 
 Result<void> DecoderBlock::backward(const Tensor& dh2, ForwardCtx& ctx) {
   if (!saved_x_ || !saved_h1_ || !saved_fc1_) {
     return std::unexpected(make_error(Errc::unsupported, "block tape"));
   }
-  auto r2 = fc2_.backward(dh2, ctx);
+  Tensor dmlp = dh2;
+  if (saved_drop_mlp_) {
+    auto dd = dropout_backward(dh2, *saved_drop_mlp_);
+    if (!dd) return std::unexpected(dd.error());
+    dmlp = std::move(*dd);
+  }
+  auto r2 = fc2_.backward(dmlp, ctx);
   if (!r2 || !ctx.dx) return r2 ? std::unexpected(make_error(Errc::unsupported, "fc2 dx")) : r2;
   Tensor dgelu_out = std::move(*ctx.dx);
   auto dge = gelu_backward(*saved_fc1_, dgelu_out);
@@ -149,8 +161,10 @@ Result<Tensor> CharLM::hidden(const Tensor& idx, ForwardCtx& ctx) {
   if (!pe) return pe;
   auto x = add_broadcast_time(*tok, *pe);
   if (!x) return x;
+  auto xd = dropout(*x, cfg_.dropout, ctx.train, ctx.rng, &saved_drop_emb_);
+  if (!xd) return xd;
 
-  Tensor h = std::move(*x);
+  Tensor h = std::move(*xd);
   for (auto& block : blocks_) {
     auto y = block.forward(h, ctx);
     if (!y) return y;
@@ -174,7 +188,12 @@ Result<void> CharLM::hidden_backward(const Tensor& d_hidden, ForwardCtx& ctx) {
     if (!rb || !ctx.dx) return rb ? std::unexpected(make_error(Errc::unsupported, "block dx")) : rb;
     dh = std::move(*ctx.dx);
   }
-  // dh is d(tok + pe). tok is [B,T,C], pe is [T,C] broadcast.
+  // dh is d(tok + pe), after embedding dropout.
+  if (saved_drop_emb_) {
+    auto dd = dropout_backward(dh, *saved_drop_emb_);
+    if (!dd) return std::unexpected(dd.error());
+    dh = std::move(*dd);
+  }
   auto rtok = wte_.backward(dh, ctx);
   if (!rtok) return rtok;
   auto dpe = sum_batch_to_time(dh);

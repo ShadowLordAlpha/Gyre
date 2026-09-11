@@ -8,6 +8,8 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
+#include <optional>
 #include <vector>
 
 #if defined(GYRE_OPENMP)
@@ -456,7 +458,7 @@ Result<Tensor> gelu(const Tensor& a) {
 #pragma omp parallel for schedule(static) if (n > 4096)
 #endif
   for (std::int64_t i = 0; i < n; ++i) {
-    float x = (*pa)[static_cast<std::size_t>(i)];
+    float x = std::clamp((*pa)[static_cast<std::size_t>(i)], -40.f, 40.f);
     float u = s * (x + c * x * x * x);
     (*po)[static_cast<std::size_t>(i)] = 0.5f * x * (1.f + std::tanh(u));
   }
@@ -510,18 +512,44 @@ Result<Tensor> softmax_last(const Tensor& a) {
   const auto last = a.shape()[a.rank() - 1];
   const auto rows = a.numel() / last;
   init_threads();
+  const float inf = std::numeric_limits<float>::infinity();
 #if defined(GYRE_OPENMP)
 #pragma omp parallel for schedule(static) if (rows > 8)
 #endif
   for (std::int64_t r = 0; r < rows; ++r) {
     const float* src = pa->data() + r * last;
     float* dst = po->data() + r * last;
-    float m = src[0];
-    for (std::int64_t i = 1; i < last; ++i) m = std::max(m, src[i]);
+    bool nan_row = false;
+    std::int64_t ninf = 0;
+    float m = -inf;
+    for (std::int64_t i = 0; i < last; ++i) {
+      float x = src[i];
+      if (std::isnan(x))
+        nan_row = true;
+      else {
+        if (x > m) m = x;
+        if (x == inf) ++ninf;
+      }
+    }
+    if (nan_row || last <= 0) {
+      const float u = last > 0 ? 1.f / static_cast<float>(last) : 0.f;
+      for (std::int64_t i = 0; i < last; ++i) dst[i] = u;
+      continue;
+    }
+    if (ninf > 0) {
+      const float u = 1.f / static_cast<float>(ninf);
+      for (std::int64_t i = 0; i < last; ++i) dst[i] = src[i] == inf ? u : 0.f;
+      continue;
+    }
     float s = 0;
     for (std::int64_t i = 0; i < last; ++i) {
       dst[i] = std::exp(src[i] - m);
       s += dst[i];
+    }
+    if (!(s > 0.f) || !std::isfinite(s)) {
+      const float u = 1.f / static_cast<float>(last);
+      for (std::int64_t i = 0; i < last; ++i) dst[i] = u;
+      continue;
     }
     for (std::int64_t i = 0; i < last; ++i) dst[i] /= s;
   }
@@ -781,7 +809,7 @@ Result<Tensor> gelu_backward(const Tensor& x, const Tensor& dy) {
   constexpr float c = 0.044715f;
   constexpr float s = 0.7978845608028654f;
   for (std::size_t i = 0; i < px->size(); ++i) {
-    float xv = (*px)[i];
+    float xv = std::clamp((*px)[i], -40.f, 40.f);
     float u = s * (xv + c * xv * xv * xv);
     float th = std::tanh(u);
     float du = s * (1.f + 3.f * c * xv * xv);
@@ -1027,5 +1055,32 @@ Result<std::int32_t> sample_logit_row(std::span<const float> logits, float tempe
   }
   return next;
 }
+
+Result<Tensor> dropout(const Tensor& x, float p, bool train, Rng* rng, std::optional<Tensor>* saved_scale) {
+  if (saved_scale) saved_scale->reset();
+  if (!train || p <= 0.f) return x;
+  if (p >= 1.f) {
+    auto z = Tensor::zeros(x.shape(), x.dtype(), x.device());
+    if (!z) return z;
+    if (saved_scale) {
+      auto s = Tensor::zeros(x.shape(), DType::f32, x.device());
+      if (!s) return std::unexpected(s.error());
+      *saved_scale = std::move(*s);
+    }
+    return z;
+  }
+  if (!rng) return std::unexpected(make_error(Errc::unsupported, "dropout requires Rng"));
+  const auto n = static_cast<std::size_t>(x.numel());
+  std::vector<float> scale(n);
+  const float keep = 1.f / (1.f - p);
+  for (std::size_t i = 0; i < n; ++i) scale[i] = rng->uniform01() >= p ? keep : 0.f;
+  auto mask = Tensor::from_host(std::as_bytes(std::span<const float>(scale.data(), scale.size())), x.shape(),
+                                DType::f32, x.device());
+  if (!mask) return std::unexpected(mask.error());
+  if (saved_scale) *saved_scale = *mask;
+  return mul(x, *mask);
+}
+
+Result<Tensor> dropout_backward(const Tensor& dy, const Tensor& scale) { return mul(dy, scale); }
 
 }  // namespace gyre

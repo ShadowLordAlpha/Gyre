@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace gyre {
 
@@ -52,18 +53,27 @@ Result<LossPair> softmax_cross_entropy(const Tensor& logits, const Tensor& targe
   if (!d) return std::unexpected(d.error());
 
   const float n = static_cast<float>(B * T);
+  auto logit_h = logits.host_span<float>();
+  if (!logit_h) return std::unexpected(logit_h.error());
+  bool bad = false;
   for (std::int64_t i = 0; i < B * T; ++i) {
     auto t = (*y)[static_cast<std::size_t>(i)];
     if (t < 0 || t >= V) return std::unexpected(make_error(Errc::invalid_shape, "target OOB"));
+    for (std::int64_t v = 0; v < V; ++v) {
+      if (!std::isfinite((*logit_h)[static_cast<std::size_t>(i * V + v)])) bad = true;
+    }
     float pt = (*p)[static_cast<std::size_t>(i * V + t)];
-    loss += -std::log(std::max(pt, 1e-12f));
+    if (bad || !std::isfinite(pt))
+      loss = std::numeric_limits<float>::quiet_NaN();
+    else
+      loss += -std::log(std::max(pt, 1e-12f));
     for (std::int64_t v = 0; v < V; ++v) {
       float g = (*p)[static_cast<std::size_t>(i * V + v)];
       if (v == t) g -= 1.f;
-      (*d)[static_cast<std::size_t>(i * V + v)] = g / n;
+      (*d)[static_cast<std::size_t>(i * V + v)] = bad ? 0.f : g / n;
     }
   }
-  loss /= n;
+  if (!bad) loss /= n;
   auto lv = Tensor::empty(std::span<const std::int64_t>(), DType::f32, logits.device());
   if (!lv) return std::unexpected(lv.error());
   auto ls = lv->host_span<float>();

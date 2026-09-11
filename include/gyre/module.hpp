@@ -13,6 +13,7 @@ struct ForwardCtx {
   std::vector<Tensor> saved;
   bool train = true;
   std::unique_ptr<Tensor> dx;  // ∂L/∂input, filled by backward()
+  Rng* rng = nullptr;          // dropout; required when train && dropout > 0
 };
 
 struct Param {

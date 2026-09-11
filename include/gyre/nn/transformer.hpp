@@ -17,6 +17,7 @@ struct CharLMConfig {
   std::int64_t d_model{64};
   std::int64_t d_ff{256};
   bool recency_alibi{true};
+  float dropout{0.f};  // 0 = off; nanoGPT shakespeare-char uses 0.2
 
   static CharLMConfig tiny() {
     CharLMConfig c;
@@ -72,15 +73,18 @@ class DecoderBlock final : public Module {
   DecoderBlock& operator=(DecoderBlock&&) noexcept = default;
 
  private:
-  DecoderBlock(LayerNorm ln1, CausalSelfAttention attn, LayerNorm ln2, Linear fc1, Linear fc2);
+  DecoderBlock(LayerNorm ln1, CausalSelfAttention attn, LayerNorm ln2, Linear fc1, Linear fc2,
+               float dropout);
   void rebind();
 
   LayerNorm ln1_;
   CausalSelfAttention attn_;
   LayerNorm ln2_;
   Linear fc1_, fc2_;
+  float dropout_{0.f};
   std::vector<Param> flat_;
   std::optional<Tensor> saved_x_, saved_h1_, saved_fc1_;
+  std::optional<Tensor> saved_drop_mlp_;
 };
 
 class CharLM final : public Module {
@@ -118,6 +122,7 @@ class CharLM final : public Module {
   Linear lm_head_;
   std::vector<Param> params_;
   std::optional<Tensor> saved_idx_;
+  std::optional<Tensor> saved_drop_emb_;
 };
 
 }  // namespace gyre

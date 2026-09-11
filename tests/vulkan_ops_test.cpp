@@ -2,9 +2,11 @@
 #include "gyre/device.hpp"
 #include "gyre/nn/transformer.hpp"
 #include "gyre/ops.hpp"
+#include "gyre/optim.hpp"
 #include "gyre/train/loop.hpp"
 
 #include <cmath>
+#include <limits>
 #include <gtest/gtest.h>
 #include <optional>
 #include <span>
@@ -112,6 +114,16 @@ TEST(Vulkan, AddGeluSoftmaxLn) {
   auto lng = gyre::layer_norm(*xg, *W->to(vkd), *B->to(vkd), 1e-5f);
   ASSERT_TRUE(ln && lng) << (lng ? ln.error().message : lng.error().message);
   expect_close(*ln, *lng->to(*cpu), 2e-4f);
+
+  float inf = std::numeric_limits<float>::infinity();
+  float iv[] = {inf, 0.f, inf, 1.f, -1.f, inf, 2.f, 3.f};
+  std::int64_t ish[] = {2, 4};
+  auto xi = gyre::Tensor::from_host(std::as_bytes(std::span(iv)), ish, gyre::DType::f32, *cpu);
+  ASSERT_TRUE(xi);
+  auto sc = gyre::softmax_last(*xi);
+  auto si = gyre::softmax_last(*xi->to(vkd));
+  ASSERT_TRUE(sc && si);
+  expect_close(*sc, *si->to(*cpu), 2e-4f);
 }
 
 TEST(Vulkan, TinyTrainStep) {
@@ -142,10 +154,40 @@ TEST(Vulkan, TinyTrainStep) {
   tc.block = 16;
   tc.lr = 1e-3f;
   tc.log_every = 0;
+  tc.grad_clip = 0.f;
   float last = -1;
   gyre::TrainLoop loop;
   auto r = loop.run(*m, *data, tc, vkd, {}, [&](const gyre::Metrics& met) { last = met.loss; });
   ASSERT_TRUE(r) << r.error().message;
   EXPECT_GT(last, 0.f);
   EXPECT_TRUE(std::isfinite(last));
+}
+
+TEST(Vulkan, ClipGradNormMatchesCpu) {
+  std::string err;
+  auto vk = try_vk(&err);
+  if (!vk) GTEST_SKIP() << err;
+  auto vkd = *vk;
+  auto cpu = gyre::Device::cpu();
+  std::int64_t sh[] = {4};
+  float v[] = {3.f, 4.f, 0.f, 0.f};
+  auto t = gyre::Tensor::from_host(std::as_bytes(std::span(v)), sh, gyre::DType::f32, *cpu);
+  auto g = gyre::Tensor::from_host(std::as_bytes(std::span(v)), sh, gyre::DType::f32, *cpu);
+  ASSERT_TRUE(t && g);
+  gyre::Param pc{std::move(*t), std::move(*g)};
+  auto ncpu = gyre::clip_grad_norm(std::span<gyre::Param>(&pc, 1), 1.f);
+  ASSERT_TRUE(ncpu);
+  auto tg = gyre::Tensor::from_host(std::as_bytes(std::span(v)), sh, gyre::DType::f32, *cpu);
+  auto gg = gyre::Tensor::from_host(std::as_bytes(std::span(v)), sh, gyre::DType::f32, *cpu);
+  ASSERT_TRUE(tg && gg);
+  auto tgv = tg->to(vkd);
+  auto ggv = gg->to(vkd);
+  ASSERT_TRUE(tgv && ggv);
+  gyre::Param pv{std::move(*tgv), std::move(*ggv)};
+  auto nvk = gyre::clip_grad_norm(std::span<gyre::Param>(&pv, 1), 1.f);
+  ASSERT_TRUE(nvk) << nvk.error().message;
+  EXPECT_NEAR(*ncpu, *nvk, 1e-4f);
+  auto back = pv.grad.to(*cpu);
+  ASSERT_TRUE(back);
+  expect_close(pc.grad, *back, 1e-4f);
 }

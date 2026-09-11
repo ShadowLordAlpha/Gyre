@@ -11,6 +11,8 @@ Human-facing docs: `README.md`, Helix embed `docs/helix.md`, index `docs/README.
 - Reuse: `--tok FILE.gyre.json` (document `{"gyre":"tokenizer","version":1,"tokenizer":{pretoken,model,merges|vocab|scores}}`). `gyre-cli tok train|export|import`. Hugging Face dir and SentencePiece `.model` (unigram/char only). Train without `--tok` also writes `ckpt` with extension `.gyre.json`. Frozen copy in the GYRE1 trailer. Legacy `"tokenizer":"bpe","merges":…` still loads.
 - Default recency is **ALiBi** (`--recency alibi|none`): per-head slope `2^{-8(h+1)/H}` on causal scores, **token distance only**. Checkpoints without `"recency":"alibi"` generate without ALiBi (old files stay compatible).
 - **Train holdout** (default `0.1`): last raw-byte fraction of `--data` is **not** used for BPE train/encode or LM steps. Sidecar JSON stores `"holdout"`. `lm eval` uses that holdout (or `--split`) as the val slice. `--holdout 0` trains on the full file (in-sample eval). `--split` on train aliases holdout.
+- Optional **wire / prune** (`docs/connectome.md`): `--prune 0.2` drops the weakest 20% of `d_model` (aligned to `n_head`) and `d_ff`, copies survivors into a smaller dense CharLM, sign-collapses 2D weights. `--wire` / `--resume` load a parent; `--prune-gens` repeats. Eval reports params, width, gen, file bytes. Compare on **nats/char**.
+- **Dropout / AdamW:** `--dropout P` (train-only, after embeddings, attn weights, attn residual, MLP; 0 = off) and `--decay λ` (decoupled weight decay on rank≥2 tensors; LayerNorm/bias skipped). nanoGPT shakespeare-char uses `--dropout 0.2 --decay 0.1`. Needed for batch-64 runs; without them large batches overfit the train split.
 - Fair comparison vs other small LMs: **nats/char or BPC**, never nats/token across tokenizers. nanoGPT shakespeare-char (~10.7M, 6×384, T=256, batch 64, 5k iters) reports val **~1.47 nats/char (~2.12 BPC)** on last 10% of Karpathy tinyshakespeare (~1,115,394 chars; val 111,540). Prior Gyre evals on a full-file train were not held-out.
 
 ## Presets
@@ -31,7 +33,7 @@ Closest apples-to-apples **char** run (match their tokenizer and 90/10 split):
 ```
 gyre-cli lm train --data data/shakespeare.txt --preset nanogpt --tokenizer chars \
   --holdout 0.1 --steps 5000 --batch 2 --lr-start 1e-3 --lr 3e-4 \
-  --recency none --ckpt data/nanogpt-char.gyre
+  --dropout 0.2 --decay 0.1 --recency none --ckpt data/nanogpt-char.gyre
 gyre-cli lm eval --ckpt data/nanogpt-char.gyre --data data/shakespeare.txt --split 0.1
 ```
 

@@ -8,7 +8,7 @@ gyre-cli lm eval  --ckpt data/charlm.gyre --data data/shakespeare.txt --device v
 gyre-cli lm generate --ckpt data/charlm.gyre --device vulkan --prompt "To be"
 ```
 
-Tokenizer training, ONNX export, GA, Helix `act`, and Grok helpers stay on CPU.
+Tokenizer training, ONNX export, GA, Helix `act`, and Grok helpers stay on CPU. CharLM `--dropout` / `--decay` (AdamW) and `--prune` run on Vulkan the same as CPU when `--device vulkan` is set.
 
 ## Build
 

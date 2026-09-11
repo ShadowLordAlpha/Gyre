@@ -6,7 +6,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <span>
+#include <vector>
 
 #include <vulkan/vulkan.h>
 
@@ -40,6 +42,7 @@ class VulkanDevice final : public Device {
                         std::uint32_t gz, const Push& pc);
 
   void destroy_alloc(VkBuffer b, VkDeviceMemory m) noexcept;
+  void recycle_alloc(VkBuffer b, VkDeviceMemory m, VkDeviceSize cap) noexcept;
 
   static VulkanDevice* from(Device* d) noexcept;
 
@@ -66,11 +69,22 @@ class VulkanDevice final : public Device {
   VkDeviceSize staging_size{0};
 
  private:
+  struct PooledBuf {
+    VkBuffer buffer{VK_NULL_HANDLE};
+    VkDeviceMemory memory{VK_NULL_HANDLE};
+    VkDeviceSize cap{0};
+  };
+
   Result<void> make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
                            VkBuffer& buf, VkDeviceMemory& mem, void** mapped);
   Result<void> ensure_staging(VkDeviceSize size);
   Result<void> submit_and_wait();
   uint32_t memory_index(uint32_t type_bits, VkMemoryPropertyFlags flags) const;
+  void drain_pool() noexcept;
+
+  std::mutex pool_mu;
+  std::vector<PooledBuf> free_bufs;
+  static constexpr std::size_t kMaxPooled = 512;
 };
 
 Result<std::shared_ptr<Device>> get_or_create();

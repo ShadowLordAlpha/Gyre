@@ -47,6 +47,14 @@ float reduce_sum(float v) {
   return red[0];
 }
 
+float qnan() { return uintBitsToFloat(0x7fc00000u); }
+
+bool bit_nan(float x) {
+  return (floatBitsToUint(x) & 0x7fffffffu) > 0x7f800000u;
+}
+
+bool bit_pinf(float x) { return floatBitsToUint(x) == 0x7f800000u; }
+
 void atomicAddU(uint i, float v) {
   uint old = s4u[i];
   for (;;) {
@@ -89,6 +97,21 @@ void main() {
     float m = -1.0e30;
     for (uint i = lid; i < cols; i += 256u) m = max(m, s0[base + i]);
     m = reduce_max(m);
+    if (bit_pinf(m)) {
+      float ninf = 0.0;
+      for (uint i = lid; i < cols; i += 256u)
+        if (bit_pinf(s0[base + i])) ninf += 1.0;
+      ninf = reduce_sum(ninf);
+      float u = 1.0 / max(ninf, 1.0);
+      for (uint i = lid; i < cols; i += 256u)
+        s1[base + i] = bit_pinf(s0[base + i]) ? u : 0.0;
+      return;
+    }
+    if (bit_nan(m)) {
+      float u = 1.0 / float(cols);
+      for (uint i = lid; i < cols; i += 256u) s1[base + i] = u;
+      return;
+    }
     float sm = 0.0;
     for (uint i = lid; i < cols; i += 256u) {
       float e = exp(s0[base + i] - m);
@@ -96,6 +119,11 @@ void main() {
       sm += e;
     }
     sm = reduce_sum(sm);
+    if (sm <= 0.0 || bit_nan(sm) || bit_pinf(sm)) {
+      float u = 1.0 / float(cols);
+      for (uint i = lid; i < cols; i += 256u) s1[base + i] = u;
+      return;
+    }
     for (uint i = lid; i < cols; i += 256u) s1[base + i] /= sm;
     return;
   }
@@ -160,10 +188,20 @@ void main() {
     float m = -1.0e30;
     for (uint i = lid; i < cols; i += 256u) m = max(m, s0[base + i]);
     m = reduce_max(m);
+    int t = ii[row];
+    if (bit_pinf(m) || bit_nan(m)) {
+      if (lid == 0u) s2[row] = qnan();
+      for (uint i = lid; i < cols; i += 256u) s1[base + i] = 0.0;
+      return;
+    }
     float sm = 0.0;
     for (uint i = lid; i < cols; i += 256u) sm += exp(s0[base + i] - m);
     sm = reduce_sum(sm);
-    int t = ii[row];
+    if (sm <= 0.0 || bit_nan(sm) || bit_pinf(sm)) {
+      if (lid == 0u) s2[row] = qnan();
+      for (uint i = lid; i < cols; i += 256u) s1[base + i] = 0.0;
+      return;
+    }
     if (lid == 0u) {
       float pt = 1e-12;
       if (t >= 0 && t < int(cols)) pt = max(exp(s0[base + uint(t)] - m) / sm, 1e-12);

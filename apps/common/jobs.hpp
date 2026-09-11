@@ -32,12 +32,20 @@ struct CharLMOpts {
   std::int64_t d_ff{512};
   float lr{3e-4f};
   float lr_start{1e-3f};  // hotter start; decays to lr
+  float grad_clip{0.f};   // 0 = off; try 10–50 as a NaN fuse, not 1
   std::uint32_t lr_decay_steps{0};  // 0 = first 20% of steps
   std::uint32_t log_every{10};
   std::uint32_t ckpt_every{100};
   float temperature{0.8f};  // 0 = greedy
   bool recency_alibi{true};  // ALiBi token-distance bias; off for old checkpoints
   std::string device{"cpu"};  // cpu | vulkan
+  float prune{0.f};          // 0 = off; else drop that fraction of width each gen
+  std::uint32_t prune_gens{1};
+  bool resume{false};
+  bool shuffle_wire{false};
+  std::filesystem::path wire;  // init from this checkpoint (parent / previous gen)
+  float dropout{0.f};          // 0 = off; nanoGPT shakespeare-char uses 0.2
+  float decay{0.f};            // AdamW on rank>=2 weights; 0 = off; nanoGPT uses 0.1
 };
 
 void apply_charlm_preset(CharLMOpts& o);
@@ -70,8 +78,12 @@ struct EvalReport {
   std::uint64_t n_chars{0};
   std::uint64_t n_windows{0};
   std::uint64_t n_params{0};
+  std::uint64_t file_bytes{0};
+  std::uint32_t connectome_generation{0};
   std::int64_t vocab{0};
   std::int64_t block{0};
+  std::int64_t d_model{0};
+  std::int64_t d_ff{0};
 };
 
 // Held-out eval on the last `split` fraction of --data. split<=0 uses checkpoint holdout.

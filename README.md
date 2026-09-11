@@ -22,7 +22,8 @@ Public headers live under `include/gyre/`. Umbrella: `gyre/gyre.hpp`.
 
 **Usable now**
 
-- CPU Device (default), optional Vulkan CharLM train/eval/generate, f32 tensors, Linear / LayerNorm / CharLM transformer, Adam, GYRE1 `.gyre` checkpoints
+- CPU Device (default), optional Vulkan CharLM train/eval/generate, f32 tensors, Linear / LayerNorm / CharLM transformer, Adam/AdamW, optional dropout, GYRE1 `.gyre` checkpoints
+- Optional CharLM **prune** (`--prune`) → smaller dense net ([docs/connectome.md](docs/connectome.md))
 - Tokenizers: BPE (default), chars, bytes, unigram; reuse `--tok FILE.gyre.json`
 - GA: tournament, elite, OneMax (`gyre-cli ga`)
 - Embed stub: `gyre::adapt::{Agent, Environment, PolicyAgent, GridWorld}`
@@ -75,6 +76,8 @@ gyre-cli lm train --data data/shakespeare.txt [--preset medium|tiny|tinygpt|nano
                  [--tokenizer bpe|chars|bytes|unigram] [--tok FILE.gyre.json]
                  [--vocab-size 2000] [--holdout 0.1] [--steps 2000] [--batch 4]
                  [--ckpt data/charlm.gyre] [--recency alibi|none] [--device cpu|vulkan]
+                 [--dropout 0] [--decay 0]
+                 [--prune 0.2] [--prune-gens 8] [--wire FILE.gyre] [--resume]
 
 gyre-cli lm generate --ckpt data/charlm.gyre --data data/shakespeare.txt
                     [--prompt "To be"] [--chars 200] [--temp 0.8] [--device cpu|vulkan]
@@ -86,6 +89,8 @@ gyre-cli lm export --ckpt data/charlm.gyre --onnx data/charlm.onnx
 gyre-cli tok train|export|import|encode ...
 gyre-cli grok info|inspect|compress-probe|pack|save|gen ...
 ```
+
+`--dropout` (train only; 0 = off) and `--decay` (AdamW on rank≥2 weights; 0 = off). nanoGPT shakespeare-char uses `0.2` and `0.1`. Optional `--prune` shrinks `d_model`/`d_ff` into a smaller **dense** net. See [docs/connectome.md](docs/connectome.md).
 
 Checkpoints use extension **`.gyre`** (binary `GYRE1` v2: JSON document first, then aligned weights). Small models also write a readable **`.gyre.json`** twin of the same document. Spec: [docs/gyre-file.md](docs/gyre-file.md). Default tokenizer is **BPE** (vocab 2000). Chars/bytes are BPE with **no merges**. Default recency is **ALiBi** (token distance only). Train **holdout** default `0.1` (last raw-byte fraction unused for BPE/LM). Fair LM scores: **nats/char or BPC**, not nats/token across tokenizers.
 
@@ -111,7 +116,7 @@ include/gyre/
   module.hpp optim.hpp checkpoint.hpp data.hpp
   ga/population.hpp
   nn/layers.hpp transformer.hpp tokenize.hpp bpe.hpp …
-  train/loop.hpp
+  train/loop.hpp connectome.hpp
   adapt/agent.hpp environment.hpp
   export/onnx.hpp
 ```
@@ -127,6 +132,8 @@ Index: [docs/README.md](docs/README.md).
 - [docs/tokenizer.md](docs/tokenizer.md)
 - [docs/grok.md](docs/grok.md)
 - [docs/vulkan.md](docs/vulkan.md) — optional GPU CharLM train/run (`--device vulkan`)
+- [docs/connectome.md](docs/connectome.md) — optional prune → smaller dense CharLM
+- [docs/interesting.md](docs/interesting.md) — research notes (fly / model connectomes)
 
 ## Data not in git
 

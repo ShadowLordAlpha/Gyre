@@ -119,7 +119,8 @@ Missing for neuroevolution: island model; flatten/unflatten of `Module` paramete
 | `Linear`, `LayerNorm` | `nn/layers.hpp` | Policies, heads |
 | `CharLM` | `nn/transformer.hpp` | Pre-LN decoder; ALiBi optional. `hidden()` / `hidden_backward()` for encoder trunks (Helix `GyrePolicy`) |
 | Tokenizer | `nn/tokenize.hpp` | BPE / chars / bytes / unigram; `*.gyre.json` |
-| Adam + `TrainLoop` | `optim.hpp`, `train/loop.hpp` | Offline train |
+| Adam / AdamW + `TrainLoop` | `optim.hpp`, `train/loop.hpp` | Offline train; `--decay` / `--dropout` |
+| CharLM prune | `train/connectome.hpp` | Optional `--prune` → smaller dense net ([connectome.md](connectome.md)) |
 | GYRE1 | `checkpoint.hpp` | `.gyre` files |
 | ONNX | `export/onnx.hpp` | CharLM inference graph, no ORT |
 

@@ -40,6 +40,7 @@ add_library(gyre STATIC
   src/gyre/checkpoint.cpp
   src/gyre/data.cpp
   src/gyre/train/loop.cpp
+  src/gyre/train/connectome.cpp
   src/gyre/adapt/agent.cpp
   src/gyre/export/onnx.cpp
 )
@@ -196,6 +197,7 @@ if(GYRE_BUILD_TESTS)
     tests/nn_test.cpp
     tests/tiktoken_test.cpp
     tests/ckpt_test.cpp
+    tests/connectome_test.cpp
     tests/adapt_grid_test.cpp
     tests/vulkan_ops_test.cpp
   )

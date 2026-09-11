@@ -14,13 +14,14 @@ void take(std::vector<Param>& flat, std::span<Param> s) {
 }  // namespace
 
 CausalSelfAttention::CausalSelfAttention(Linear q, Linear k, Linear v, Linear o, std::int64_t n_head,
-                                         bool alibi)
+                                         bool alibi, float dropout)
     : q_(std::move(q)),
       k_(std::move(k)),
       v_(std::move(v)),
       o_(std::move(o)),
       n_head_(n_head),
-      recency_alibi_(alibi) {
+      recency_alibi_(alibi),
+      dropout_(dropout) {
   rebind();
 }
 
@@ -34,7 +35,8 @@ void CausalSelfAttention::rebind() {
 
 Result<CausalSelfAttention> CausalSelfAttention::create(std::int64_t d_model, std::int64_t n_head,
                                                         std::shared_ptr<Device> d, Rng& rng,
-                                                        float resid_scale, bool recency_alibi) {
+                                                        float resid_scale, bool recency_alibi,
+                                                        float dropout) {
   if (n_head <= 0 || d_model % n_head != 0) {
     return std::unexpected(make_error(Errc::invalid_shape, "d_model % n_head"));
   }
@@ -46,7 +48,7 @@ Result<CausalSelfAttention> CausalSelfAttention::create(std::int64_t d_model, st
     return std::unexpected(q ? (k ? (v ? o.error() : v.error()) : k.error()) : q.error());
   }
   return CausalSelfAttention(std::move(*q), std::move(*k), std::move(*v), std::move(*o), n_head,
-                             recency_alibi);
+                             recency_alibi, dropout);
 }
 
 Result<Tensor> CausalSelfAttention::forward(const Tensor& x, ForwardCtx& ctx) {
@@ -89,7 +91,9 @@ Result<Tensor> CausalSelfAttention::forward(const Tensor& x, ForwardCtx& ctx) {
   auto w = softmax_last(*scaled);
   if (!w) return w;
   if (ctx.train) saved_w_ = *w;
-  auto y = bmm(*w, *vh);
+  auto wd = dropout(*w, dropout_, ctx.train, ctx.rng, &saved_drop_attn_);
+  if (!wd) return wd;
+  auto y = bmm(*wd, *vh);
   if (!y) return y;
   auto y2 = permute_bhtd_bthd(*y);
   if (!y2) return y2;
@@ -97,7 +101,9 @@ Result<Tensor> CausalSelfAttention::forward(const Tensor& x, ForwardCtx& ctx) {
   auto y3 = reshape(*y2, osh);
   if (!y3) return y3;
   if (ctx.train) saved_y3_ = *y3;
-  return o_.forward(*y3, ctx);
+  auto o = o_.forward(*y3, ctx);
+  if (!o) return o;
+  return dropout(*o, dropout_, ctx.train, ctx.rng, &saved_drop_resid_);
 }
 
 Result<void> CausalSelfAttention::backward(const Tensor& d_att, ForwardCtx& ctx) {
@@ -107,7 +113,13 @@ Result<void> CausalSelfAttention::backward(const Tensor& d_att, ForwardCtx& ctx)
   const auto B = saved_x_->shape()[0], T = saved_x_->shape()[1], C = saved_x_->shape()[2];
   const auto dk = C / n_head_;
   const float scale = 1.f / std::sqrt(static_cast<float>(dk));
-  auto ro = o_.backward(d_att, ctx);
+  Tensor d_o = d_att;
+  if (saved_drop_resid_) {
+    auto dd = dropout_backward(d_att, *saved_drop_resid_);
+    if (!dd) return std::unexpected(dd.error());
+    d_o = std::move(*dd);
+  }
+  auto ro = o_.backward(d_o, ctx);
   if (!ro) return ro;
   if (!ctx.dx) return std::unexpected(make_error(Errc::unsupported, "o dx"));
   Tensor dy3 = std::move(*ctx.dx);
@@ -120,7 +132,18 @@ Result<void> CausalSelfAttention::backward(const Tensor& d_att, ForwardCtx& ctx)
   if (!vt) return std::unexpected(vt.error());
   auto dw = bmm(*dyh, *vt);
   if (!dw) return std::unexpected(dw.error());
-  auto wt = transpose_last2(*saved_w_);
+  if (saved_drop_attn_) {
+    auto dd = dropout_backward(*dw, *saved_drop_attn_);
+    if (!dd) return std::unexpected(dd.error());
+    dw = std::move(*dd);
+  }
+  Tensor w_use = *saved_w_;
+  if (saved_drop_attn_) {
+    auto wm = mul(*saved_w_, *saved_drop_attn_);
+    if (!wm) return std::unexpected(wm.error());
+    w_use = std::move(*wm);
+  }
+  auto wt = transpose_last2(w_use);
   if (!wt) return std::unexpected(wt.error());
   auto dvh = bmm(*wt, *dyh);
   if (!dvh) return std::unexpected(dvh.error());

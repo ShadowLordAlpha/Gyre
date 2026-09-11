@@ -51,6 +51,11 @@ Result<Tensor> linear(const Tensor& x, const Tensor& W, const Tensor& b);
 Result<Tensor> gelu_backward(const Tensor& x, const Tensor& dy);
 Result<Tensor> softmax_last_backward(const Tensor& softmax, const Tensor& d_out);
 
+// Train: y = x * mask, mask is 0 or 1/(1-p). Eval or p<=0: identity (x is returned).
+// `saved_scale` is filled only when a mask is applied.
+Result<Tensor> dropout(const Tensor& x, float p, bool train, Rng* rng, std::optional<Tensor>* saved_scale);
+Result<Tensor> dropout_backward(const Tensor& dy, const Tensor& scale);
+
 // temperature <= 0: argmax. temperature > 0 requires rng.
 Result<std::int32_t> sample_logit_row(std::span<const float> logits, float temperature, Rng* rng);
 

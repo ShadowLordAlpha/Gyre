@@ -12,7 +12,10 @@ static void usage() {
       "  gyre-cli lm train --data data/shakespeare.txt [--preset medium|tiny|tinygpt|nanogpt]\n"
       "                   [--tokenizer bpe|chars|bytes|unigram] [--tok FILE.gyre.json] [--vocab-size 2000]\n"
       "                   [--holdout 0.1] [--steps 2000] [--batch 4] [--ckpt data/charlm.gyre]\n"
-      "                   [--lr 3e-4] [--lr-start 1e-3] [--recency alibi|none] [--device cpu|vulkan]\n"
+      "                   [--lr 3e-4] [--lr-start 1e-3] [--grad-clip 0] [--recency alibi|none]\n"
+      "                   [--device cpu|vulkan] [--dropout 0] [--decay 0]\n"
+      "                   [--prune 0.2] [--prune-gens 1] [--wire FILE.gyre] [--resume]\n"
+      "                   [--shuffle-wire]\n"
       "                   [--hf-dir DIR] [--sp FILE.model]\n"
       "  gyre-cli lm generate --data data/shakespeare.txt --ckpt data/charlm.gyre\n"
       "                      [--preset medium|tiny|tinygpt] [--prompt \"To be\"] [--chars 200] [--temp 0.8]\n"
@@ -284,6 +287,7 @@ int main(int argc, char** argv) {
       else if (a == "--lr-start" && i + 1 < argc) o.lr_start = std::stof(argv[++i]);
       else if (a == "--lr-decay-steps" && i + 1 < argc)
         o.lr_decay_steps = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      else if (a == "--grad-clip" && i + 1 < argc) o.grad_clip = std::stof(argv[++i]);
       else if (a == "--onnx" && i + 1 < argc) onnx_path = argv[++i];
       else if (a == "--tokenizer" && i + 1 < argc) o.tokenizer = argv[++i];
       else if (a == "--tok" && i + 1 < argc) o.tok = argv[++i];
@@ -319,6 +323,14 @@ int main(int argc, char** argv) {
         o.recency_alibi = (r != "none" && r != "off" && r != "0");
       }
       else if (a == "--device" && i + 1 < argc) o.device = argv[++i];
+      else if (a == "--prune" && i + 1 < argc) o.prune = std::stof(argv[++i]);
+      else if (a == "--prune-gens" && i + 1 < argc)
+        o.prune_gens = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      else if (a == "--wire" && i + 1 < argc) o.wire = argv[++i];
+      else if (a == "--resume") o.resume = true;
+      else if (a == "--shuffle-wire") o.shuffle_wire = true;
+      else if (a == "--dropout" && i + 1 < argc) o.dropout = std::stof(argv[++i]);
+      else if (a == "--decay" && i + 1 < argc) o.decay = std::stof(argv[++i]);
     }
     apply_charlm_preset(o);
     if (block_set) o.block = block_ov;
@@ -328,6 +340,18 @@ int main(int argc, char** argv) {
     if (d_ff_set) o.d_ff = d_ff_ov;
     if (!holdout_set && split_set) o.holdout = split;
     if (sub == "train") {
+      if (o.prune < 0.f || o.prune >= 1.f) {
+        std::cerr << "--prune must be in (0, 1)\n";
+        return 1;
+      }
+      if (o.dropout < 0.f || o.dropout >= 1.f) {
+        std::cerr << "--dropout must be in [0, 1)\n";
+        return 1;
+      }
+      if (o.decay < 0.f) {
+        std::cerr << "--decay must be >= 0\n";
+        return 1;
+      }
       auto r = run_charlm_train(o, log);
       if (!r) {
         std::cerr << r.error().message << '\n';

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -26,7 +27,11 @@ struct VkGpuAlloc final : GpuAlloc {
   VkDeviceSize nbytes{0};
   std::size_t size() const noexcept override { return static_cast<std::size_t>(nbytes); }
   ~VkGpuAlloc() override {
-    if (owner) owner->destroy_alloc(buffer, memory);
+    if (owner) {
+      owner->recycle_alloc(buffer, memory, nbytes);
+      buffer = VK_NULL_HANDLE;
+      memory = VK_NULL_HANDLE;
+    }
   }
 };
 
@@ -133,8 +138,29 @@ void VulkanDevice::destroy_alloc(VkBuffer b, VkDeviceMemory m) noexcept {
   if (m) vkFreeMemory(device, m, nullptr);
 }
 
+void VulkanDevice::recycle_alloc(VkBuffer b, VkDeviceMemory m, VkDeviceSize cap) noexcept {
+  if (!b && !m) return;
+  if (!device) {
+    destroy_alloc(b, m);
+    return;
+  }
+  std::lock_guard<std::mutex> lock(pool_mu);
+  if (free_bufs.size() < kMaxPooled && cap > 0) {
+    free_bufs.push_back(PooledBuf{b, m, cap});
+    return;
+  }
+  destroy_alloc(b, m);
+}
+
+void VulkanDevice::drain_pool() noexcept {
+  std::lock_guard<std::mutex> lock(pool_mu);
+  for (auto& p : free_bufs) destroy_alloc(p.buffer, p.memory);
+  free_bufs.clear();
+}
+
 VulkanDevice::~VulkanDevice() {
   if (queue) vkQueueWaitIdle(queue);
+  drain_pool();
   if (device) {
     for (auto& p : pipes) {
       if (p) vkDestroyPipeline(device, p, nullptr);
@@ -312,7 +338,27 @@ Result<std::shared_ptr<Storage>> VulkanDevice::alloc(std::size_t bytes) {
   auto st = std::make_shared<Storage>();
   auto g = std::make_unique<VkGpuAlloc>();
   g->owner = std::static_pointer_cast<VulkanDevice>(shared_from_this());
-  VkDeviceSize n = bytes < 16 ? 16 : static_cast<VkDeviceSize>((bytes + 15) & ~std::size_t{15});
+  VkDeviceSize n = 256;
+  while (n < bytes) {
+    if (n > (std::numeric_limits<VkDeviceSize>::max() / 2)) {
+      n = static_cast<VkDeviceSize>(bytes < 16 ? 16 : bytes);
+      break;
+    }
+    n *= 2;
+  }
+  {
+    std::lock_guard<std::mutex> lock(pool_mu);
+    for (std::size_t i = 0; i < free_bufs.size(); ++i) {
+      if (free_bufs[i].cap == n) {
+        g->buffer = free_bufs[i].buffer;
+        g->memory = free_bufs[i].memory;
+        g->nbytes = n;
+        free_bufs.erase(free_bufs.begin() + static_cast<std::ptrdiff_t>(i));
+        st->gpu = std::move(g);
+        return st;
+      }
+    }
+  }
   auto r = make_buffer(n,
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
