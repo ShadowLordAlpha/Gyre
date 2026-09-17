@@ -191,3 +191,37 @@ TEST(Vulkan, ClipGradNormMatchesCpu) {
   ASSERT_TRUE(back);
   expect_close(pc.grad, *back, 1e-4f);
 }
+
+TEST(Vulkan, CharLMHiddenEvalIsFinite) {
+  std::string err;
+  auto vk = try_vk(&err);
+  if (!vk) GTEST_SKIP() << err;
+  gyre::CharLMConfig cfg;
+  cfg.vocab = 64;
+  cfg.block_size = 32;
+  cfg.n_layer = 2;
+  cfg.n_head = 2;
+  cfg.d_model = 16;
+  cfg.d_ff = 32;
+  cfg.dropout = 0.f;
+  gyre::Rng rng(1);
+  auto m = gyre::CharLM::create(cfg, *vk, rng);
+  ASSERT_TRUE(m) << m.error().message;
+  std::int32_t ids[] = {1, 2, 3, 4, 5, 6, 7, 8};
+  std::int64_t sh[] = {1, 8};
+  auto idx = gyre::Tensor::from_host(std::as_bytes(std::span(ids)), sh, gyre::DType::i32, *vk);
+  ASSERT_TRUE(idx);
+  gyre::ForwardCtx ctx;
+  ctx.train = false;
+  auto h = m->hidden(*idx, ctx);
+  ASSERT_TRUE(h) << h.error().message;
+  auto host = h->to_host_vec();
+  ASSERT_TRUE(host);
+  auto* f = reinterpret_cast<const float*>(host->data());
+  const auto n = host->size() / 4;
+  std::size_t nans = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    if (!std::isfinite(f[i])) ++nans;
+  }
+  EXPECT_EQ(nans, 0u) << "vulkan hidden produced " << nans << " non-finite of " << n;
+}

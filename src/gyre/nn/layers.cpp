@@ -36,10 +36,73 @@ Result<Linear> Linear::create(std::int64_t in, std::int64_t out, std::shared_ptr
   return Linear(std::move(ps));
 }
 
+void Linear::rebind_lora() {
+  lora_flat_.clear();
+  if (loraA_ && loraB_) {
+    lora_flat_.push_back(Param{loraA_->value, loraA_->grad});
+    lora_flat_.push_back(Param{loraB_->value, loraB_->grad});
+  }
+}
+
+Result<void> Linear::set_lora(Tensor A, Tensor B, float scale) {
+  if (params_.empty()) return std::unexpected(make_error(Errc::invalid_shape, "linear empty"));
+  const auto in = params_[0].value.shape()[0];
+  const auto out = params_[0].value.shape()[1];
+  if (A.rank() != 2 || B.rank() != 2 || A.shape()[0] != in || B.shape()[1] != out
+      || A.shape()[1] != B.shape()[0]) {
+    return std::unexpected(make_error(Errc::invalid_shape, "lora A [in,r] B [r,out]"));
+  }
+  auto device = params_[0].value.device();
+  if (device && A.device() && A.device()->kind() != device->kind()) {
+    auto a = A.to(device);
+    if (!a) return std::unexpected(a.error());
+    A = std::move(*a);
+  }
+  if (device && B.device() && B.device()->kind() != device->kind()) {
+    auto b = B.to(device);
+    if (!b) return std::unexpected(b.error());
+    B = std::move(*b);
+  }
+  auto pA = make_param(std::move(A));
+  auto pB = make_param(std::move(B));
+  if (!pA || !pB) return std::unexpected(pA ? pB.error() : pA.error());
+  loraA_ = std::move(*pA);
+  loraB_ = std::move(*pB);
+  lora_scale_ = scale;
+  rebind_lora();
+  return {};
+}
+
+void Linear::clear_lora() {
+  loraA_.reset();
+  loraB_.reset();
+  lora_flat_.clear();
+  lora_scale_ = 0.f;
+  saved_xa_.reset();
+}
+
 Result<Tensor> Linear::forward(const Tensor& x, ForwardCtx& ctx) {
   if (ctx.train) saved_x_ = x;
   else saved_x_.reset();
-  return linear(x, params_[0].value, params_[1].value);
+  auto y = linear(x, params_[0].value, params_[1].value);
+  if (!y) return y;
+  if (!loraA_ || !loraB_ || lora_scale_ == 0.f) {
+    saved_xa_.reset();
+    return y;
+  }
+  auto xf = flatten_leading(x);
+  if (!xf) return std::unexpected(xf.error());
+  auto xa = matmul(*xf, loraA_->value);
+  if (!xa) return xa;
+  if (ctx.train) saved_xa_ = *xa;
+  else saved_xa_.reset();
+  auto xb = matmul(*xa, loraB_->value);
+  if (!xb) return xb;
+  auto scaled = mul_scalar(*xb, lora_scale_);
+  if (!scaled) return scaled;
+  auto extra = unflatten_like(std::move(*scaled), *y);
+  if (!extra) return extra;
+  return add(*y, *extra);
 }
 
 Result<void> Linear::backward(const Tensor& d_out, ForwardCtx& ctx) {
@@ -48,20 +111,49 @@ Result<void> Linear::backward(const Tensor& d_out, ForwardCtx& ctx) {
   auto xf = flatten_leading(x);
   auto df = flatten_leading(d_out);
   if (!xf || !df) return std::unexpected(xf ? df.error() : xf.error());
-  auto xt = transpose_last2(*xf);
-  if (!xt) return std::unexpected(xt.error());
-  auto dW = matmul(*xt, *df);
-  if (!dW) return std::unexpected(dW.error());
-  auto r1 = add_(params_[0].grad, *dW);
-  if (!r1) return r1;
-  auto db = sum_dim(*df, 0, false);
-  if (!db) return std::unexpected(db.error());
-  auto r2 = add_(params_[1].grad, *db);
-  if (!r2) return r2;
+  if (!freeze_base_) {
+    auto xt = transpose_last2(*xf);
+    if (!xt) return std::unexpected(xt.error());
+    auto dW = matmul(*xt, *df);
+    if (!dW) return std::unexpected(dW.error());
+    auto r1 = add_(params_[0].grad, *dW);
+    if (!r1) return r1;
+    auto db = sum_dim(*df, 0, false);
+    if (!db) return std::unexpected(db.error());
+    auto r2 = add_(params_[1].grad, *db);
+    if (!r2) return r2;
+  }
   auto Wt = transpose_last2(params_[0].value);
   if (!Wt) return std::unexpected(Wt.error());
   auto dx2 = matmul(*df, *Wt);
   if (!dx2) return std::unexpected(dx2.error());
+  if (loraA_ && loraB_ && lora_scale_ != 0.f && saved_xa_) {
+    auto dfS = mul_scalar(*df, lora_scale_);
+    if (!dfS) return std::unexpected(dfS.error());
+    auto xaT = transpose_last2(*saved_xa_);
+    if (!xaT) return std::unexpected(xaT.error());
+    auto dB = matmul(*xaT, *dfS);
+    if (!dB) return std::unexpected(dB.error());
+    auto rB = add_(loraB_->grad, *dB);
+    if (!rB) return rB;
+    auto BT = transpose_last2(loraB_->value);
+    if (!BT) return std::unexpected(BT.error());
+    auto dXa = matmul(*dfS, *BT);
+    if (!dXa) return std::unexpected(dXa.error());
+    auto xT = transpose_last2(*xf);
+    if (!xT) return std::unexpected(xT.error());
+    auto dA = matmul(*xT, *dXa);
+    if (!dA) return std::unexpected(dA.error());
+    auto rA = add_(loraA_->grad, *dA);
+    if (!rA) return rA;
+    auto AT = transpose_last2(loraA_->value);
+    if (!AT) return std::unexpected(AT.error());
+    auto dxL = matmul(*dXa, *AT);
+    if (!dxL) return std::unexpected(dxL.error());
+    auto summed = add(*dx2, *dxL);
+    if (!summed) return std::unexpected(summed.error());
+    dx2 = std::move(*summed);
+  }
   auto dx = unflatten_like(std::move(*dx2), x);
   if (!dx) return std::unexpected(dx.error());
   ctx.dx = std::make_unique<Tensor>(std::move(*dx));

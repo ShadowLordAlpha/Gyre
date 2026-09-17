@@ -22,7 +22,7 @@ Public headers live under `include/gyre/`. Umbrella: `gyre/gyre.hpp`.
 
 **Usable now**
 
-- CPU Device (default), optional Vulkan CharLM train/eval/generate, f32 tensors, Linear / LayerNorm / CharLM transformer, Adam/AdamW, optional dropout, GYRE1 `.gyre` checkpoints
+- CPU Device (default), optional Vulkan CharLM train/eval/generate, f32 tensors, Linear / LayerNorm / CharLM transformer, CharLM **LoRA** (freeze base, save/load), Adam/AdamW, optional dropout, GYRE1 `.gyre` checkpoints
 - Optional CharLM **prune** (`--prune`) → smaller dense net ([docs/connectome.md](docs/connectome.md))
 - Tokenizers: BPE (default), chars, bytes, unigram; reuse `--tok FILE.gyre.json`
 - GA: tournament, elite, OneMax (`gyre-cli ga`)

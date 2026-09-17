@@ -51,6 +51,44 @@ Result<CausalSelfAttention> CausalSelfAttention::create(std::int64_t d_model, st
                              recency_alibi, dropout);
 }
 
+Result<void> CausalSelfAttention::set_lora(const LoraPair& q, const LoraPair& k, const LoraPair& v,
+                                           const LoraPair& o, float scale) {
+  auto rq = q_.set_lora(q.A, q.B, scale);
+  auto rk = k_.set_lora(k.A, k.B, scale);
+  auto rv = v_.set_lora(v.A, v.B, scale);
+  auto ro = o_.set_lora(o.A, o.B, scale);
+  if (!rq || !rk || !rv || !ro) {
+    return std::unexpected(rq ? (rk ? (rv ? ro.error() : rv.error()) : rk.error()) : rq.error());
+  }
+  return {};
+}
+
+void CausalSelfAttention::clear_lora() {
+  q_.clear_lora();
+  k_.clear_lora();
+  v_.clear_lora();
+  o_.clear_lora();
+}
+
+void CausalSelfAttention::set_freeze_base(bool freeze) {
+  q_.set_freeze_base(freeze);
+  k_.set_freeze_base(freeze);
+  v_.set_freeze_base(freeze);
+  o_.set_freeze_base(freeze);
+}
+
+std::vector<Param> CausalSelfAttention::lora_parameters() {
+  std::vector<Param> out;
+  auto take = [&](std::span<Param> s) {
+    for (auto& p : s) out.push_back(Param{p.value, p.grad});
+  };
+  take(q_.lora_parameters());
+  take(k_.lora_parameters());
+  take(v_.lora_parameters());
+  take(o_.lora_parameters());
+  return out;
+}
+
 Result<Tensor> CausalSelfAttention::forward(const Tensor& x, ForwardCtx& ctx) {
   if (x.rank() != 3) return std::unexpected(make_error(Errc::invalid_shape, "attn [B,T,C]"));
   const auto B = x.shape()[0], T = x.shape()[1], C = x.shape()[2];

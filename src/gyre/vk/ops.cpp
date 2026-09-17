@@ -424,6 +424,8 @@ Result<Tensor> mul_scalar(const Tensor& a, float s) {
 Result<void> causal_alibi_(Tensor& scores, bool alibi) {
   auto* d = dev_of(scores);
   if (!d) return std::unexpected(make_error(Errc::unsupported, "vulkan device"));
+  auto out = Tensor::empty(scores.shape(), DType::f32, scores.device());
+  if (!out) return std::unexpected(out.error());
   const auto T = scores.shape()[scores.rank() - 1];
   const auto H = scores.shape()[1];
   vkrt::Push pc;
@@ -434,7 +436,11 @@ Result<void> causal_alibi_(Tensor& scores, bool alibi) {
   pc.f[0] = alibi ? 1.f : 0.f;
   std::array<vkrt::Bind, 7> b{};
   b[0].t = &scores;
-  return d->dispatch(vkrt::Pipe::idx, b, groups(scores.numel()), 1, 1, pc);
+  b[2].t = &*out;
+  auto r = d->dispatch(vkrt::Pipe::idx, b, groups(scores.numel()), 1, 1, pc);
+  if (!r) return r;
+  scores = std::move(*out);
+  return {};
 }
 
 Result<Tensor> add_broadcast_time(const Tensor& tok, const Tensor& pe) {
@@ -539,6 +545,8 @@ Result<void> embedding_backward(Tensor& grad_W, const Tensor& idx, const Tensor&
 Result<void> bias_add_(Tensor& y, const Tensor& b) {
   auto* d = dev_of(y);
   if (!d) return std::unexpected(make_error(Errc::unsupported, "vulkan device"));
+  auto out = Tensor::empty(y.shape(), DType::f32, y.device());
+  if (!out) return std::unexpected(out.error());
   vkrt::Push pc;
   pc.u[0] = static_cast<std::uint32_t>(y.numel());
   pc.u[1] = 10;
@@ -546,8 +554,11 @@ Result<void> bias_add_(Tensor& y, const Tensor& b) {
   std::array<vkrt::Bind, 7> bd{};
   bd[0].t = &y;
   bd[1].t = &b;
-  bd[2].t = &y;
-  return d->dispatch(vkrt::Pipe::elem, bd, groups(y.numel()), 1, 1, pc);
+  bd[2].t = &*out;
+  auto r = d->dispatch(vkrt::Pipe::elem, bd, groups(y.numel()), 1, 1, pc);
+  if (!r) return r;
+  y = std::move(*out);
+  return {};
 }
 
 Result<LossPair> softmax_cross_entropy(const Tensor& logits, const Tensor& targets_i32) {

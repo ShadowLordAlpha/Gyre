@@ -195,6 +195,7 @@ if(GYRE_BUILD_TESTS)
     tests/grok_io_test.cpp
     tests/ga_test.cpp
     tests/nn_test.cpp
+    tests/charlm_lora_test.cpp
     tests/tiktoken_test.cpp
     tests/ckpt_test.cpp
     tests/connectome_test.cpp

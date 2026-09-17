@@ -44,7 +44,10 @@ void main() {
   if (op == 0u) {
     int id = ia[i];
     uint d = pc.u2;
-    if (id < 0 || uint(id) >= pc.u3) return;
+    if (id < 0 || uint(id) >= pc.u3) {
+      for (uint c = 0u; c < d; ++c) cu[i * d + c] = 0u;
+      return;
+    }
     for (uint c = 0u; c < d; ++c) cu[i * d + c] = au[uint(id) * d + c];
     return;
   }
@@ -110,7 +113,7 @@ void main() {
       float slope = pow(2.0, -8.0 * float(h + 1u) / float(H));
       v += -slope * float(t - j);
     }
-    au[i] = floatBitsToUint(v);
+    cu[i] = floatBitsToUint(v);
     return;
   }
 

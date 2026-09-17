@@ -33,12 +33,12 @@ void main() {
   } else if (op == 1u) {
     z[i] = x[i] * y[i];
   } else if (op == 2u) {
-    float v = clamp(x[i], -40.0, 40.0);
-    float u = s * (v + c * v * v * v);
+    float v = clamp(x[i], -8.0, 8.0);
+    float u = clamp(s * (v + c * v * v * v), -8.0, 8.0);
     z[i] = 0.5 * v * (1.0 + tanh(u));
   } else if (op == 3u) {
-    float xv = clamp(x[i], -40.0, 40.0);
-    float u = s * (xv + c * xv * xv * xv);
+    float xv = clamp(x[i], -8.0, 8.0);
+    float u = clamp(s * (xv + c * xv * xv * xv), -8.0, 8.0);
     float th = tanh(u);
     float du = s * (1.0 + 3.0 * c * xv * xv);
     float dgelu = 0.5 * (1.0 + th) + 0.5 * xv * (1.0 - th * th) * du;

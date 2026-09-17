@@ -3,6 +3,7 @@
 #include "gyre/nn/attention.hpp"
 #include "gyre/nn/tokenize.hpp"
 
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -61,6 +62,21 @@ struct CharLMConfig {
   }
 };
 
+struct CharLoraLayer {
+  LoraPair q, k, v, o, fc1, fc2;
+};
+
+struct CharLora {
+  std::int64_t rank{8};
+  float alpha{16.f};
+  std::vector<CharLoraLayer> layers;
+  float scale() const noexcept {
+    return rank > 0 ? alpha / static_cast<float>(rank) : 0.f;
+  }
+  static Result<CharLora> create(const CharLMConfig& c, std::int64_t rank, float alpha,
+                                 std::shared_ptr<Device> d, Rng& rng);
+};
+
 class DecoderBlock final : public Module {
  public:
   static Result<DecoderBlock> create(const CharLMConfig& c, std::shared_ptr<Device> d, Rng& rng,
@@ -68,6 +84,11 @@ class DecoderBlock final : public Module {
   Result<Tensor> forward(const Tensor& x, ForwardCtx& ctx) override;
   Result<void> backward(const Tensor& d_out, ForwardCtx& ctx) override;
   std::span<Param> parameters() noexcept override { return flat_; }
+
+  Result<void> set_lora(const CharLoraLayer& layer, float scale);
+  void clear_lora();
+  void set_freeze_base(bool freeze);
+  std::vector<Param> lora_parameters();
 
   DecoderBlock(DecoderBlock&&) noexcept = default;
   DecoderBlock& operator=(DecoderBlock&&) noexcept = default;
@@ -101,6 +122,16 @@ class CharLM final : public Module {
                                              std::shared_ptr<Device> d, Rng* rng = nullptr,
                                              float temperature = 0.f);
 
+  Result<void> set_lora(CharLora lora);
+  Result<void> save_lora(const std::filesystem::path& path) const;
+  Result<void> load_lora(const std::filesystem::path& path, std::shared_ptr<Device> d);
+  void clear_lora();
+  void set_freeze_base(bool freeze);
+  const CharLora* lora() const { return lora_ ? &*lora_ : nullptr; }
+  std::span<Param> lora_parameters() noexcept { return lora_flat_; }
+  std::span<const Param> lora_parameters() const noexcept { return lora_flat_; }
+  Result<void> zero_grad() override;
+
   CharLM(CharLM&&) noexcept = default;
   CharLM& operator=(CharLM&&) noexcept = default;
 
@@ -118,6 +149,8 @@ class CharLM final : public Module {
   Embedding wte_;
   Embedding wpe_;
   std::vector<DecoderBlock> blocks_;
+  std::optional<CharLora> lora_;
+  std::vector<Param> lora_flat_;
   LayerNorm ln_f_;
   Linear lm_head_;
   std::vector<Param> params_;

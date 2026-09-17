@@ -36,15 +36,6 @@ Result<void> TrainLoop::run(Module& model, Dataset& data, const TrainConfig& cfg
     if (!logits) return std::unexpected(logits.error());
     auto loss = softmax_cross_entropy(*logits, xy->second);
     if (!loss) return std::unexpected(loss.error());
-    auto item = loss->value.item_f32();
-    if (!item) return std::unexpected(item.error());
-    float loss_v = *item;
-    if (!std::isfinite(loss_v)) {
-      return std::unexpected(make_error(
-          Errc::overflow, "non-finite loss at step " + std::to_string(step) +
-                              " (logits overflowed or NaN). Weights were not updated. Resume from the "
-                              "last step-*.gyre in the checkpoint directory."));
-    }
     auto bw = model.backward(loss->d_pred, ctx);
     if (!bw) return bw;
     float gnorm = 0.f;
@@ -56,6 +47,18 @@ Result<void> TrainLoop::run(Module& model, Dataset& data, const TrainConfig& cfg
     opt->lr = scheduled_lr(cfg, step);
     auto st = opt->step(model.parameters());
     if (!st) return st;
+    const bool want_log = (cfg.log_every && step % cfg.log_every == 0) || step == last;
+    float loss_v = 0.f;
+    if (want_log) {
+      auto item = loss->value.item_f32();
+      if (!item) return std::unexpected(item.error());
+      loss_v = *item;
+      if (!std::isfinite(loss_v)) {
+        return std::unexpected(make_error(
+            Errc::overflow, "non-finite loss at step " + std::to_string(step) +
+                                " (logits overflowed or NaN). Resume from the last step-*.gyre."));
+      }
+    }
     Metrics m{step, loss_v, opt->lr, gnorm};
     if (on_progress) on_progress(m);
     if (cfg.log_every && step % cfg.log_every == 0) {

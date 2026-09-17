@@ -15,7 +15,7 @@ Intended runtime: Helix **links `gyre` in-process**. It is not a sidecar RPC ser
 | Discrete or continuous actions | **API yes** | `ActionSpace::discrete_int` / `continuous_f32`; PolicyAgent is discrete only |
 | Genetic algorithms | **Kernel yes** | Tournament k=3, elite, OneMax. **No islands. No param flatten for neuroevolution** |
 | Recurrent controller (Elman) | **No** | Not implemented; ALiBi transformer used for sequence LMs instead |
-| Small transformer LM | **Yes** | CharLM presets `tiny` … `nanogpt`; BPE/chars/bytes/unigram |
+| Small transformer LM | **Yes** | CharLM presets `tiny` … `nanogpt`; BPE/chars/bytes/unigram; Linear LoRA on attn/MLP |
 | ONNX export of CharLM | **Yes** | Write-only; no ORT link |
 | Vulkan / OpenCL | **Train yes / tick no** | Optional CharLM `--device vulkan` (see [vulkan.md](vulkan.md)). Helix `act` stays CPU. OpenCL not implemented |
 | Full Grok-2 generate | **No** | Tiny/mini Grok-shaped nets + inspect/pack; 270B not runnable |

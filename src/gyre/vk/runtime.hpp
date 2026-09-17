@@ -58,6 +58,9 @@ class VulkanDevice final : public Device {
   VkPipelineLayout pipe_layout{VK_NULL_HANDLE};
   VkDescriptorPool desc_pool{VK_NULL_HANDLE};
   VkDescriptorSet desc_set{VK_NULL_HANDLE};
+  std::vector<VkDescriptorSet> desc_sets_{};
+  std::uint32_t desc_index_{0};
+  bool recording_{false};
   VkPipeline pipes[static_cast<int>(Pipe::count)]{};
   VkShaderModule shaders[static_cast<int>(Pipe::count)]{};
   VkPhysicalDeviceMemoryProperties mem{};
@@ -79,12 +82,17 @@ class VulkanDevice final : public Device {
                            VkBuffer& buf, VkDeviceMemory& mem, void** mapped);
   Result<void> ensure_staging(VkDeviceSize size);
   Result<void> submit_and_wait();
+  Result<void> begin_record();
+  Result<void> flush();
+  Result<void> ensure_room(std::uint32_t sets = 0);
   uint32_t memory_index(uint32_t type_bits, VkMemoryPropertyFlags flags) const;
   void drain_pool() noexcept;
 
   std::mutex pool_mu;
   std::vector<PooledBuf> free_bufs;
+  std::vector<PooledBuf> graveyard_;
   static constexpr std::size_t kMaxPooled = 512;
+  void bury_graveyard() noexcept;
 };
 
 Result<std::shared_ptr<Device>> get_or_create();

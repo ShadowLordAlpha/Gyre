@@ -128,7 +128,53 @@ Result<void> VulkanDevice::submit_and_wait() {
   return {};
 }
 
+Result<void> VulkanDevice::begin_record() {
+  if (recording_) return {};
+  vkResetCommandBuffer(cmd, 0);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  VkResult r = vkBeginCommandBuffer(cmd, &bi);
+  if (r != VK_SUCCESS) return std::unexpected(vkerr(r, "vkBeginCommandBuffer"));
+  recording_ = true;
+  desc_index_ = 0;
+  return {};
+}
+
+Result<void> VulkanDevice::flush() {
+  if (!recording_) return {};
+  VkResult r = vkEndCommandBuffer(cmd);
+  recording_ = false;
+  desc_index_ = 0;
+  if (r != VK_SUCCESS) return std::unexpected(vkerr(r, "vkEndCommandBuffer"));
+  auto s = submit_and_wait();
+  {
+    std::lock_guard<std::mutex> lock(pool_mu);
+    bury_graveyard();
+  }
+  return s;
+}
+
+Result<void> VulkanDevice::ensure_room(std::uint32_t sets) {
+  if (!recording_) return begin_record();
+  if (sets > 0 && desc_index_ + sets > desc_sets_.size()) {
+    auto f = flush();
+    if (!f) return f;
+    return begin_record();
+  }
+  return {};
+}
+
+static void memory_barrier(VkCommandBuffer cmd) {
+  VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb,
+                       0, nullptr, 0, nullptr);
+}
+
 void VulkanDevice::synchronize() {
+  (void)flush();
   if (queue) vkQueueWaitIdle(queue);
 }
 
@@ -145,6 +191,12 @@ void VulkanDevice::recycle_alloc(VkBuffer b, VkDeviceMemory m, VkDeviceSize cap)
     return;
   }
   std::lock_guard<std::mutex> lock(pool_mu);
+  // Recorded dispatches still hold this VkBuffer. Reusing or destroying it
+  // before submit leaves compute reading recycled/uninitialized memory (NaNs).
+  if (recording_) {
+    graveyard_.push_back(PooledBuf{b, m, cap});
+    return;
+  }
   if (free_bufs.size() < kMaxPooled && cap > 0) {
     free_bufs.push_back(PooledBuf{b, m, cap});
     return;
@@ -152,13 +204,27 @@ void VulkanDevice::recycle_alloc(VkBuffer b, VkDeviceMemory m, VkDeviceSize cap)
   destroy_alloc(b, m);
 }
 
+void VulkanDevice::bury_graveyard() noexcept {
+  for (auto& p : graveyard_) {
+    if (free_bufs.size() < kMaxPooled && p.cap > 0) {
+      free_bufs.push_back(p);
+    } else {
+      destroy_alloc(p.buffer, p.memory);
+    }
+  }
+  graveyard_.clear();
+}
+
 void VulkanDevice::drain_pool() noexcept {
   std::lock_guard<std::mutex> lock(pool_mu);
+  for (auto& p : graveyard_) destroy_alloc(p.buffer, p.memory);
+  graveyard_.clear();
   for (auto& p : free_bufs) destroy_alloc(p.buffer, p.memory);
   free_bufs.clear();
 }
 
 VulkanDevice::~VulkanDevice() {
+  (void)flush();
   if (queue) vkQueueWaitIdle(queue);
   drain_pool();
   if (device) {
@@ -316,21 +382,25 @@ Result<void> VulkanDevice::init() {
   if (auto e = make_pipe(Pipe::idx, gyre_idx_spv, sizeof(gyre_idx_spv)); !e) return e;
   if (auto e = make_pipe(Pipe::adam, gyre_adam_spv, sizeof(gyre_adam_spv)); !e) return e;
 
+  constexpr std::uint32_t kDescRing = 512;
   VkDescriptorPoolSize ps{};
   ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  ps.descriptorCount = 7;
+  ps.descriptorCount = 7 * kDescRing;
   VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-  dpi.maxSets = 1;
+  dpi.maxSets = kDescRing;
   dpi.poolSizeCount = 1;
   dpi.pPoolSizes = &ps;
   r = vkCreateDescriptorPool(device, &dpi, nullptr, &desc_pool);
   if (r != VK_SUCCESS) return std::unexpected(vkerr(r, "vkCreateDescriptorPool"));
+  std::vector<VkDescriptorSetLayout> layouts(kDescRing, set_layout);
   VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
   dai.descriptorPool = desc_pool;
-  dai.descriptorSetCount = 1;
-  dai.pSetLayouts = &set_layout;
-  r = vkAllocateDescriptorSets(device, &dai, &desc_set);
+  dai.descriptorSetCount = kDescRing;
+  dai.pSetLayouts = layouts.data();
+  desc_sets_.resize(kDescRing);
+  r = vkAllocateDescriptorSets(device, &dai, desc_sets_.data());
   if (r != VK_SUCCESS) return std::unexpected(vkerr(r, "vkAllocateDescriptorSets"));
+  desc_set = desc_sets_[0];
   return {};
 }
 
@@ -380,39 +450,38 @@ Result<void> VulkanDevice::upload(Storage& st, std::size_t offset, std::span<con
   if (src.empty()) return {};
   auto* g = gpu(st);
   if (!g) return std::unexpected(make_error(Errc::unsupported, "not a Vulkan buffer"));
+  auto fl = flush();
+  if (!fl) return fl;
   auto er = ensure_staging(src.size());
   if (!er) return er;
   std::memcpy(staging_ptr, src.data(), src.size());
-  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vkResetCommandBuffer(cmd, 0);
-  vkBeginCommandBuffer(cmd, &bi);
+  auto b = begin_record();
+  if (!b) return b;
   VkBufferCopy cp{};
   cp.srcOffset = 0;
   cp.dstOffset = offset;
   cp.size = src.size();
   vkCmdCopyBuffer(cmd, staging, g->buffer, 1, &cp);
-  vkEndCommandBuffer(cmd);
-  return submit_and_wait();
+  memory_barrier(cmd);
+  return flush();
 }
 
 Result<void> VulkanDevice::download(const Storage& st, std::size_t offset, std::span<std::byte> dst) {
   if (dst.empty()) return {};
   auto* g = gpu(st);
   if (!g) return std::unexpected(make_error(Errc::unsupported, "not a Vulkan buffer"));
+  auto fl = flush();
+  if (!fl) return fl;
   auto er = ensure_staging(dst.size());
   if (!er) return er;
-  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vkResetCommandBuffer(cmd, 0);
-  vkBeginCommandBuffer(cmd, &bi);
+  auto b = begin_record();
+  if (!b) return b;
   VkBufferCopy cp{};
   cp.srcOffset = offset;
   cp.dstOffset = 0;
   cp.size = dst.size();
   vkCmdCopyBuffer(cmd, g->buffer, staging, 1, &cp);
-  vkEndCommandBuffer(cmd);
-  auto s = submit_and_wait();
+  auto s = flush();
   if (!s) return s;
   std::memcpy(dst.data(), staging_ptr, dst.size());
   return {};
@@ -424,17 +493,15 @@ Result<void> VulkanDevice::copy(Storage& dst, std::size_t dst_off, const Storage
   auto* d = gpu(dst);
   auto* s = gpu(src);
   if (!d || !s) return std::unexpected(make_error(Errc::unsupported, "not a Vulkan buffer"));
-  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vkResetCommandBuffer(cmd, 0);
-  vkBeginCommandBuffer(cmd, &bi);
+  auto room = ensure_room();
+  if (!room) return room;
   VkBufferCopy cp{};
   cp.srcOffset = src_off;
   cp.dstOffset = dst_off;
   cp.size = n;
   vkCmdCopyBuffer(cmd, s->buffer, d->buffer, 1, &cp);
-  vkEndCommandBuffer(cmd);
-  return submit_and_wait();
+  memory_barrier(cmd);
+  return {};
 }
 
 Result<void> VulkanDevice::fill_zero(Storage& st, std::size_t offset, std::size_t n) {
@@ -446,13 +513,11 @@ Result<void> VulkanDevice::fill_zero(Storage& st, std::size_t offset, std::size_
     std::vector<std::byte> z(n);
     return upload(st, offset, z);
   }
-  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vkResetCommandBuffer(cmd, 0);
-  vkBeginCommandBuffer(cmd, &bi);
+  auto room = ensure_room();
+  if (!room) return room;
   vkCmdFillBuffer(cmd, g->buffer, off, aligned, 0);
-  vkEndCommandBuffer(cmd);
-  return submit_and_wait();
+  memory_barrier(cmd);
+  return {};
 }
 
 Result<void> VulkanDevice::dispatch(Pipe p, const std::array<Bind, 7>& binds, std::uint32_t gx,
@@ -460,6 +525,15 @@ Result<void> VulkanDevice::dispatch(Pipe p, const std::array<Bind, 7>& binds, st
   if (gx == 0) gx = 1;
   if (gy == 0) gy = 1;
   if (gz == 0) gz = 1;
+  auto room = ensure_room(1);
+  if (!room) return room;
+  if (desc_index_ >= desc_sets_.size()) {
+    auto f = flush();
+    if (!f) return f;
+    auto b = begin_record();
+    if (!b) return b;
+  }
+  VkDescriptorSet set = desc_sets_[desc_index_++];
   VkDescriptorBufferInfo infos[7]{};
   VkWriteDescriptorSet writes[7]{};
   for (int i = 0; i < 7; ++i) {
@@ -473,7 +547,7 @@ Result<void> VulkanDevice::dispatch(Pipe p, const std::array<Bind, 7>& binds, st
       infos[i].range = std::max<VkDeviceSize>(binds[i].t->nbytes(), 4);
     }
     writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[i].dstSet = desc_set;
+    writes[i].dstSet = set;
     writes[i].dstBinding = static_cast<uint32_t>(i);
     writes[i].descriptorCount = 1;
     writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -481,23 +555,12 @@ Result<void> VulkanDevice::dispatch(Pipe p, const std::array<Bind, 7>& binds, st
   }
   vkUpdateDescriptorSets(device, 7, writes, 0, nullptr);
 
-  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vkResetCommandBuffer(cmd, 0);
-  vkBeginCommandBuffer(cmd, &bi);
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipes[static_cast<int>(p)]);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_layout, 0, 1, &desc_set, 0,
-                          nullptr);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_layout, 0, 1, &set, 0, nullptr);
   vkCmdPushConstants(cmd, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 48, &pc);
   vkCmdDispatch(cmd, gx, gy, gz);
-  VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-  mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-  mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
-  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
-                       &mb, 0, nullptr, 0, nullptr);
-  vkEndCommandBuffer(cmd);
-  return submit_and_wait();
+  memory_barrier(cmd);
+  return {};
 }
 
 Result<std::shared_ptr<Device>> get_or_create() {

@@ -10,6 +10,11 @@
 
 namespace gyre {
 
+struct LoraPair {
+  Tensor A;  // [in, rank]
+  Tensor B;  // [rank, out]
+};
+
 class Linear final : public Module {
  public:
   static Result<Linear> create(std::int64_t in, std::int64_t out, std::shared_ptr<Device> dev,
@@ -18,14 +23,29 @@ class Linear final : public Module {
   Result<Tensor> forward(const Tensor& x, ForwardCtx& ctx) override;
   Result<void> backward(const Tensor& d_out, ForwardCtx& ctx) override;
   std::span<Param> parameters() noexcept override { return params_; }
+  std::span<Param> lora_parameters() noexcept { return lora_flat_; }
+  std::span<const Param> lora_parameters() const noexcept { return lora_flat_; }
+
+  Result<void> set_lora(Tensor A, Tensor B, float scale);
+  void clear_lora();
+  void set_freeze_base(bool freeze) { freeze_base_ = freeze; }
+  bool freeze_base() const { return freeze_base_; }
+  bool has_lora() const { return loraA_.has_value(); }
 
   Linear(Linear&&) noexcept = default;
   Linear& operator=(Linear&&) noexcept = default;
 
  private:
   Linear(std::vector<Param> p) : params_(std::move(p)) {}
+  void rebind_lora();
   std::vector<Param> params_;  // W [in,out], b [out]
+  std::optional<Param> loraA_;
+  std::optional<Param> loraB_;
+  std::vector<Param> lora_flat_;
+  float lora_scale_{0.f};
+  bool freeze_base_{false};
   std::optional<Tensor> saved_x_;
+  std::optional<Tensor> saved_xa_;
 };
 
 class LayerNorm final : public Module {

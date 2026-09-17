@@ -18,6 +18,12 @@ class CausalSelfAttention final : public Module {
   Result<void> backward(const Tensor& d_out, ForwardCtx& ctx) override;
   std::span<Param> parameters() noexcept override { return flat_; }
 
+  Result<void> set_lora(const LoraPair& q, const LoraPair& k, const LoraPair& v, const LoraPair& o,
+                        float scale);
+  void clear_lora();
+  void set_freeze_base(bool freeze);
+  std::vector<Param> lora_parameters();
+
   CausalSelfAttention(CausalSelfAttention&&) noexcept = default;
   CausalSelfAttention& operator=(CausalSelfAttention&&) noexcept = default;
 
