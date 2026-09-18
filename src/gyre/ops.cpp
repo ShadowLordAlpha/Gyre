@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <vector>
@@ -21,6 +22,15 @@ namespace {
 
 bool is_vk(const Tensor& t) {
   return t.device() && t.device()->kind() == DeviceKind::vulkan;
+}
+
+Result<void> require_vk(std::initializer_list<const Tensor*> ts) {
+  for (auto* t : ts) {
+    if (t && !is_vk(*t)) {
+      return std::unexpected(make_error(Errc::mixed_device, "mixed device"));
+    }
+  }
+  return {};
 }
 
 Result<void> same_dev_dtype_shape(const Tensor& a, const Tensor& b, bool check_shape) {
@@ -565,7 +575,10 @@ Result<Tensor> layer_norm(const Tensor& x, const Tensor& w, const Tensor& b, flo
     return std::unexpected(make_error(Errc::invalid_shape, "ln shape"));
   }
 #if defined(GYRE_VULKAN)
-  if (is_vk(x)) return vkops::layer_norm(x, w, b, eps);
+  if (is_vk(x)) {
+    if (auto d = require_vk({&x, &w, &b}); !d) return std::unexpected(d.error());
+    return vkops::layer_norm(x, w, b, eps);
+  }
 #endif
   auto out = Tensor::empty(x.shape(), DType::f32, x.device());
   if (!out) return out;
@@ -609,7 +622,10 @@ Result<Tensor> rms_norm(const Tensor& x, const Tensor& w, float eps) {
     return std::unexpected(make_error(Errc::invalid_shape, "rms shape"));
   }
 #if defined(GYRE_VULKAN)
-  if (is_vk(x)) return vkops::rms_norm(x, w, eps);
+  if (is_vk(x)) {
+    if (auto d = require_vk({&x, &w}); !d) return std::unexpected(d.error());
+    return vkops::rms_norm(x, w, eps);
+  }
 #endif
   auto out = Tensor::empty(x.shape(), DType::f32, x.device());
   if (!out) return out;
@@ -780,6 +796,7 @@ Result<Tensor> linear(const Tensor& x, const Tensor& W, const Tensor& b) {
   if (!y) return y;
 #if defined(GYRE_VULKAN)
   if (is_vk(*y)) {
+    if (auto d = require_vk({&*y, &b}); !d) return std::unexpected(d.error());
     auto ba = vkops::bias_add_(*y, b);
     if (!ba) return std::unexpected(ba.error());
     return unflatten_like(std::move(*y), x);
@@ -798,7 +815,10 @@ Result<Tensor> linear(const Tensor& x, const Tensor& W, const Tensor& b) {
 
 Result<Tensor> gelu_backward(const Tensor& x, const Tensor& dy) {
 #if defined(GYRE_VULKAN)
-  if (is_vk(x)) return vkops::gelu_backward(x, dy);
+  if (is_vk(x)) {
+    if (auto d = require_vk({&x, &dy}); !d) return std::unexpected(d.error());
+    return vkops::gelu_backward(x, dy);
+  }
 #endif
   auto out = Tensor::empty(x.shape(), DType::f32, x.device());
   if (!out) return out;
@@ -821,7 +841,10 @@ Result<Tensor> gelu_backward(const Tensor& x, const Tensor& dy) {
 
 Result<Tensor> softmax_last_backward(const Tensor& softmax, const Tensor& d_out) {
 #if defined(GYRE_VULKAN)
-  if (is_vk(softmax)) return vkops::softmax_last_backward(softmax, d_out);
+  if (is_vk(softmax)) {
+    if (auto d = require_vk({&softmax, &d_out}); !d) return std::unexpected(d.error());
+    return vkops::softmax_last_backward(softmax, d_out);
+  }
 #endif
   auto out = Tensor::empty(softmax.shape(), DType::f32, softmax.device());
   if (!out) return out;
@@ -953,7 +976,10 @@ Result<Tensor> arange_i32(std::int64_t n, std::shared_ptr<Device> d) {
 Result<Tensor> layer_norm_backward(const Tensor& x, const Tensor& d_out, const Tensor& w, Tensor& gw,
                                    Tensor& gb, float eps) {
 #if defined(GYRE_VULKAN)
-  if (is_vk(x)) return vkops::layer_norm_backward(x, d_out, w, gw, gb, eps);
+  if (is_vk(x)) {
+    if (auto d = require_vk({&x, &d_out, &w, &gw, &gb}); !d) return std::unexpected(d.error());
+    return vkops::layer_norm_backward(x, d_out, w, gw, gb, eps);
+  }
 #endif
   auto px = x.host_span<float>();
   auto pd = d_out.host_span<float>();
@@ -1005,7 +1031,10 @@ Result<Tensor> layer_norm_backward(const Tensor& x, const Tensor& d_out, const T
 
 Result<void> embedding_backward(Tensor& grad_W, const Tensor& idx, const Tensor& d_out) {
 #if defined(GYRE_VULKAN)
-  if (is_vk(grad_W)) return vkops::embedding_backward(grad_W, idx, d_out);
+  if (is_vk(grad_W)) {
+    if (auto d = require_vk({&grad_W, &idx, &d_out}); !d) return std::unexpected(d.error());
+    return vkops::embedding_backward(grad_W, idx, d_out);
+  }
 #endif
   auto g = grad_W.host_span<float>();
   auto i = idx.host_span<std::int32_t>();

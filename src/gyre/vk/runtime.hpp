@@ -66,10 +66,12 @@ class VulkanDevice final : public Device {
   VkPhysicalDeviceMemoryProperties mem{};
   VkBuffer dummy{VK_NULL_HANDLE};
   VkDeviceMemory dummy_mem{VK_NULL_HANDLE};
-  VkBuffer staging{VK_NULL_HANDLE};
-  VkDeviceMemory staging_mem{VK_NULL_HANDLE};
-  void* staging_ptr{nullptr};
-  VkDeviceSize staging_size{0};
+  static constexpr int kStagingSlots = 4;
+  VkBuffer staging[kStagingSlots]{};
+  VkDeviceMemory staging_mem[kStagingSlots]{};
+  void* staging_ptr[kStagingSlots]{};
+  VkDeviceSize staging_size[kStagingSlots]{};
+  int staging_used_{0};
 
  private:
   struct PooledBuf {
@@ -80,7 +82,8 @@ class VulkanDevice final : public Device {
 
   Result<void> make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
                            VkBuffer& buf, VkDeviceMemory& mem, void** mapped);
-  Result<void> ensure_staging(VkDeviceSize size);
+  Result<void> ensure_staging(int slot, VkDeviceSize size);
+  void destroy_staging(int slot) noexcept;
   Result<void> submit_and_wait();
   Result<void> begin_record();
   Result<void> flush();

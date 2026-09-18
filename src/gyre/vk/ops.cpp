@@ -5,12 +5,39 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 #include <vector>
 
 namespace gyre::vkops {
 namespace {
 
 vkrt::VulkanDevice* dev_of(const Tensor& t) { return vkrt::VulkanDevice::from(t.device().get()); }
+
+Result<void> on_device(vkrt::VulkanDevice* d, std::initializer_list<const Tensor*> ts) {
+  for (auto* t : ts) {
+    if (!t) continue;
+    if (t->device().get() != d) {
+      return std::unexpected(make_error(Errc::mixed_device, "mixed device"));
+    }
+    if (!t->storage() || !t->storage()->gpu) {
+      return std::unexpected(make_error(Errc::mixed_device, "mixed device"));
+    }
+  }
+  return {};
+}
+
+Result<void> check_i32_range(const Tensor& idx, std::int64_t hi, const char* what) {
+  auto bytes = idx.to_host_vec();
+  if (!bytes) return std::unexpected(bytes.error());
+  const auto n = idx.numel();
+  const auto* p = reinterpret_cast<const std::int32_t*>(bytes->data());
+  for (std::int64_t i = 0; i < n; ++i) {
+    if (p[i] < 0 || static_cast<std::int64_t>(p[i]) >= hi) {
+      return std::unexpected(make_error(Errc::invalid_shape, what));
+    }
+  }
+  return {};
+}
 
 std::uint32_t groups(std::int64_t n, std::uint32_t local = 256) {
   if (n <= 0) return 1;
@@ -163,7 +190,11 @@ Result<Tensor> transpose_last2(const Tensor& a) {
 Result<Tensor> embedding(const Tensor& weight, const Tensor& indices_i32) {
   auto* d = dev_of(weight);
   if (!d) return std::unexpected(make_error(Errc::unsupported, "vulkan device"));
+  if (auto ok = on_device(d, {&weight, &indices_i32}); !ok) return std::unexpected(ok.error());
   const auto V = weight.shape()[0], dim = weight.shape()[1];
+  if (auto ids = check_i32_range(indices_i32, V, "index OOB"); !ids) {
+    return std::unexpected(ids.error());
+  }
   std::vector<std::int64_t> osh(indices_i32.shape().begin(), indices_i32.shape().end());
   osh.push_back(dim);
   auto out = Tensor::empty(osh, DType::f32, weight.device());
@@ -289,6 +320,7 @@ Result<Tensor> softmax_last(const Tensor& a) {
 Result<Tensor> layer_norm(const Tensor& x, const Tensor& w, const Tensor& b, float eps) {
   auto* d = dev_of(x);
   if (!d) return std::unexpected(make_error(Errc::unsupported, "vulkan device"));
+  if (auto ok = on_device(d, {&x, &w, &b}); !ok) return std::unexpected(ok.error());
   auto out = Tensor::empty(x.shape(), DType::f32, x.device());
   if (!out) return out;
   const auto C = x.shape()[x.rank() - 1];
@@ -311,6 +343,7 @@ Result<Tensor> layer_norm(const Tensor& x, const Tensor& w, const Tensor& b, flo
 Result<Tensor> rms_norm(const Tensor& x, const Tensor& w, float eps) {
   auto* d = dev_of(x);
   if (!d) return std::unexpected(make_error(Errc::unsupported, "vulkan device"));
+  if (auto ok = on_device(d, {&x, &w}); !ok) return std::unexpected(ok.error());
   auto out = Tensor::empty(x.shape(), DType::f32, x.device());
   if (!out) return out;
   const auto C = x.shape()[x.rank() - 1];
@@ -545,6 +578,7 @@ Result<void> embedding_backward(Tensor& grad_W, const Tensor& idx, const Tensor&
 Result<void> bias_add_(Tensor& y, const Tensor& b) {
   auto* d = dev_of(y);
   if (!d) return std::unexpected(make_error(Errc::unsupported, "vulkan device"));
+  if (auto ok = on_device(d, {&y, &b}); !ok) return ok;
   auto out = Tensor::empty(y.shape(), DType::f32, y.device());
   if (!out) return std::unexpected(out.error());
   vkrt::Push pc;
@@ -564,7 +598,11 @@ Result<void> bias_add_(Tensor& y, const Tensor& b) {
 Result<LossPair> softmax_cross_entropy(const Tensor& logits, const Tensor& targets_i32) {
   auto* d = dev_of(logits);
   if (!d) return std::unexpected(make_error(Errc::unsupported, "vulkan device"));
+  if (auto ok = on_device(d, {&logits, &targets_i32}); !ok) return std::unexpected(ok.error());
   const auto B = logits.shape()[0], T = logits.shape()[1], V = logits.shape()[2];
+  if (auto ids = check_i32_range(targets_i32, V, "target OOB"); !ids) {
+    return std::unexpected(ids.error());
+  }
   auto dlog = Tensor::empty(logits.shape(), DType::f32, logits.device());
   if (!dlog) return std::unexpected(dlog.error());
   std::int64_t rsh[1] = {B * T};

@@ -99,20 +99,28 @@ Result<void> VulkanDevice::make_buffer(VkDeviceSize size, VkBufferUsageFlags usa
   return {};
 }
 
-Result<void> VulkanDevice::ensure_staging(VkDeviceSize size) {
-  if (staging && staging_size >= size) return {};
-  if (staging_ptr && staging_mem) vkUnmapMemory(device, staging_mem);
-  if (staging) vkDestroyBuffer(device, staging, nullptr);
-  if (staging_mem) vkFreeMemory(device, staging_mem, nullptr);
-  staging = VK_NULL_HANDLE;
-  staging_mem = VK_NULL_HANDLE;
-  staging_ptr = nullptr;
-  staging_size = 0;
+void VulkanDevice::destroy_staging(int slot) noexcept {
+  if (slot < 0 || slot >= kStagingSlots || !device) return;
+  if (staging_ptr[slot] && staging_mem[slot]) vkUnmapMemory(device, staging_mem[slot]);
+  if (staging[slot]) vkDestroyBuffer(device, staging[slot], nullptr);
+  if (staging_mem[slot]) vkFreeMemory(device, staging_mem[slot], nullptr);
+  staging[slot] = VK_NULL_HANDLE;
+  staging_mem[slot] = VK_NULL_HANDLE;
+  staging_ptr[slot] = nullptr;
+  staging_size[slot] = 0;
+}
+
+Result<void> VulkanDevice::ensure_staging(int slot, VkDeviceSize size) {
+  if (slot < 0 || slot >= kStagingSlots) {
+    return std::unexpected(make_error(Errc::unsupported, "staging slot"));
+  }
+  if (staging[slot] && staging_size[slot] >= size) return {};
+  destroy_staging(slot);
   auto r = make_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                       staging, staging_mem, &staging_ptr);
+                       staging[slot], staging_mem[slot], &staging_ptr[slot]);
   if (!r) return r;
-  staging_size = std::max<VkDeviceSize>(size, 16);
+  staging_size[slot] = std::max<VkDeviceSize>(size, 16);
   return {};
 }
 
@@ -145,6 +153,7 @@ Result<void> VulkanDevice::flush() {
   VkResult r = vkEndCommandBuffer(cmd);
   recording_ = false;
   desc_index_ = 0;
+  staging_used_ = 0;
   if (r != VK_SUCCESS) return std::unexpected(vkerr(r, "vkEndCommandBuffer"));
   auto s = submit_and_wait();
   {
@@ -242,9 +251,7 @@ VulkanDevice::~VulkanDevice() {
     if (cmd && pool) vkFreeCommandBuffers(device, pool, 1, &cmd);
     if (pool) vkDestroyCommandPool(device, pool, nullptr);
     if (fence) vkDestroyFence(device, fence, nullptr);
-    if (staging_ptr && staging_mem) vkUnmapMemory(device, staging_mem);
-    if (staging) vkDestroyBuffer(device, staging, nullptr);
-    if (staging_mem) vkFreeMemory(device, staging_mem, nullptr);
+    for (int i = 0; i < kStagingSlots; ++i) destroy_staging(i);
     if (dummy) vkDestroyBuffer(device, dummy, nullptr);
     if (dummy_mem) vkFreeMemory(device, dummy_mem, nullptr);
     vkDestroyDevice(device, nullptr);
@@ -332,7 +339,7 @@ Result<void> VulkanDevice::init() {
                           dummy, dummy_mem, nullptr);
     if (!dummy_r) return dummy_r;
   }
-  auto stg = ensure_staging(1 << 20);
+  auto stg = ensure_staging(0, 1 << 20);
   if (!stg) return stg;
 
   VkDescriptorSetLayoutBinding binds[7]{};
@@ -450,20 +457,23 @@ Result<void> VulkanDevice::upload(Storage& st, std::size_t offset, std::span<con
   if (src.empty()) return {};
   auto* g = gpu(st);
   if (!g) return std::unexpected(make_error(Errc::unsupported, "not a Vulkan buffer"));
-  auto fl = flush();
-  if (!fl) return fl;
-  auto er = ensure_staging(src.size());
+  if (staging_used_ >= kStagingSlots) {
+    auto fl = flush();
+    if (!fl) return fl;
+  }
+  auto rec = begin_record();
+  if (!rec) return rec;
+  const int slot = staging_used_++;
+  auto er = ensure_staging(slot, src.size());
   if (!er) return er;
-  std::memcpy(staging_ptr, src.data(), src.size());
-  auto b = begin_record();
-  if (!b) return b;
+  std::memcpy(staging_ptr[slot], src.data(), src.size());
   VkBufferCopy cp{};
   cp.srcOffset = 0;
   cp.dstOffset = offset;
   cp.size = src.size();
-  vkCmdCopyBuffer(cmd, staging, g->buffer, 1, &cp);
+  vkCmdCopyBuffer(cmd, staging[slot], g->buffer, 1, &cp);
   memory_barrier(cmd);
-  return flush();
+  return {};
 }
 
 Result<void> VulkanDevice::download(const Storage& st, std::size_t offset, std::span<std::byte> dst) {
@@ -472,7 +482,7 @@ Result<void> VulkanDevice::download(const Storage& st, std::size_t offset, std::
   if (!g) return std::unexpected(make_error(Errc::unsupported, "not a Vulkan buffer"));
   auto fl = flush();
   if (!fl) return fl;
-  auto er = ensure_staging(dst.size());
+  auto er = ensure_staging(0, dst.size());
   if (!er) return er;
   auto b = begin_record();
   if (!b) return b;
@@ -480,10 +490,10 @@ Result<void> VulkanDevice::download(const Storage& st, std::size_t offset, std::
   cp.srcOffset = offset;
   cp.dstOffset = 0;
   cp.size = dst.size();
-  vkCmdCopyBuffer(cmd, g->buffer, staging, 1, &cp);
+  vkCmdCopyBuffer(cmd, g->buffer, staging[0], 1, &cp);
   auto s = flush();
   if (!s) return s;
-  std::memcpy(dst.data(), staging_ptr, dst.size());
+  std::memcpy(dst.data(), staging_ptr[0], dst.size());
   return {};
 }
 

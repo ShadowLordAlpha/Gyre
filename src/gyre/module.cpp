@@ -37,6 +37,9 @@ Result<LossPair> softmax_cross_entropy(const Tensor& logits, const Tensor& targe
   }
 #if defined(GYRE_VULKAN)
   if (logits.device() && logits.device()->kind() == DeviceKind::vulkan) {
+    if (!targets_i32.device() || targets_i32.device().get() != logits.device().get()) {
+      return std::unexpected(make_error(Errc::mixed_device, "mixed device"));
+    }
     return vkops::softmax_cross_entropy(logits, targets_i32);
   }
 #endif

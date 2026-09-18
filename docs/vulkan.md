@@ -43,7 +43,14 @@ Device::open("cpu"|"vulkan")  // CLI helper; "gpu" aliases vulkan
 
 Weights, activations, Adam moments, and CharLM forward/backward (GEMM, LN, softmax, GELU, attention mask, embeddings, CE). Token windows are sampled on CPU and uploaded each step. Loss scalar and generate sampling download to host.
 
-Storage is **device-local** `VkBuffer` plus a host-visible staging buffer. Shaders live in `src/gyre/vk/shaders/*.comp` and compile to SPIR-V at build time (`raw vulkan.h`, no volk/VMA).
+Storage is **device-local** `VkBuffer` plus a 4-slot host-visible staging ring.
+Uploads record a copy into the current compute command buffer (flush only when
+all slots are in use, on download, or when the descriptor ring fills). Shaders
+live in `src/gyre/vk/shaders/*.comp` and compile to SPIR-V at build time (`raw
+vulkan.h`, no volk/VMA). GELU matches CPU: clamp `x` to ±40. `tanh`’s argument
+is clamped to ±20 on GPU only so `exp` does not overflow to NaN (`std::tanh`
+saturates). Mixed-device LN/CE/bias operands error (`mixed_device`); OOB
+embedding/CE ids error (`index OOB` / `target OOB`) like CPU.
 
 Grok RoPE / MoE / GQA kernels are not implemented on Vulkan. OpenCL and CUDA are not in tree.
 
