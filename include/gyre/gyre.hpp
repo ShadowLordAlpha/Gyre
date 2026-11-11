@@ -14,6 +14,7 @@
 #include "gyre/log.hpp"
 #include "gyre/module.hpp"
 #include "gyre/nn/attention.hpp"
+#include "gyre/nn/gpt2_import.hpp"
 #include "gyre/nn/gqa.hpp"
 #include "gyre/nn/grok.hpp"
 #include "gyre/nn/layers.hpp"

@@ -43,131 +43,86 @@ class MetaspacePretok final : public Pretokenizer {
   bool dummy_{true};
 };
 
-// GPT-2 bytes-to-unicode (same table as OpenAI).
-void gpt2_byte_encoder(std::uint32_t enc[256]) {
-  int n = 0;
-  for (int b = 0; b < 256; ++b) enc[b] = 0;
-  for (int b = '!'; b <= '~'; ++b) enc[b] = static_cast<std::uint32_t>(b);
-  for (int b = 0xA1; b <= 0xAC; ++b) enc[b] = static_cast<std::uint32_t>(b);
-  for (int b = 0xAE; b <= 0xFF; ++b) enc[b] = static_cast<std::uint32_t>(b);
-  for (int b = 0; b < 256; ++b) {
-    if (enc[b] == 0 && b != 0) {
-      // unassigned get 256+n
-    }
-  }
-  n = 0;
-  for (int b = 0; b < 256; ++b) {
-    bool mapped = (b >= '!' && b <= '~') || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF);
-    if (!mapped) {
-      enc[b] = static_cast<std::uint32_t>(256 + n);
-      ++n;
-    } else {
-      enc[b] = static_cast<std::uint32_t>(b);
-    }
-  }
-}
-
-void append_utf8(std::string& s, std::uint32_t cp) {
-  if (cp < 0x80) {
-    s.push_back(static_cast<char>(cp));
-  } else if (cp < 0x800) {
-    s.push_back(static_cast<char>(0xC0 | (cp >> 6)));
-    s.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-  } else {
-    s.push_back(static_cast<char>(0xE0 | (cp >> 12)));
-    s.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-    s.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-  }
-}
-
-bool is_letter(unsigned char c) {
-  return std::isalpha(c) != 0;
-}
-bool is_digit(unsigned char c) { return std::isdigit(c) != 0; }
-
+// GPT-2 byte-level pre-tokenizer. Splits the RAW text with the published pattern
+//   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+// (Unicode-aware via the generated category tables) and returns spans of the original bytes. The
+// byte -> unicode alphabet of Hugging Face files is only applied when reading/writing those files
+// (see bytelevel.hpp); inside Gyre pieces are raw bytes.
 class Gpt2Pretok final : public Pretokenizer {
  public:
-  Gpt2Pretok() { gpt2_byte_encoder(enc_); }
   const char* name() const noexcept override { return "bytelevel"; }
-  Result<void> split(std::string_view text, std::string& scratch,
-                     std::vector<std::string_view>& spans) const override {
-    scratch.clear();
-    for (unsigned char c : text) append_utf8(scratch, enc_[c]);
+  Result<void> split(std::string_view text, std::string&, std::vector<std::string_view>& spans) const override {
     spans.clear();
-    const std::size_t n = scratch.size();
+    const std::size_t n = text.size();
     std::size_t i = 0;
-    auto peek = [&](std::size_t k) -> unsigned char {
-      return k < n ? static_cast<unsigned char>(scratch[k]) : 0;
+    std::uint32_t cp = 0;
+    std::size_t nb = 0;
+    auto emit = [&](std::size_t from, std::size_t to) { spans.emplace_back(text.data() + from, to - from); };
+    auto is_other = [](std::uint32_t c) {
+      return !unicode::is_space(c) && !unicode::is_letter(c) && !unicode::is_number(c);
     };
     while (i < n) {
-      std::size_t start = i;
-      unsigned char c = peek(i);
-      // 's | 't | 're | 've | 'm | 'll | 'd
-      if (c == '\'' && i + 1 < n) {
-        unsigned char n1 = peek(i + 1);
-        if (n1 == 's' || n1 == 't' || n1 == 'm' || n1 == 'd') {
+      // 's 't 'm 'd 're 've 'll
+      if (text[i] == '\'' && i + 1 < n) {
+        const char c1 = text[i + 1];
+        if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') {
+          emit(i, i + 2);
           i += 2;
-        } else if ((n1 == 'r' || n1 == 'v') && i + 2 < n && peek(i + 2) == 'e') {
-          i += 3;
-        } else if (n1 == 'l' && i + 2 < n && peek(i + 2) == 'l') {
-          i += 3;
-        } else {
-          goto rest;
+          continue;
         }
-        spans.emplace_back(scratch.data() + start, i - start);
-        continue;
-      }
-    rest:
-      // optional space + letters
-      if (c == ' ' && i + 1 < n && is_letter(peek(i + 1))) {
-        ++i;
-        while (i < n && is_letter(peek(i))) ++i;
-        spans.emplace_back(scratch.data() + start, i - start);
-        continue;
-      }
-      if (is_letter(c)) {
-        while (i < n && is_letter(peek(i))) ++i;
-        spans.emplace_back(scratch.data() + start, i - start);
-        continue;
-      }
-      if (c == ' ' && i + 1 < n && is_digit(peek(i + 1))) {
-        ++i;
-        while (i < n && is_digit(peek(i))) ++i;
-        spans.emplace_back(scratch.data() + start, i - start);
-        continue;
-      }
-      if (is_digit(c)) {
-        while (i < n && is_digit(peek(i))) ++i;
-        spans.emplace_back(scratch.data() + start, i - start);
-        continue;
-      }
-      // optional space + non-letter-digit
-      if (c == ' ') {
-        ++i;
-        if (i < n && !std::isspace(peek(i)) && !is_letter(peek(i)) && !is_digit(peek(i))) {
-          while (i < n && !std::isspace(peek(i)) && !is_letter(peek(i)) && !is_digit(peek(i))) ++i;
-        } else {
-          while (i < n && std::isspace(peek(i))) ++i;
+        if (i + 2 < n) {
+          const char c2 = text[i + 2];
+          if (((c1 == 'r' || c1 == 'v') && c2 == 'e') || (c1 == 'l' && c2 == 'l')) {
+            emit(i, i + 3);
+            i += 3;
+            continue;
+          }
         }
-        spans.emplace_back(scratch.data() + start, i - start);
-        continue;
       }
-      if (std::isspace(c)) {
-        while (i < n && std::isspace(peek(i))) ++i;
-        spans.emplace_back(scratch.data() + start, i - start);
-        continue;
+      // optional single space, then a run of letters / numbers / other
+      std::size_t q = i;
+      if (text[q] == ' ') ++q;
+      if (q < n) {
+        unicode::next_codepoint(text, q, cp, nb);
+        int kind = unicode::is_letter(cp) ? 1 : unicode::is_number(cp) ? 2 : is_other(cp) ? 3 : 0;
+        if (kind != 0) {
+          std::size_t k = q;
+          while (k < n) {
+            unicode::next_codepoint(text, k, cp, nb);
+            const int kk = unicode::is_letter(cp) ? 1 : unicode::is_number(cp) ? 2 : is_other(cp) ? 3 : 0;
+            if (kk != kind) break;
+            k += nb;
+          }
+          emit(i, k);
+          i = k;
+          continue;
+        }
       }
-      while (i < n && !std::isspace(peek(i)) && !is_letter(peek(i)) && !is_digit(peek(i)) &&
-             peek(i) != '\'')
+      // whitespace: \s+(?!\S) leaves the last space for the next token; \s+ takes a lone one
+      std::size_t k = i, last = i;
+      int count = 0;
+      while (k < n) {
+        unicode::next_codepoint(text, k, cp, nb);
+        if (!unicode::is_space(cp)) break;
+        last = k;
+        k += nb;
+        ++count;
+      }
+      if (count == 0) {  // defensive: never loop forever on malformed input
+        emit(i, i + 1);
         ++i;
-      if (i == start) ++i;
-      spans.emplace_back(scratch.data() + start, i - start);
+        continue;
+      }
+      if (k >= n || count < 2) {
+        emit(i, k);
+        i = k;
+      } else {
+        emit(i, last);
+        i = last;
+      }
     }
     return {};
   }
-
- private:
-  std::uint32_t enc_[256]{};
 };
 
 }  // namespace

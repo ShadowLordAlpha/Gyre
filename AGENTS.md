@@ -91,3 +91,9 @@ Build: `vcvars64` then `cmake --build` the Ninja dir (`cmake-build-gyre` or `cma
 - `gyre-infer` must stay dependency-free (no gyre/OpenMP/Vulkan/JSON; `tests/infer_standalone.cpp` links only it) and must not require AVX2. Weight order = `PolicyNet::parameters()`; if the architecture changes, update the flat exporter, the loader's expected-count formula and the parity tests together.
 - Build tests: `cmake --build cmake-build-release --target gyre-tests gyre-infer-standalone` (after `vcvars64`).
 - Kernels: large CPU buffers come from a recycling pool (`Storage`); `Tensor::empty` is zero-filled, `Tensor::uninit` is not, so use `uninit` only for outputs you overwrite completely. Cross-thread reductions use fixed-size blocks so results do not depend on the thread count. `gyre-bench-ops` / `gyre-bench-rl` time the hot ops and a 128-entity training step.
+
+## Hugging Face GPT-2
+
+- `gyre-cli lm import-gpt2 --hf-dir data/gpt2 --ckpt data/gpt2/gpt2.gyre` converts `openai-community/gpt2` into a CharLM (`recency none`, tied head copied). Files live in git-ignored `data/gpt2/` like `data/grok2/`. Write-up and zero-shot Shakespeare score: `docs/gpt2.md`.
+- The `bytelevel` pretokenizer works on RAW text (real GPT-2 pattern); pieces are raw bytes; the GPT-2 byte→unicode alphabet is only for reading/writing Hugging Face files (`src/gyre/nn/bytelevel.hpp`). Don't map before splitting.
+- BPE encode is rank-based (lowest-rank pair first); keep it equal to sequential merges (`tests/bytelevel_test.cpp`). No KV cache yet, so generation from big models is very slow; scoring is fine.

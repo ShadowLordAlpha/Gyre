@@ -52,3 +52,6 @@ Desktop.ini
 
 # Local experiment outputs
 /data/shk-run/
+
+# Hub downloads + converted checkpoints (large)
+/data/gpt2/

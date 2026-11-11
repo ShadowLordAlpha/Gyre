@@ -7,6 +7,7 @@
 | [design.md](design.md) | Architecture, GYRE1 layout, historical PR plan |
 | [gyre-file.md](gyre-file.md) | `.gyre` / `.gyre.json` model document |
 | [tokenizer.md](tokenizer.md) | BPE / chars / bytes / unigram, `*.gyre.json` |
+| [gpt2.md](gpt2.md) | Run Hugging Face GPT-2 as a CharLM checkpoint; pretrained baseline results |
 | [grok.md](grok.md) | Grok-2-shaped nets, inspect, tiny generate |
 | [grok-compress.md](grok-compress.md) | Weight packing probe (not Helix-critical) |
 | [vulkan.md](vulkan.md) | Optional Vulkan CharLM train/eval/generate |

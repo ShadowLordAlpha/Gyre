@@ -7,6 +7,7 @@
 #include "gyre/io/compress_probe.hpp"
 #include "gyre/io/safetensors.hpp"
 #include "gyre/io/wpack.hpp"
+#include "gyre/nn/gpt2_import.hpp"
 #include "gyre/nn/tokenize.hpp"
 #include "gyre/train/connectome.hpp"
 
@@ -152,6 +153,29 @@ static Result<void> save_charlm_ckpt(CharLM& model, const GyreDoc& doc, std::uin
                            nbytes <= kGyreJsonDataLimit);
   if (js && log) log("saved " + json_path.string());
   return {};
+}
+
+Result<void> run_gpt2_import(const std::filesystem::path& hf_dir, const std::filesystem::path& out, LogFn log) {
+  auto dev = Device::cpu();
+  if (!dev) return std::unexpected(dev.error());
+  if (log) log("loading GPT-2 from " + hf_dir.string() + " …");
+  auto model = import_gpt2(hf_dir, *dev);
+  if (!model) return std::unexpected(model.error());
+  auto tok = Tokenizer::load_huggingface(hf_dir);
+  if (!tok) return std::unexpected(tok.error());
+  if (static_cast<std::int64_t>((*tok)->vocab_size()) != model->vocab()) {
+    return std::unexpected(make_error(Errc::invalid_shape, "tokenizer vocab " + std::to_string((*tok)->vocab_size()) +
+                                                               " != model vocab " + std::to_string(model->vocab())));
+  }
+  std::uint64_t n = 0;
+  for (auto& p : model->parameters()) n += static_cast<std::uint64_t>(p.value.numel());
+  CharLMOpts o;
+  o.preset = "gpt2";
+  o.holdout = 0.1;  // default val slice for `lm eval`
+  o.dropout = 0.f;
+  auto doc = make_charlm_doc(o, model->config(), **tok, 0, n, 0);
+  if (log) log("converted " + std::to_string(n) + " parameters");
+  return save_charlm_ckpt(*model, doc, 0, nullptr, out, log);
 }
 
 static CharLMConfig charlm_cfg_from_doc(const GyreDoc& d, const CharLMOpts& opts, std::int64_t vocab) {

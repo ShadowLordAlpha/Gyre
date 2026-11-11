@@ -1,5 +1,6 @@
 #include "gyre/nn/bpe.hpp"
 
+#include "bytelevel.hpp"
 #include "json_parse.hpp"
 
 #include <cstdlib>
@@ -51,6 +52,12 @@ void rebuild_pieces_from_merges(PieceTable& t, const std::vector<std::pair<std::
 
 BpeModel::BpeModel(std::vector<std::pair<std::int32_t, std::int32_t>> merges) : merges_(std::move(merges)) {
   vocab_size_ = 256 + static_cast<std::int64_t>(merges_.size());
+  rank_.reserve(merges_.size() * 2);
+  for (std::size_t i = 0; i < merges_.size(); ++i) {
+    const auto key = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(merges_[i].first)) << 32) |
+                     static_cast<std::uint32_t>(merges_[i].second);
+    rank_.emplace(key, static_cast<std::int32_t>(i));  // first occurrence wins
+  }
 }
 
 std::int64_t BpeModel::vocab_size() const noexcept { return vocab_size_; }
@@ -77,9 +84,19 @@ Result<void> BpeModel::encode_span(std::string_view span, const PieceTable& piec
     // restricted alphabet: new merge ids start at alphabet size
     nid = static_cast<std::int32_t>(pieces.byte_to_id.size());
   }
-  for (auto [a, b] : merges_) {
-    apply_merge(seq, a, b, nid);
-    ++nid;
+  // Lowest-rank pair first: same result as applying every merge in order, but only merges that
+  // actually occur in this span are visited.
+  while (seq.size() > 1 && !rank_.empty()) {
+    std::int32_t best = -1;
+    for (std::size_t i = 0; i + 1 < seq.size(); ++i) {
+      const auto key = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(seq[i])) << 32) |
+                       static_cast<std::uint32_t>(seq[i + 1]);
+      auto it = rank_.find(key);
+      if (it != rank_.end() && (best < 0 || it->second < best)) best = it->second;
+    }
+    if (best < 0) break;
+    const auto [a, b] = merges_[static_cast<std::size_t>(best)];
+    apply_merge(seq, a, b, nid + best);
   }
   out.insert(out.end(), seq.begin(), seq.end());
   return {};
@@ -101,8 +118,11 @@ Result<void> BpeModel::write_huggingface(const std::filesystem::path& dir, const
   auto tok_path = dir / "tokenizer.json";
   std::ofstream v(vocab_path, std::ios::binary);
   if (!v) return std::unexpected(make_error(Errc::io, "vocab.json"));
+  // Byte-level tokenizers are written in the GPT-2 alphabet so other tools (and load_huggingface) read them.
+  const bool byte_level = std::string(pretok.name()) == "bytelevel";
+  auto key_text = [&](const std::string& raw) { return byte_level ? bytelevel::to_mapped(raw) : bytes_to_json_text(raw); };
   nlohmann::json vocab = nlohmann::json::object();
-  for (std::size_t i = 0; i < pieces.pieces.size(); ++i) vocab[bytes_to_json_text(pieces.pieces[i])] = i;
+  for (std::size_t i = 0; i < pieces.pieces.size(); ++i) vocab[key_text(pieces.pieces[i])] = i;
   v << vocab.dump();
   std::ofstream m(merges_path, std::ios::binary);
   if (!m) return std::unexpected(make_error(Errc::io, "merges.txt"));
@@ -111,8 +131,12 @@ Result<void> BpeModel::write_huggingface(const std::filesystem::path& dir, const
     if (a < 0 || b < 0 || static_cast<std::size_t>(a) >= pieces.pieces.size() ||
         static_cast<std::size_t>(b) >= pieces.pieces.size())
       continue;
-    m << pieces.pieces[static_cast<std::size_t>(a)] << ' '
-      << pieces.pieces[static_cast<std::size_t>(b)] << '\n';
+    m << (byte_level ? bytelevel::to_mapped(pieces.pieces[static_cast<std::size_t>(a)])
+                     : pieces.pieces[static_cast<std::size_t>(a)])
+      << ' '
+      << (byte_level ? bytelevel::to_mapped(pieces.pieces[static_cast<std::size_t>(b)])
+                     : pieces.pieces[static_cast<std::size_t>(b)])
+      << '\n';
   }
   std::ofstream t(tok_path, std::ios::binary);
   if (!t) return std::unexpected(make_error(Errc::io, "tokenizer.json"));
@@ -130,8 +154,11 @@ Result<void> BpeModel::write_huggingface(const std::filesystem::path& dir, const
   model["vocab"] = vocab;
   model["merges"] = nlohmann::json::array();
   for (auto [a, b] : merges_) {
-    model["merges"].push_back(bytes_to_json_text(pieces.pieces[static_cast<std::size_t>(a)] + " " +
-                                                pieces.pieces[static_cast<std::size_t>(b)]));
+    model["merges"].push_back(byte_level
+                                  ? bytelevel::to_mapped(pieces.pieces[static_cast<std::size_t>(a)]) + " " +
+                                        bytelevel::to_mapped(pieces.pieces[static_cast<std::size_t>(b)])
+                                  : bytes_to_json_text(pieces.pieces[static_cast<std::size_t>(a)] + " " +
+                                                       pieces.pieces[static_cast<std::size_t>(b)]));
   }
   tok["model"] = std::move(model);
   t << tok.dump();

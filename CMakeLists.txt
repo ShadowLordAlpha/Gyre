@@ -32,6 +32,7 @@ add_library(gyre STATIC
   src/gyre/nn/sp_model.cpp
   src/gyre/nn/attention.cpp
   src/gyre/nn/transformer.cpp
+  src/gyre/nn/gpt2_import.cpp
   src/gyre/nn/gqa.cpp
   src/gyre/nn/moe.cpp
   src/gyre/nn/grok.cpp
@@ -240,6 +241,8 @@ if(GYRE_BUILD_TESTS)
     tests/infer_test.cpp
     tests/review_fixes_test.cpp
     tests/kernels_test.cpp
+    tests/gpt2_import_test.cpp
+    tests/bytelevel_test.cpp
     tests/vulkan_ops_test.cpp
   )
   target_link_libraries(gyre-tests PRIVATE gyre gyre-infer GTest::gtest_main)

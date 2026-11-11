@@ -28,6 +28,15 @@ class TiktokenModel final : public VocabModel {
   std::int64_t vocab_size_{0};
 };
 
+// Unicode classification shared by the regex-style pretokenizers.
+namespace unicode {
+bool is_letter(std::uint32_t cp);  // \p{L}
+bool is_number(std::uint32_t cp);  // \p{N}
+bool is_space(std::uint32_t cp);   // \s
+// Decodes the code point at s[i] (invalid bytes decode as themselves, 1 byte). False at the end.
+bool next_codepoint(std::string_view s, std::size_t i, std::uint32_t& cp, std::size_t& nbytes);
+}  // namespace unicode
+
 std::unique_ptr<Pretokenizer> make_tiktoken_v1_pretok(std::vector<std::string> specials);
 
 bool is_tiktoken_tok_json(std::string_view json);

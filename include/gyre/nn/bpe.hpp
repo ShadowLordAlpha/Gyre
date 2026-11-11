@@ -5,8 +5,8 @@
 namespace gyre {
 
 // Byte-pair merges. Empty merges + bytes_table() = 0..255; empty merges +
-// chars_table() = observed alphabet. Gyre encode applies merges in train order
-// on each pretok span (identity pretok = whole buffer).
+// chars_table() = observed alphabet. Encode repeatedly applies the lowest-rank merge present in a
+// pretok span (identity pretok = whole buffer), which equals applying all merges in train order.
 
 class BpeModel final : public VocabModel {
  public:
@@ -37,6 +37,7 @@ class BpeModel final : public VocabModel {
 
  private:
   std::vector<std::pair<std::int32_t, std::int32_t>> merges_;
+  std::unordered_map<std::uint64_t, std::int32_t> rank_;  // (a,b) -> index of the first merge with that pair
   std::int64_t vocab_size_{256};
 };
 

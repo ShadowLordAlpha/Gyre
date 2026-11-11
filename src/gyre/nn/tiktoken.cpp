@@ -256,6 +256,15 @@ class TiktokenV1Pretok final : public Pretokenizer {
 
 }  // namespace
 
+namespace unicode {
+bool is_letter(std::uint32_t cp) { return is_L(cp); }
+bool is_number(std::uint32_t cp) { return is_N(cp); }
+bool is_space(std::uint32_t cp) { return is_S(cp); }
+bool next_codepoint(std::string_view s, std::size_t i, std::uint32_t& cp, std::size_t& nbytes) {
+  return next_cp(s, i, cp, nbytes);
+}
+}  // namespace unicode
+
 std::unique_ptr<Pretokenizer> make_tiktoken_v1_pretok(std::vector<std::string> specials) {
   return std::make_unique<TiktokenV1Pretok>(std::move(specials));
 }

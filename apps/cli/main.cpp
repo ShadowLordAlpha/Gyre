@@ -22,6 +22,7 @@ static void usage() {
       "                      [--device cpu|vulkan]\n"
       "  gyre-cli lm export --ckpt data/charlm.gyre --onnx data/charlm.onnx [--preset medium]\n"
       "                    [--data data/shakespeare.txt]\n"
+      "  gyre-cli lm import-gpt2 --hf-dir data/gpt2 --ckpt data/gpt2.gyre\n"
       "  gyre-cli lm eval --ckpt data/charlm.gyre --data data/shakespeare.txt [--preset tinygpt]\n"
       "                  [--split 0.1] [--device cpu|vulkan]\n"
       "  gyre-cli tok train --data data/shakespeare.txt [--tokenizer bpe|chars|bytes|unigram]\n"
@@ -369,6 +370,14 @@ int main(int argc, char** argv) {
     }
     if (sub == "export") {
       auto r = run_charlm_export_onnx(o, onnx_path, log);
+      if (!r) {
+        std::cerr << r.error().message << '\n';
+        return 1;
+      }
+      return 0;
+    }
+    if (sub == "import-gpt2") {
+      auto r = run_gpt2_import(o.hf_dir, o.ckpt, log);
       if (!r) {
         std::cerr << r.error().message << '\n';
         return 1;

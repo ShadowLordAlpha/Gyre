@@ -101,9 +101,9 @@ Grok-2 goldens: `"hello world"` → `21517 1749`; chat prefix with `<|separator|
 **Import** (`load_huggingface` / `tok import --hf-dir`):
 
 - `tokenizer.json` BPE / Unigram
-- GPT-2 layout `vocab.json` + `merges.txt` → `bytelevel` + `bpe`
+- GPT-2 layout `vocab.json` + `merges.txt`, or `tokenizer.json` with a `ByteLevel` pre-tokenizer → `bytelevel` + `bpe`. Vocab/merges are decoded from GPT-2's byte→unicode alphabet into raw-byte pieces; token ids must be `256 + merge rank` (GPT-2 layout) or import fails. Verified against the real `openai-community/gpt2` files (`docs/gpt2.md`).
 
-GPT-2 regex without ICU is ASCII/Latin-1 best-effort. English fixtures match; full Unicode `\p{L}` does not.
+The `bytelevel` pre-tokenizer splits raw text with the GPT-2 pattern using the generated Unicode category tables (`\p{L}`, `\p{N}`, `\s`); `save_huggingface` writes byte-level tokenizers back in the GPT-2 alphabet.
 
 ## SentencePiece
 

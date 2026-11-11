@@ -1,3 +1,4 @@
+#include "bytelevel.hpp"
 #include "gyre/nn/tokenize.hpp"
 #include "gyre/nn/bpe.hpp"
 #include "gyre/nn/tiktoken.hpp"
@@ -142,6 +143,51 @@ static PieceTable table_from_vocab_object(const nlohmann::json& obj) {
   return t;
 }
 
+// Hugging Face byte-level BPE (GPT-2, and files laid out the same way): vocab keys and merges are in the
+// GPT-2 byte->unicode alphabet. Gyre pieces are raw bytes, so decode them here. GPT-2 numbers a merge's
+// result 256 + its rank; that is what BpeModel assumes, so anything else is rejected instead of
+// silently mis-tokenizing.
+static Result<std::unique_ptr<Tokenizer>> bytelevel_bpe_tokenizer(
+    const nlohmann::json& vocab, const std::vector<std::pair<std::string, std::string>>& merge_text) {
+  if (!vocab.is_object() || vocab.empty())
+    return std::unexpected(make_error(Errc::invalid_shape, "byte-level BPE: vocab must be an object"));
+  std::int32_t maxid = -1;
+  for (auto& [k, v] : vocab.items()) maxid = std::max(maxid, v.get<std::int32_t>());
+  PieceTable t;
+  t.identity256 = false;
+  t.pieces.assign(static_cast<std::size_t>(maxid + 1), {});
+  std::unordered_map<std::string, std::int32_t> inv;
+  for (auto& [k, v] : vocab.items()) {
+    const auto id = v.get<std::int32_t>();
+    if (id < 0) continue;
+    std::string raw;
+    if (!bytelevel::from_mapped(k, raw)) raw = k;  // special tokens such as <|endoftext|>
+    t.pieces[static_cast<std::size_t>(id)] = raw;
+    inv.emplace(raw, id);
+  }
+  for (std::int32_t i = 0; i < static_cast<std::int32_t>(t.pieces.size()); ++i)
+    if (t.pieces[static_cast<std::size_t>(i)].size() == 1)
+      t.byte_to_id[static_cast<std::uint8_t>(t.pieces[static_cast<std::size_t>(i)][0])] = i;
+  if (t.byte_to_id.size() != 256)
+    return std::unexpected(make_error(Errc::unsupported, "byte-level BPE: vocab lacks the 256 single-byte tokens"));
+  std::vector<std::pair<std::int32_t, std::int32_t>> merges;
+  for (auto& [sa, sb] : merge_text) {
+    std::string a, b;
+    if (!bytelevel::from_mapped(sa, a) || !bytelevel::from_mapped(sb, b)) continue;
+    auto ia = inv.find(a);
+    auto ib = inv.find(b);
+    if (ia == inv.end() || ib == inv.end()) continue;
+    const auto result_id = static_cast<std::size_t>(256 + merges.size());
+    if (result_id >= t.pieces.size() || t.pieces[result_id] != a + b)
+      return std::unexpected(make_error(Errc::unsupported,
+                                        "byte-level BPE: token ids are not 256 + merge rank (unsupported layout)"));
+    merges.emplace_back(ia->second, ib->second);
+  }
+  auto bm = BpeModel::from_merges(std::move(merges), t.size());
+  if (!bm) return std::unexpected(bm.error());
+  return std::make_unique<Tokenizer>(make_gpt2_pretok(), std::move(*bm), std::move(t));
+}
+
 static Result<PieceTable> pieces_from_obj(const nlohmann::json& obj,
                                           const std::vector<std::pair<std::int32_t, std::int32_t>>& merges) {
   if (obj.contains("vocab") && obj["vocab"].is_array()) return table_from_vocab_array(obj["vocab"]);
@@ -265,6 +311,21 @@ Result<std::unique_ptr<Tokenizer>> Tokenizer::load_huggingface(const std::filesy
       if (!um) return std::unexpected(um.error());
       return std::make_unique<Tokenizer>(std::move(pt), std::move(*um), std::move(table));
     }
+    if (ptype == "ByteLevel" && model.contains("vocab") && model["vocab"].is_object()) {
+      std::vector<std::pair<std::string, std::string>> mt;
+      if (model.contains("merges") && model["merges"].is_array()) {
+        for (auto& m : model["merges"]) {
+          if (m.is_string()) {
+            auto s2 = m.get<std::string>();
+            auto sp = s2.find(' ');
+            if (sp != std::string::npos) mt.emplace_back(s2.substr(0, sp), s2.substr(sp + 1));
+          } else if (m.is_array() && m.size() == 2 && m[0].is_string() && m[1].is_string()) {
+            mt.emplace_back(m[0].get<std::string>(), m[1].get<std::string>());
+          }
+        }
+      }
+      return bytelevel_bpe_tokenizer(model["vocab"], mt);
+    }
     auto merges = BpeModel::parse_merges(model.dump());
     if (!merges) return std::unexpected(merges.error());
     PieceTable table;
@@ -299,25 +360,19 @@ Result<std::unique_ptr<Tokenizer>> Tokenizer::load_huggingface(const std::filesy
   if (vs.empty()) return std::unexpected(make_error(Errc::io, "vocab.json"));
   auto vj = parse_json(vs);
   if (!vj) return std::unexpected(vj.error());
-  auto table = table_from_vocab_object(*vj);
-  std::unordered_map<std::string, std::int32_t> inv;
-  for (std::int32_t i = 0; i < static_cast<std::int32_t>(table.pieces.size()); ++i)
-    inv[table.pieces[static_cast<std::size_t>(i)]] = i;
-  std::vector<std::pair<std::int32_t, std::int32_t>> merges;
+  // GPT-2 layout (vocab.json + merges.txt, GPT-2 byte->unicode alphabet)
   auto ms = read_all(mergesp);
   std::istringstream iss(ms);
   std::string line;
+  std::vector<std::pair<std::string, std::string>> mt;
   while (std::getline(iss, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
     if (line.empty() || line[0] == '#') continue;
     auto sp = line.find(' ');
     if (sp == std::string::npos) continue;
-    auto a = inv.find(line.substr(0, sp));
-    auto b = inv.find(line.substr(sp + 1));
-    if (a != inv.end() && b != inv.end()) merges.emplace_back(a->second, b->second);
+    mt.emplace_back(line.substr(0, sp), line.substr(sp + 1));
   }
-  auto bm = BpeModel::from_merges(std::move(merges), table.size());
-  if (!bm) return std::unexpected(bm.error());
-  return std::make_unique<Tokenizer>(make_gpt2_pretok(), std::move(*bm), std::move(table));
+  return bytelevel_bpe_tokenizer(*vj, mt);
 }
 
 }  // namespace gyre

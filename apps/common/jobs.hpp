@@ -89,6 +89,9 @@ struct EvalReport {
 // Held-out eval on the last `split` fraction of --data. split<=0 uses checkpoint holdout.
 Result<EvalReport> run_charlm_eval(const CharLMOpts& opts, double split, LogFn log);
 
+// Hugging Face GPT-2 directory (config.json + model.safetensors + tokenizer.json) -> CharLM `.gyre`.
+Result<void> run_gpt2_import(const std::filesystem::path& hf_dir, const std::filesystem::path& out, LogFn log);
+
 Result<void> run_tok_train(const CharLMOpts& opts, const std::filesystem::path& out, LogFn log);
 Result<void> run_tok_export_hf(const std::filesystem::path& tok, const std::filesystem::path& hf_dir,
                                LogFn log);
