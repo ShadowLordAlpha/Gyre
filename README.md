@@ -119,6 +119,9 @@ include/gyre/
   train/loop.hpp connectome.hpp
   adapt/agent.hpp environment.hpp
   export/onnx.hpp
+  rl/ops.hpp set_encoder.hpp gru.hpp dist.hpp losses.hpp
+  rl/policy.hpp ppo.hpp imitation.hpp policy_io.hpp
+infer/include/gyre_infer/policy.hpp   (separate `gyre-infer` lib, links nothing)
 ```
 
 Errors: `gyre::Result<T>` (`std::expected`). Logging: `log.hpp` (default no-op).
@@ -134,6 +137,7 @@ Index: [docs/README.md](docs/README.md).
 - [docs/vulkan.md](docs/vulkan.md) — optional GPU CharLM train/run (`--device vulkan`)
 - [docs/connectome.md](docs/connectome.md) — optional prune → smaller dense CharLM
 - [docs/wire-evals.md](docs/wire-evals.md) — local prune evals and /10 ratings
+- [docs/rl.md](docs/rl.md) — game-agnostic policy/value nets, PPO, GRU, imitation, standalone CPU inference
 - [docs/interesting.md](docs/interesting.md) — research notes (fly / model connectomes)
 
 ## Data not in git

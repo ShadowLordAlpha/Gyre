@@ -109,3 +109,21 @@ gyre-cli lm eval --ckpt data/wire/nano-child-g5.gyre --data data/shakespeare.txt
 ```
 
 CPU for tiny/medium. Scripts that produced the dumps: `data/wire/run_prune6*.ps1`.
+
+## Re-run after the RNG/optimiser-adjacent changes (fresh parent)
+
+Parent: `--preset medium --tokenizer chars --holdout 0.1 --steps 6000 --batch 8 --lr-start 1e-3
+--lr 3e-4 --dropout 0.1 --decay 0.1 --recency none`. Children: `--wire parent --prune 0.2
+--prune-gens 4 --steps 1000 --batch 8 --lr 3e-4 --dropout 0.1 --decay 0.1`. Local, not CI.
+
+| Gen | d / d_ff | Params | % parent | nats/char | BPC | overall/10 | vs parent/10 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 128 / 512 | 826,433 | 100 | 1.746 | 2.52 | 8.98 | 10.00 |
+| 1 | 100 / 409 | 518,501 | 63 | 1.829 | 2.64 | 8.67 | 9.66 |
+| 2 | 76 / 327 | 315,101 | 38 | 1.901 | 2.74 | 8.41 | 9.36 |
+| 3 | 60 / 261 | 201,749 | 24 | 1.943 | 2.80 | 8.25 | 9.18 |
+| 4 | 44 / 208 | 118,113 | 14 | 2.056 | 2.97 | 7.83 | 8.72 |
+
+Unlike the earlier medium run (parent 1.856 at 5000 steps, batch 4), no child beats this better
+trained parent with only 1000 retraining steps per generation. Shapes match the earlier run
+exactly. No `--shuffle-wire` control was run here.

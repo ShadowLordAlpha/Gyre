@@ -12,6 +12,7 @@
 | [vulkan.md](vulkan.md) | Optional Vulkan CharLM train/eval/generate |
 | [connectome.md](connectome.md) | Optional prune → smaller dense CharLM |
 | [wire-evals.md](wire-evals.md) | Local prune evals + /10 ratings (checkpoints not in git) |
+| [rl.md](rl.md) | Policy/value nets, PPO, GRU, imitation, `gyre-infer` (game-agnostic RL blocks) |
 | [interesting.md](interesting.md) | Research notes (fly connectome / model connectomes) |
 
 Agent notes for contributors in this repo: [../AGENTS.md](../AGENTS.md).

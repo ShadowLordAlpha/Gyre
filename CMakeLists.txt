@@ -36,6 +36,15 @@ add_library(gyre STATIC
   src/gyre/nn/moe.cpp
   src/gyre/nn/grok.cpp
   src/gyre/optim.cpp
+  src/gyre/rl/ops.cpp
+  src/gyre/rl/set_encoder.cpp
+  src/gyre/rl/dist.cpp
+  src/gyre/rl/gru.cpp
+  src/gyre/rl/imitation.cpp
+  src/gyre/rl/losses.cpp
+  src/gyre/rl/policy.cpp
+  src/gyre/rl/policy_io.cpp
+  src/gyre/rl/ppo.cpp
   src/gyre/ga/population.cpp
   src/gyre/checkpoint.cpp
   src/gyre/data.cpp
@@ -128,6 +137,20 @@ if(GYRE_ENABLE_OPENMP)
   endif()
 endif()
 
+# gyre-infer: forward-only policy runtime. Deliberately links NOTHING (no gyre, OpenMP, Vulkan,
+# JSON, optimiser or autodiff code) so a ladder bot can ship just this library.
+add_library(gyre-infer STATIC infer/src/policy.cpp)
+target_include_directories(gyre-infer PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/infer/include>
+  $<INSTALL_INTERFACE:include>
+)
+target_compile_features(gyre-infer PUBLIC cxx_std_20)
+if(MSVC)
+  target_compile_options(gyre-infer PRIVATE /W4 /permissive-)
+else()
+  target_compile_options(gyre-infer PRIVATE -Wall -Wextra)
+endif()
+
 add_library(gyre-app-jobs STATIC apps/common/jobs.cpp)
 target_include_directories(gyre-app-jobs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/apps/common
                                         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/gyre)
@@ -147,6 +170,10 @@ if(GYRE_BUILD_EXAMPLE_BINS)
   target_link_libraries(gyre-ga-onemax PRIVATE gyre)
   add_executable(gyre-charlm examples/charlm.cpp)
   target_link_libraries(gyre-charlm PRIVATE gyre)
+  add_executable(gyre-shakespeare-policy examples/shakespeare_policy.cpp)
+  target_link_libraries(gyre-shakespeare-policy PRIVATE gyre gyre-infer)
+  add_executable(gyre-bench-rl examples/bench_rl.cpp)
+  target_link_libraries(gyre-bench-rl PRIVATE gyre)
 endif()
 
 if(GYRE_ENABLE_TUI)
@@ -162,8 +189,9 @@ if(GYRE_ENABLE_TUI)
 endif()
 
 include(CMakePackageConfigHelpers)
-install(TARGETS gyre EXPORT GyreTargets ARCHIVE DESTINATION lib)
+install(TARGETS gyre gyre-infer EXPORT GyreTargets ARCHIVE DESTINATION lib)
 install(DIRECTORY include/gyre DESTINATION include)
+install(DIRECTORY infer/include/gyre_infer DESTINATION include)
 install(EXPORT GyreTargets FILE GyreTargets.cmake NAMESPACE gyre:: DESTINATION lib/cmake/Gyre)
 configure_package_config_file(
   cmake/GyreConfig.cmake.in
@@ -201,14 +229,26 @@ if(GYRE_BUILD_TESTS)
     tests/connectome_test.cpp
     tests/adapt_grid_test.cpp
     tests/gradcheck_test.cpp
+    tests/rl_ops_test.cpp
+    tests/set_encoder_test.cpp
+    tests/rl_policy_test.cpp
+    tests/rl_ppo_test.cpp
+    tests/rl_gru_test.cpp
+    tests/rl_imitation_test.cpp
+    tests/infer_test.cpp
+    tests/review_fixes_test.cpp
     tests/vulkan_ops_test.cpp
   )
-  target_link_libraries(gyre-tests PRIVATE gyre GTest::gtest_main)
+  target_link_libraries(gyre-tests PRIVATE gyre gyre-infer GTest::gtest_main)
   target_compile_definitions(gyre-tests PRIVATE GYRE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   if(GYRE_ENABLE_ASAN AND NOT MSVC)
     target_compile_options(gyre-tests PRIVATE -fsanitize=address)
     target_link_options(gyre-tests PRIVATE -fsanitize=address)
   endif()
+  # Proves gyre-infer is self-contained: this binary links ONLY gyre-infer.
+  add_executable(gyre-infer-standalone tests/infer_standalone.cpp)
+  target_link_libraries(gyre-infer-standalone PRIVATE gyre-infer)
+  add_test(NAME InferStandalone COMMAND gyre-infer-standalone)
   include(GoogleTest)
   gtest_discover_tests(gyre-tests)
 endif()

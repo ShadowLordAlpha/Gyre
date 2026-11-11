@@ -81,3 +81,12 @@ gyre-cli lm train --data data/shakespeare.txt --preset nanogpt --tokenizer chars
 C++23, CPU Device is the default. Vulkan CharLM train/eval/generate is implemented behind `--device vulkan`. Helix/StarCraft adapters later. Do not start Elman/leaky-state, island GA, or OpenCL unless requested. Recency-biased attention was chosen over RNN fade for v1.5.
 
 Build: `vcvars64` then `cmake --build` the Ninja dir (`cmake-build-gyre` or `cmake-build-release`).
+
+## RL stack (`gyre/rl/*`, `gyre-infer`)
+
+- **Game-agnostic:** floats, `u8` masks, `i32` actions only. Never add game concepts (units, SC2 names) to `include/gyre` or `infer/`. Write-up: `docs/rl.md`.
+- PolicyNet = SetEncoder (padded entity set + mask + global) -> optional GRU (`gru_hidden>0`) -> masked categorical heads (legal mask + per-sample *active* mask; log-prob/entropy summed over active heads) + value. Feedforward uses `forward/backward`; recurrent uses `forward_step` (act) and `forward_seq/backward_seq` (BPTT). `reset[t][b]=1` zeroes carried state.
+- Every backward is finite-difference checked (`tests/gradcheck.hpp`); add a gradcheck for any new op/module. Sampling that depends on earlier heads goes through `sample_conditional` with an `ActiveFn`; store the FINAL active mask in the rollout.
+- Determinism: `set_deterministic(true)` (1 thread) + portable `Rng` (no `std::*_distribution`). Don't reintroduce std distributions.
+- `gyre-infer` must stay dependency-free (no gyre/OpenMP/Vulkan/JSON; `tests/infer_standalone.cpp` links only it) and must not require AVX2. Weight order = `PolicyNet::parameters()`; if the architecture changes, update the flat exporter, the loader's expected-count formula and the parity tests together.
+- Build tests: `cmake --build cmake-build-release --target gyre-tests gyre-infer-standalone` (after `vcvars64`).
