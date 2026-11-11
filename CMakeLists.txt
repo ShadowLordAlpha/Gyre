@@ -200,6 +200,7 @@ if(GYRE_BUILD_TESTS)
     tests/ckpt_test.cpp
     tests/connectome_test.cpp
     tests/adapt_grid_test.cpp
+    tests/gradcheck_test.cpp
     tests/vulkan_ops_test.cpp
   )
   target_link_libraries(gyre-tests PRIVATE gyre GTest::gtest_main)

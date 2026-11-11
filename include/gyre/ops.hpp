@@ -5,6 +5,12 @@
 
 namespace gyre {
 
+// CPU kernel threading. Deterministic mode forces a single thread so float reductions
+// have a fixed order (bit-reproducible on one machine). Overrides GYRE_THREADS.
+void set_num_threads(int n);
+void set_deterministic(bool on);
+bool deterministic() noexcept;
+
 Result<Tensor> add(const Tensor& a, const Tensor& b);
 Result<Tensor> mul(const Tensor& a, const Tensor& b);
 Result<Tensor> matmul(const Tensor& a, const Tensor& b);

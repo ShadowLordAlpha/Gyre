@@ -8,6 +8,8 @@
 
 namespace gyre {
 
+// Portable: the same seed gives the same stream on any conforming compiler/STL
+// (transcendentals in normal() aside, which are libm-dependent in the last ulp).
 class Rng {
  public:
   explicit Rng(std::uint64_t seed = 1) : gen_(seed), seed_(seed) {}
@@ -26,6 +28,8 @@ class Rng {
  private:
   std::mt19937_64 gen_;
   std::uint64_t seed_;
+  float spare_{0.f};
+  bool has_spare_{false};
 };
 
 }  // namespace gyre

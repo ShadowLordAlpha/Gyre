@@ -5,6 +5,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
@@ -64,25 +65,34 @@ Result<std::span<const float>> f32c(const Tensor& t) {
   return t.host_span<float>();
 }
 
+// Explicit thread count (set_num_threads / set_deterministic). omp_set_num_threads only affects the
+// calling thread, so every kernel re-applies this value through init_threads().
+std::atomic<int> g_num_threads{0};
+std::atomic<int> g_prev_threads{0};
+std::atomic<bool> g_deterministic{false};
+
 void init_threads() {
 #if defined(GYRE_OPENMP)
   static bool once = false;
-  if (once) return;
-  once = true;
+  if (!once) {
+    once = true;
 #ifdef _MSC_VER
-  char* e = nullptr;
-  size_t elen = 0;
-  if (_dupenv_s(&e, &elen, "GYRE_THREADS") == 0 && e) {
-    int n = std::atoi(e);
-    free(e);
-    if (n > 0) omp_set_num_threads(n);
-  }
+    char* e = nullptr;
+    size_t elen = 0;
+    if (_dupenv_s(&e, &elen, "GYRE_THREADS") == 0 && e) {
+      int n = std::atoi(e);
+      free(e);
+      if (n > 0) omp_set_num_threads(n);
+    }
 #else
-  if (const char* e = std::getenv("GYRE_THREADS")) {
-    int n = std::atoi(e);
-    if (n > 0) omp_set_num_threads(n);
-  }
+    if (const char* e = std::getenv("GYRE_THREADS")) {
+      int n = std::atoi(e);
+      if (n > 0) omp_set_num_threads(n);
+    }
 #endif
+  }
+  const int n = g_num_threads.load(std::memory_order_relaxed);
+  if (n > 0) omp_set_num_threads(n);
 #endif
 }
 
@@ -106,6 +116,27 @@ void gemm_nn(const float* A, const float* B, float* C, std::int64_t M, std::int6
 }
 
 }  // namespace
+
+void set_num_threads(int n) {
+  if (n > 0) g_num_threads = n;
+  init_threads();
+}
+
+void set_deterministic(bool on) {
+  const bool was = g_deterministic.exchange(on);
+  if (on && !was) {
+    g_prev_threads = g_num_threads.load();
+    g_num_threads = 1;
+  } else if (!on && was) {
+    g_num_threads = g_prev_threads.load();
+#if defined(GYRE_OPENMP)
+    if (g_num_threads.load() == 0) omp_set_num_threads(omp_get_num_procs());
+#endif
+  }
+  init_threads();
+}
+
+bool deterministic() noexcept { return g_deterministic.load(); }
 
 Result<Tensor> add(const Tensor& a, const Tensor& b) {
   auto ok = same_dev_dtype_shape(a, b, true);
