@@ -26,6 +26,10 @@ class Tensor {
 
   static Result<Tensor> empty(std::span<const std::int64_t> shape, DType dtype,
                               std::shared_ptr<Device> device);
+  // Like empty() but the contents are UNSPECIFIED (recycled memory). Only for outputs that the
+  // caller overwrites completely.
+  static Result<Tensor> uninit(std::span<const std::int64_t> shape, DType dtype,
+                               std::shared_ptr<Device> device);
   static Result<Tensor> zeros(std::span<const std::int64_t> shape, DType dtype,
                               std::shared_ptr<Device> device);
   static Result<Tensor> from_host(std::span<const std::byte> bytes,
@@ -82,6 +86,8 @@ class Tensor {
   static Result<Tensor> view_reshape(const Tensor& a, std::span<const std::int64_t> new_shape);
 
  private:
+  static Result<Tensor> make(std::span<const std::int64_t> shape, DType dtype,
+                             std::shared_ptr<Device> device, bool zero);
   Tensor(std::shared_ptr<Device> d, std::shared_ptr<Storage> s, std::size_t off, DType dt,
          std::array<std::int64_t, 8> sh, std::uint8_t rank, std::int64_t n);
 

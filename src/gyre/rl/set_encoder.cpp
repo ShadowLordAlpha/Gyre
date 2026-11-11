@@ -86,11 +86,7 @@ Result<Tensor> SetBlock::forward(const Tensor& x, const Tensor& mask, ForwardCtx
   GYRE_TRY(qh, permute_bthd_bhtd(qr));
   GYRE_TRY(kh, permute_bthd_bhtd(kr));
   GYRE_TRY(vh, permute_bthd_bhtd(vr));
-  GYRE_TRY(kt, transpose_last2(kh));
-  GYRE_TRY(scores, bmm(qh, kt));
-  GYRE_TRY(scaled, mul_scalar(scores, 1.f / std::sqrt(static_cast<float>(dk))));
-  if (auto r = key_mask_(scaled, mask); !r) return std::unexpected(r.error());
-  GYRE_TRY(w, softmax_last(scaled));
+  GYRE_TRY(w, attn_probs(qh, kh, &mask, 1.f / std::sqrt(static_cast<float>(dk))));  // fused q.k, mask, softmax
   GYRE_TRY(y, bmm(w, vh));
   GYRE_TRY(y2, permute_bhtd_bthd(y));
   std::int64_t osh[3] = {B, N, C};
@@ -135,15 +131,11 @@ Result<Tensor> SetBlock::backward(const Tensor& dy, ForwardCtx& ctx) {
   std::int64_t sh4[4] = {B, N, H, dk};
   GYRE_TRY(dy2, reshape(dy3, sh4));
   GYRE_TRY(dyh, permute_bthd_bhtd(dy2));
-  GYRE_TRY(vt, transpose_last2(*saved_vh_));
-  GYRE_TRY(dw, bmm(dyh, vt));
-  GYRE_TRY(wt, transpose_last2(*saved_w_));
-  GYRE_TRY(dvh, bmm(wt, dyh));
-  GYRE_TRY(dz, softmax_last_backward(*saved_w_, dw));  // masked entries have w == 0 -> dz == 0
-  GYRE_TRY(dzs, mul_scalar(dz, scale));
-  GYRE_TRY(dqh, bmm(dzs, *saved_kh_));
-  GYRE_TRY(dzt, transpose_last2(dzs));
-  GYRE_TRY(dkh, bmm(dzt, *saved_qh_));
+  // dz = scale * softmax-backward(w, dy.v); masked keys have w == 0 -> dz == 0 exactly
+  GYRE_TRY(dz, attn_probs_backward(*saved_w_, dyh, *saved_vh_, scale));
+  GYRE_TRY(dvh, bmm_tn(*saved_w_, dyh));   // dv_j = sum_i w[i,j] dy_i
+  GYRE_TRY(dqh, bmm(dz, *saved_kh_));      // dq_i = sum_j dz[i,j] k_j
+  GYRE_TRY(dkh, bmm_tn(dz, *saved_qh_));   // dk_j = sum_i dz[i,j] q_i
   std::int64_t osh[3] = {B, N, C};
   GYRE_TRY(q_bthd, permute_bhtd_bthd(dqh));
   GYRE_TRY(k_bthd, permute_bhtd_bthd(dkh));

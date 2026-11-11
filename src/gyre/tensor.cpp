@@ -76,6 +76,16 @@ Tensor::Tensor(std::shared_ptr<Device> d, std::shared_ptr<Storage> s, std::size_
 
 Result<Tensor> Tensor::empty(std::span<const std::int64_t> shape, DType dtype,
                              std::shared_ptr<Device> device) {
+  return make(shape, dtype, std::move(device), true);
+}
+
+Result<Tensor> Tensor::uninit(std::span<const std::int64_t> shape, DType dtype,
+                              std::shared_ptr<Device> device) {
+  return make(shape, dtype, std::move(device), false);
+}
+
+Result<Tensor> Tensor::make(std::span<const std::int64_t> shape, DType dtype,
+                            std::shared_ptr<Device> device, bool zero) {
   if (!device) return std::unexpected(make_error(Errc::unsupported, "null device"));
   if (device->kind() != DeviceKind::cpu && device->kind() != DeviceKind::vulkan) {
     return std::unexpected(make_error(Errc::unsupported, "device not implemented"));
@@ -99,7 +109,7 @@ Result<Tensor> Tensor::empty(std::span<const std::int64_t> shape, DType dtype,
 #endif
   } else {
     st = std::make_shared<Storage>();
-    st->heap.resize(bytes);
+    st->heap = pool_acquire(bytes, zero);
   }
   std::array<std::int64_t, 8> sh{};
   for (std::size_t i = 0; i < shape.size(); ++i) sh[i] = shape[i];
@@ -175,6 +185,7 @@ Result<Tensor> Tensor::zeros(std::span<const std::int64_t> shape, DType dtype,
                              std::shared_ptr<Device> device) {
   auto t = empty(shape, dtype, std::move(device));
   if (!t) return t;
+  if (t->device()->kind() == DeviceKind::cpu) return t;  // empty() already zero-fills CPU memory
   auto z = fill_zero(*t);
   if (!z) return std::unexpected(z.error());
   return t;
@@ -182,7 +193,7 @@ Result<Tensor> Tensor::zeros(std::span<const std::int64_t> shape, DType dtype,
 
 Result<Tensor> Tensor::from_host(std::span<const std::byte> bytes, std::span<const std::int64_t> shape,
                                  DType dtype, std::shared_ptr<Device> device) {
-  auto t = empty(shape, dtype, std::move(device));
+  auto t = uninit(shape, dtype, std::move(device));  // fully overwritten below
   if (!t) return t;
   auto c = t->copy_from_host(bytes);
   if (!c) return std::unexpected(c.error());

@@ -1,5 +1,9 @@
 #include "gyre/detail/storage.hpp"
 
+#include <cstring>
+#include <map>
+#include <mutex>
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -17,7 +21,56 @@
 
 namespace gyre {
 
+namespace {
+constexpr std::size_t kPoolMin = std::size_t{1} << 20;    // pool only buffers >= 1 MiB
+constexpr std::size_t kPoolCap = std::size_t{768} << 20;  // total bytes kept
+struct Pool {
+  std::mutex mu;
+  std::multimap<std::size_t, std::vector<std::byte>> free;  // key = capacity
+  std::size_t held{0};
+};
+Pool& pool() {
+  static Pool* p = new Pool();  // intentionally leaked: Storage may be destroyed during exit
+  return *p;
+}
+}  // namespace
+
+std::vector<std::byte> pool_acquire(std::size_t bytes, bool zero) {
+  if (bytes >= kPoolMin) {
+    auto& P = pool();
+    std::vector<std::byte> got;
+    {
+      std::lock_guard<std::mutex> lk(P.mu);
+      auto it = P.free.lower_bound(bytes);
+      if (it != P.free.end() && it->first <= bytes + bytes / 2) {  // at most 50% waste
+        got = std::move(it->second);
+        P.held -= it->first;
+        P.free.erase(it);
+      }
+    }
+    if (got.capacity() >= bytes) {
+      got.resize(bytes);
+      if (zero) std::memset(got.data(), 0, bytes);
+      return got;
+    }
+  }
+  std::vector<std::byte> v;
+  v.resize(bytes);  // value-initialised: zero
+  return v;
+}
+
+void pool_release(std::vector<std::byte>&& buf) {
+  const std::size_t cap = buf.capacity();
+  if (cap < kPoolMin) return;
+  auto& P = pool();
+  std::lock_guard<std::mutex> lk(P.mu);
+  if (P.held + cap > kPoolCap) return;  // drop: let the vector free itself
+  P.held += cap;
+  P.free.emplace(cap, std::move(buf));
+}
+
 Storage::~Storage() {
+  if (!mapped && !gpu && heap.capacity() >= kPoolMin) pool_release(std::move(heap));
 #ifdef _WIN32
   if (mapped) UnmapViewOfFile(mapped);
   if (win_map) CloseHandle(static_cast<HANDLE>(win_map));

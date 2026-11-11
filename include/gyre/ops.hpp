@@ -7,14 +7,22 @@ namespace gyre {
 
 // CPU kernel threading. Deterministic mode forces a single thread so float reductions
 // have a fixed order (bit-reproducible on one machine). Overrides GYRE_THREADS.
-void set_num_threads(int n);
+void set_num_threads(int n);  // n <= 0: automatic (all processors)
 void set_deterministic(bool on);
 bool deterministic() noexcept;
+// Re-apply the configured thread count on the calling thread (kernels outside ops.cpp call this
+// before an OpenMP region; omp_set_num_threads is per-thread).
+void apply_thread_settings();
 
 Result<Tensor> add(const Tensor& a, const Tensor& b);
 Result<Tensor> mul(const Tensor& a, const Tensor& b);
 Result<Tensor> matmul(const Tensor& a, const Tensor& b);
 Result<Tensor> bmm(const Tensor& a, const Tensor& b);
+// A^T B without materialising the transpose: a [M,K], b [M,N] -> [K,N]. Fixed-block reduction,
+// so the result does not depend on the thread count. bmm_tn is the batched form
+// ([..,M,K], [..,M,N]) -> [..,K,N].
+Result<Tensor> matmul_tn(const Tensor& a, const Tensor& b);
+Result<Tensor> bmm_tn(const Tensor& a, const Tensor& b);
 Result<Tensor> sum(const Tensor& a);
 Result<Tensor> sum_dim(const Tensor& a, int axis, bool keepdim);
 Result<Tensor> reshape(const Tensor& a, std::span<const std::int64_t> new_shape);

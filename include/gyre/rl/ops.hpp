@@ -53,4 +53,15 @@ Result<Tensor> mask_rows(const Tensor& h, const Tensor& keep_u8);
 // Stack rank-2 tensors with equal width along rows -> [sum rows, C].
 Result<Tensor> concat_rows(std::span<const Tensor> parts);
 
+// ---- fused attention (non-causal, optional key padding mask), all [B,H,N,dk] row-major ----
+// w[b,h,i,j] = softmax_j( scale * q_i . k_j ), keys with mask==0 get weight exactly 0 (an all-masked
+// row degrades to uniform, like softmax over equal fill values). Replaces
+// transpose + bmm + mul_scalar + key_mask_ + softmax, which materialised four [B,H,N,N] tensors.
+// key_mask: u8 [B,N] or nullptr.
+Result<Tensor> attn_probs(const Tensor& qh, const Tensor& kh, const Tensor* key_mask_u8, float scale);
+// Gradient w.r.t. the pre-softmax *dot products* of q.k scaled by `scale`, i.e.
+//   dz[i,j] = scale * w[i,j] * (dw[i,j] - sum_j' w[i,j'] dw[i,j']),  dw[i,j] = dy_i . v_j,
+// so that dq = bmm(dz, k) and dk = bmm_tn(dz, q). dy and v are [B,H,N,dk]; w comes from attn_probs.
+Result<Tensor> attn_probs_backward(const Tensor& w, const Tensor& dyh, const Tensor& vh, float scale);
+
 }  // namespace gyre

@@ -117,17 +117,22 @@ void gemm_nn(const float* A, const float* B, float* C, std::int64_t M, std::int6
 
 }  // namespace
 
+void apply_thread_settings() { init_threads(); }
+
 void set_num_threads(int n) {
-  if (n > 0) g_num_threads = n;
+  g_num_threads = n > 0 ? n : 0;  // 0 = automatic (all processors)
+#if defined(GYRE_OPENMP)
+  if (n <= 0) omp_set_num_threads(omp_get_num_procs());
+#endif
   init_threads();
 }
 
 void set_deterministic(bool on) {
   const bool was = g_deterministic.exchange(on);
-  if (on && !was) {
-    g_prev_threads = g_num_threads.load();
-    g_num_threads = 1;
-  } else if (!on && was) {
+  if (on) {
+    if (!was) g_prev_threads = g_num_threads.load();
+    g_num_threads = 1;  // re-assert even if already on (set_num_threads may have changed it)
+  } else if (was) {
     g_num_threads = g_prev_threads.load();
 #if defined(GYRE_OPENMP)
     if (g_num_threads.load() == 0) omp_set_num_threads(omp_get_num_procs());
@@ -147,7 +152,7 @@ Result<Tensor> add(const Tensor& a, const Tensor& b) {
 #if defined(GYRE_VULKAN)
   if (is_vk(a)) return vkops::add(a, b);
 #endif
-  auto out = Tensor::empty(a.shape(), DType::f32, a.device());
+  auto out = Tensor::uninit(a.shape(), DType::f32, a.device());
   if (!out) return out;
   auto pa = f32c(a);
   auto pb = f32c(b);
@@ -173,7 +178,7 @@ Result<Tensor> mul(const Tensor& a, const Tensor& b) {
 #if defined(GYRE_VULKAN)
   if (is_vk(a)) return vkops::mul(a, b);
 #endif
-  auto out = Tensor::empty(a.shape(), DType::f32, a.device());
+  auto out = Tensor::uninit(a.shape(), DType::f32, a.device());
   if (!out) return out;
   auto pa = f32c(a);
   auto pb = f32c(b);
@@ -206,7 +211,7 @@ Result<Tensor> matmul(const Tensor& a, const Tensor& b) {
   if (is_vk(a)) return vkops::matmul(a, b);
 #endif
   std::int64_t osh[2] = {M, N};
-  auto out = Tensor::empty(osh, DType::f32, a.device());
+  auto out = Tensor::uninit(osh, DType::f32, a.device());
   if (!out) return out;
   auto pa = f32c(a);
   auto pb = f32c(b);
@@ -245,7 +250,7 @@ Result<Tensor> bmm(const Tensor& a, const Tensor& b) {
   }
   osh[r - 2] = M;
   osh[r - 1] = N;
-  auto out = Tensor::empty(std::span<const std::int64_t>(osh.data(), r), DType::f32, a.device());
+  auto out = Tensor::uninit(std::span<const std::int64_t>(osh.data(), r), DType::f32, a.device());
   if (!out) return out;
   auto pa = f32c(a);
   auto pb = f32c(b);
@@ -259,6 +264,109 @@ Result<Tensor> bmm(const Tensor& a, const Tensor& b) {
   for (std::int64_t bi = 0; bi < batch; ++bi) {
     gemm_nn(pa->data() + bi * a_mat, pb->data() + bi * b_mat, po->data() + bi * o_mat, M, K, N);
   }
+  return out;
+}
+
+namespace {
+// C[K,N] += A[M,K]^T @ B[M,N]
+void gemm_tn_acc(const float* A, const float* B, float* C, std::int64_t M, std::int64_t K, std::int64_t N) {
+  for (std::int64_t m = 0; m < M; ++m) {
+    const float* Bm = B + m * N;
+    const float* Am = A + m * K;
+    for (std::int64_t k = 0; k < K; ++k) {
+      const float a = Am[k];
+      float* Ck = C + k * N;
+      for (std::int64_t j = 0; j < N; ++j) Ck[j] += a * Bm[j];
+    }
+  }
+}
+}  // namespace
+
+Result<Tensor> matmul_tn(const Tensor& a, const Tensor& b) {
+  if (a.device().get() != b.device().get()) return std::unexpected(make_error(Errc::mixed_device, "mixed device"));
+  if (a.dtype() != DType::f32 || b.dtype() != DType::f32)
+    return std::unexpected(make_error(Errc::dtype_mismatch, "matmul_tn f32"));
+  if (a.rank() != 2 || b.rank() != 2 || a.shape()[0] != b.shape()[0])
+    return std::unexpected(make_error(Errc::invalid_shape, "matmul_tn: a [M,K], b [M,N]"));
+#if defined(GYRE_VULKAN)
+  if (is_vk(a)) {
+    auto at = transpose_last2(a);
+    if (!at) return at;
+    return matmul(*at, b);
+  }
+#endif
+  const auto M = a.shape()[0], K = a.shape()[1], N = b.shape()[1];
+  std::int64_t osh[2] = {K, N};
+  auto out = Tensor::empty(osh, DType::f32, a.device());  // zeroed: accumulated into
+  if (!out) return out;
+  auto pa = f32c(a);
+  auto pb = f32c(b);
+  auto po = f32(*out);
+  if (!pa || !pb || !po) return std::unexpected(make_error(Errc::not_cpu, "host"));
+  constexpr std::int64_t BLK = 256;  // fixed block size => result independent of thread count
+  if (M <= 2 * BLK) {
+    gemm_tn_acc(pa->data(), pb->data(), po->data(), M, K, N);
+    return out;
+  }
+  const std::int64_t nb = (M + BLK - 1) / BLK;
+  std::vector<float> part(static_cast<std::size_t>(nb * K * N), 0.f);
+  init_threads();
+#if defined(GYRE_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+  for (std::int64_t k = 0; k < nb; ++k) {
+    const std::int64_t m0 = k * BLK, m1 = std::min(M, m0 + BLK);
+    gemm_tn_acc(pa->data() + m0 * K, pb->data() + m0 * N, part.data() + k * K * N, m1 - m0, K, N);
+  }
+  const std::int64_t KN = K * N;
+#if defined(GYRE_OPENMP)
+#pragma omp parallel for schedule(static) if (KN > 4096)
+#endif
+  for (std::int64_t i = 0; i < KN; ++i) {
+    float acc = 0.f;
+    for (std::int64_t k = 0; k < nb; ++k) acc += part[static_cast<std::size_t>(k * KN + i)];
+    (*po)[static_cast<std::size_t>(i)] = acc;
+  }
+  return out;
+}
+
+Result<Tensor> bmm_tn(const Tensor& a, const Tensor& b) {
+  if (a.device().get() != b.device().get()) return std::unexpected(make_error(Errc::mixed_device, "mixed device"));
+  if (a.dtype() != DType::f32 || b.dtype() != DType::f32)
+    return std::unexpected(make_error(Errc::dtype_mismatch, "bmm_tn f32"));
+  if (a.rank() < 3 || b.rank() != a.rank())
+    return std::unexpected(make_error(Errc::invalid_shape, "bmm_tn rank"));
+  const int r = a.rank();
+  for (int i = 0; i < r - 1; ++i)  // batch dims and M must match
+    if (a.shape()[i] != b.shape()[i]) return std::unexpected(make_error(Errc::invalid_shape, "bmm_tn dims"));
+#if defined(GYRE_VULKAN)
+  if (is_vk(a)) {
+    auto at = transpose_last2(a);
+    if (!at) return at;
+    return bmm(*at, b);
+  }
+#endif
+  const auto M = a.shape()[r - 2], K = a.shape()[r - 1], N = b.shape()[r - 1];
+  std::int64_t batch = 1;
+  std::array<std::int64_t, 8> osh{};
+  for (int i = 0; i < r - 2; ++i) {
+    osh[i] = a.shape()[i];
+    batch *= a.shape()[i];
+  }
+  osh[r - 2] = K;
+  osh[r - 1] = N;
+  auto out = Tensor::empty(std::span<const std::int64_t>(osh.data(), r), DType::f32, a.device());
+  if (!out) return out;
+  auto pa = f32c(a);
+  auto pb = f32c(b);
+  auto po = f32(*out);
+  if (!pa || !pb || !po) return std::unexpected(make_error(Errc::not_cpu, "host"));
+  init_threads();
+#if defined(GYRE_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+  for (std::int64_t bi = 0; bi < batch; ++bi)
+    gemm_tn_acc(pa->data() + bi * M * K, pb->data() + bi * M * N, po->data() + bi * K * N, M, K, N);
   return out;
 }
 
@@ -307,38 +415,44 @@ Result<Tensor> sum_dim(const Tensor& a, int axis, bool keepdim) {
   auto po = f32(*out);
   if (!pa || !po) return std::unexpected(make_error(Errc::not_cpu, "host"));
 
-  std::array<std::int64_t, 8> stride{};
-  stride[a.rank() - 1] = 1;
-  for (int i = a.rank() - 2; i >= 0; --i) stride[i] = stride[i + 1] * a.shape()[i + 1];
-
-  std::array<std::int64_t, 8> ostr{};
-  if (!osh.empty()) {
-    ostr[osh.size() - 1] = 1;
-    for (int i = static_cast<int>(osh.size()) - 2; i >= 0; --i) ostr[i] = ostr[i + 1] * osh[i + 1];
-  }
-
-  const std::int64_t n = a.numel();
-  for (std::int64_t lin = 0; lin < n; ++lin) {
-    std::array<std::int64_t, 8> idx{};
-    auto rem = lin;
-    for (int i = 0; i < a.rank(); ++i) {
-      idx[i] = rem / stride[i];
-      rem %= stride[i];
-    }
-    std::int64_t olin = 0;
-    int oi = 0;
-    for (int i = 0; i < a.rank(); ++i) {
-      if (i == axis) {
-        if (keepdim) {
-          olin += 0 * ostr[oi];
-          ++oi;
-        }
-      } else {
-        olin += idx[i] * ostr[oi];
-        ++oi;
+  // View the tensor as [outer, len, inner] around `axis` and reduce `len`.
+  std::int64_t outer = 1, inner = 1;
+  for (int i = 0; i < axis; ++i) outer *= a.shape()[i];
+  for (int i = axis + 1; i < a.rank(); ++i) inner *= a.shape()[i];
+  const std::int64_t len = a.shape()[axis];
+  init_threads();
+  const float* src = pa->data();
+  float* dst = po->data();
+  if (outer == 1 && len > 1024) {
+    // Long reduction into a short row (e.g. bias gradients over many rows): fixed 256-row blocks
+    // reduced in a fixed order, so the result does not depend on the thread count.
+    constexpr std::int64_t BLK = 256;
+    const std::int64_t nb = (len + BLK - 1) / BLK;
+    std::vector<float> part(static_cast<std::size_t>(nb * inner), 0.f);
+#if defined(GYRE_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (std::int64_t k = 0; k < nb; ++k) {
+      float* pk = part.data() + k * inner;
+      const std::int64_t r1 = std::min(len, (k + 1) * BLK);
+      for (std::int64_t r = k * BLK; r < r1; ++r) {
+        const float* row = src + r * inner;
+        for (std::int64_t i = 0; i < inner; ++i) pk[i] += row[i];
       }
     }
-    (*po)[static_cast<std::size_t>(olin)] += (*pa)[static_cast<std::size_t>(lin)];
+    for (std::int64_t k = 0; k < nb; ++k)
+      for (std::int64_t i = 0; i < inner; ++i) dst[i] += part[static_cast<std::size_t>(k * inner + i)];
+  } else {
+#if defined(GYRE_OPENMP)
+#pragma omp parallel for schedule(static) if (outer * len * inner > 65536)
+#endif
+    for (std::int64_t o = 0; o < outer; ++o) {
+      float* od = dst + o * inner;
+      for (std::int64_t l = 0; l < len; ++l) {
+        const float* row = src + (o * len + l) * inner;
+        for (std::int64_t i = 0; i < inner; ++i) od[i] += row[i];
+      }
+    }
   }
   return out;
 }
@@ -358,7 +472,7 @@ Result<Tensor> transpose_last2(const Tensor& a) {
   std::array<std::int64_t, 8> osh{};
   for (int i = 0; i < a.rank(); ++i) osh[i] = a.shape()[i];
   std::swap(osh[a.rank() - 2], osh[a.rank() - 1]);
-  auto out = Tensor::empty(std::span<const std::int64_t>(osh.data(), a.rank()), a.dtype(), a.device());
+  auto out = Tensor::uninit(std::span<const std::int64_t>(osh.data(), a.rank()), a.dtype(), a.device());
   if (!out) return out;
   const auto d0 = a.shape()[a.rank() - 2];
   const auto d1 = a.shape()[a.rank() - 1];
@@ -368,6 +482,27 @@ Result<Tensor> transpose_last2(const Tensor& a) {
   auto dst = out->host_bytes();
   if (!src || !dst) return std::unexpected(make_error(Errc::not_cpu, "host"));
   const std::size_t es = dtype_size(a.dtype());
+  if (es == 4) {  // 32-bit elements (f32/i32): cache-blocked, parallel over (batch, row block)
+    const auto* sp = reinterpret_cast<const std::uint32_t*>(src->data());
+    auto* dp = reinterpret_cast<std::uint32_t*>(dst->data());
+    constexpr std::int64_t T = 16;
+    const std::int64_t nib = (d0 + T - 1) / T;
+    init_threads();
+#if defined(GYRE_OPENMP)
+#pragma omp parallel for schedule(static) if (batch * d0 * d1 > 65536)
+#endif
+    for (std::int64_t bi = 0; bi < batch * nib; ++bi) {
+      const std::int64_t b = bi / nib, i0 = (bi % nib) * T, i1 = std::min(d0, i0 + T);
+      const std::uint32_t* sb = sp + b * d0 * d1;
+      std::uint32_t* db = dp + b * d0 * d1;
+      for (std::int64_t j0 = 0; j0 < d1; j0 += T) {
+        const std::int64_t j1 = std::min(d1, j0 + T);
+        for (std::int64_t i = i0; i < i1; ++i)
+          for (std::int64_t j = j0; j < j1; ++j) db[j * d0 + i] = sb[i * d1 + j];
+      }
+    }
+    return out;
+  }
   for (std::int64_t b = 0; b < batch; ++b) {
     for (std::int64_t i = 0; i < d0; ++i)
       for (std::int64_t j = 0; j < d1; ++j) {
@@ -421,17 +556,21 @@ Result<Tensor> permute_bthd_bhtd(const Tensor& x) {
 #endif
   const auto B = x.shape()[0], T = x.shape()[1], H = x.shape()[2], D = x.shape()[3];
   std::int64_t osh[4] = {B, H, T, D};
-  auto out = Tensor::empty(osh, DType::f32, x.device());
+  auto out = Tensor::uninit(osh, DType::f32, x.device());
   if (!out) return out;
   auto s = f32c(x);
   auto d = f32(*out);
   if (!s || !d) return std::unexpected(make_error(Errc::not_cpu, "host"));
-  for (std::int64_t b = 0; b < B; ++b)
-    for (std::int64_t t = 0; t < T; ++t)
-      for (std::int64_t h = 0; h < H; ++h)
-        for (std::int64_t i = 0; i < D; ++i)
-          (*d)[static_cast<std::size_t>(((b * H + h) * T + t) * D + i)] =
-              (*s)[static_cast<std::size_t>(((b * T + t) * H + h) * D + i)];
+  init_threads();
+#if defined(GYRE_OPENMP)
+#pragma omp parallel for schedule(static) if (B * T * H * D > 65536)
+#endif
+  for (std::int64_t bt = 0; bt < B * T; ++bt) {
+    const std::int64_t b = bt / T, t = bt % T;
+    for (std::int64_t h = 0; h < H; ++h)
+      std::memcpy(d->data() + ((b * H + h) * T + t) * D, s->data() + ((b * T + t) * H + h) * D,
+                  static_cast<std::size_t>(D) * sizeof(float));
+  }
   return out;
 }
 
@@ -444,17 +583,21 @@ Result<Tensor> permute_bhtd_bthd(const Tensor& x) {
 #endif
   const auto B = x.shape()[0], H = x.shape()[1], T = x.shape()[2], D = x.shape()[3];
   std::int64_t osh[4] = {B, T, H, D};
-  auto out = Tensor::empty(osh, DType::f32, x.device());
+  auto out = Tensor::uninit(osh, DType::f32, x.device());
   if (!out) return out;
   auto s = f32c(x);
   auto d = f32(*out);
   if (!s || !d) return std::unexpected(make_error(Errc::not_cpu, "host"));
-  for (std::int64_t b = 0; b < B; ++b)
+  init_threads();
+#if defined(GYRE_OPENMP)
+#pragma omp parallel for schedule(static) if (B * T * H * D > 65536)
+#endif
+  for (std::int64_t bt = 0; bt < B * T; ++bt) {
+    const std::int64_t b = bt / T, t = bt % T;
     for (std::int64_t h = 0; h < H; ++h)
-      for (std::int64_t t = 0; t < T; ++t)
-        for (std::int64_t i = 0; i < D; ++i)
-          (*d)[static_cast<std::size_t>(((b * T + t) * H + h) * D + i)] =
-              (*s)[static_cast<std::size_t>(((b * H + h) * T + t) * D + i)];
+      std::memcpy(d->data() + ((b * T + t) * H + h) * D, s->data() + ((b * H + h) * T + t) * D,
+                  static_cast<std::size_t>(D) * sizeof(float));
+  }
   return out;
 }
 
@@ -486,7 +629,7 @@ Result<Tensor> gelu(const Tensor& a) {
 #if defined(GYRE_VULKAN)
   if (is_vk(a)) return vkops::gelu(a);
 #endif
-  auto out = Tensor::empty(a.shape(), DType::f32, a.device());
+  auto out = Tensor::uninit(a.shape(), DType::f32, a.device());
   if (!out) return out;
   auto pa = f32c(a);
   auto po = f32(*out);
@@ -545,7 +688,7 @@ Result<Tensor> softmax_last(const Tensor& a) {
 #if defined(GYRE_VULKAN)
   if (is_vk(a)) return vkops::softmax_last(a);
 #endif
-  auto out = Tensor::empty(a.shape(), DType::f32, a.device());
+  auto out = Tensor::uninit(a.shape(), DType::f32, a.device());
   if (!out) return out;
   auto pa = f32c(a);
   auto po = f32(*out);
@@ -611,7 +754,7 @@ Result<Tensor> layer_norm(const Tensor& x, const Tensor& w, const Tensor& b, flo
     return vkops::layer_norm(x, w, b, eps);
   }
 #endif
-  auto out = Tensor::empty(x.shape(), DType::f32, x.device());
+  auto out = Tensor::uninit(x.shape(), DType::f32, x.device());
   if (!out) return out;
   auto px = f32c(x);
   auto pw = f32c(w);
@@ -851,7 +994,7 @@ Result<Tensor> gelu_backward(const Tensor& x, const Tensor& dy) {
     return vkops::gelu_backward(x, dy);
   }
 #endif
-  auto out = Tensor::empty(x.shape(), DType::f32, x.device());
+  auto out = Tensor::uninit(x.shape(), DType::f32, x.device());
   if (!out) return out;
   auto px = f32c(x);
   auto pd = f32c(dy);
@@ -859,13 +1002,18 @@ Result<Tensor> gelu_backward(const Tensor& x, const Tensor& dy) {
   if (!px || !pd || !po) return std::unexpected(make_error(Errc::not_cpu, "host"));
   constexpr float c = 0.044715f;
   constexpr float s = 0.7978845608028654f;
-  for (std::size_t i = 0; i < px->size(); ++i) {
-    float xv = std::clamp((*px)[i], -40.f, 40.f);
+  init_threads();
+  const auto n = static_cast<std::int64_t>(px->size());
+#if defined(GYRE_OPENMP)
+#pragma omp parallel for schedule(static) if (n > 16384)
+#endif
+  for (std::int64_t i = 0; i < n; ++i) {
+    float xv = std::clamp((*px)[static_cast<std::size_t>(i)], -40.f, 40.f);
     float u = s * (xv + c * xv * xv * xv);
     float th = std::tanh(u);
     float du = s * (1.f + 3.f * c * xv * xv);
     float dgelu = 0.5f * (1.f + th) + 0.5f * xv * (1.f - th * th) * du;
-    (*po)[i] = (*pd)[i] * dgelu;
+    (*po)[static_cast<std::size_t>(i)] = (*pd)[static_cast<std::size_t>(i)] * dgelu;
   }
   return out;
 }
@@ -877,7 +1025,7 @@ Result<Tensor> softmax_last_backward(const Tensor& softmax, const Tensor& d_out)
     return vkops::softmax_last_backward(softmax, d_out);
   }
 #endif
-  auto out = Tensor::empty(softmax.shape(), DType::f32, softmax.device());
+  auto out = Tensor::uninit(softmax.shape(), DType::f32, softmax.device());
   if (!out) return out;
   auto ps = f32c(softmax);
   auto pd = f32c(d_out);
@@ -885,6 +1033,10 @@ Result<Tensor> softmax_last_backward(const Tensor& softmax, const Tensor& d_out)
   if (!ps || !pd || !po) return std::unexpected(make_error(Errc::not_cpu, "host"));
   const auto last = softmax.shape()[softmax.rank() - 1];
   const auto rows = softmax.numel() / last;
+  init_threads();
+#if defined(GYRE_OPENMP)
+#pragma omp parallel for schedule(static) if (rows > 8 && rows * last > 16384)
+#endif
   for (std::int64_t r = 0; r < rows; ++r) {
     const float* sv = ps->data() + r * last;
     const float* dv = pd->data() + r * last;
@@ -910,12 +1062,17 @@ Result<Tensor> mul_scalar(const Tensor& a, float s) {
 #if defined(GYRE_VULKAN)
   if (is_vk(a)) return vkops::mul_scalar(a, s);
 #endif
-  auto out = Tensor::empty(a.shape(), DType::f32, a.device());
+  auto out = Tensor::uninit(a.shape(), DType::f32, a.device());
   if (!out) return out;
   auto pa = f32c(a);
   auto po = f32(*out);
   if (!pa || !po) return std::unexpected(pa ? po.error() : pa.error());
-  for (std::size_t i = 0; i < pa->size(); ++i) (*po)[i] = (*pa)[i] * s;
+  init_threads();
+  const auto n = static_cast<std::int64_t>(pa->size());
+#if defined(GYRE_OPENMP)
+#pragma omp parallel for schedule(static) if (n > 65536)
+#endif
+  for (std::int64_t i = 0; i < n; ++i) (*po)[static_cast<std::size_t>(i)] = (*pa)[static_cast<std::size_t>(i)] * s;
   return out;
 }
 

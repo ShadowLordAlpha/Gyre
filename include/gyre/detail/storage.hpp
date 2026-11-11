@@ -10,6 +10,12 @@
 
 namespace gyre {
 
+// Recycling pool for large CPU buffers: fresh multi-MB allocations page-fault on every use, which
+// dominated the cost of elementwise ops on attention-sized tensors. Buffers >= 1 MiB are returned
+// here by ~Storage and reused. `zero=false` leaves recycled contents unspecified.
+std::vector<std::byte> pool_acquire(std::size_t bytes, bool zero);
+void pool_release(std::vector<std::byte>&& buf);
+
 struct GpuAlloc {
   virtual ~GpuAlloc() = default;
   virtual std::size_t size() const noexcept = 0;

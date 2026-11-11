@@ -112,9 +112,7 @@ Result<void> Linear::backward(const Tensor& d_out, ForwardCtx& ctx) {
   auto df = flatten_leading(d_out);
   if (!xf || !df) return std::unexpected(xf ? df.error() : xf.error());
   if (!freeze_base_) {
-    auto xt = transpose_last2(*xf);
-    if (!xt) return std::unexpected(xt.error());
-    auto dW = matmul(*xt, *df);
+    auto dW = matmul_tn(*xf, *df);  // x^T dy without a transpose copy
     if (!dW) return std::unexpected(dW.error());
     auto r1 = add_(params_[0].grad, *dW);
     if (!r1) return r1;

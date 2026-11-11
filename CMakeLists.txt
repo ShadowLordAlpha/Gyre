@@ -174,6 +174,8 @@ if(GYRE_BUILD_EXAMPLE_BINS)
   target_link_libraries(gyre-shakespeare-policy PRIVATE gyre gyre-infer)
   add_executable(gyre-bench-rl examples/bench_rl.cpp)
   target_link_libraries(gyre-bench-rl PRIVATE gyre)
+  add_executable(gyre-bench-ops examples/bench_ops.cpp)
+  target_link_libraries(gyre-bench-ops PRIVATE gyre)
 endif()
 
 if(GYRE_ENABLE_TUI)
@@ -237,6 +239,7 @@ if(GYRE_BUILD_TESTS)
     tests/rl_imitation_test.cpp
     tests/infer_test.cpp
     tests/review_fixes_test.cpp
+    tests/kernels_test.cpp
     tests/vulkan_ops_test.cpp
   )
   target_link_libraries(gyre-tests PRIVATE gyre gyre-infer GTest::gtest_main)

@@ -218,22 +218,44 @@ Single runs, different learning-rate schedules and regularisation between the tw
 from 0.12 at 6.1M). What it shows: the recurrent path trains stably on real data, and
 `gyre-infer` reproduces the trainer's held-out loss to four decimals on that data.
 
-## Measured: training throughput (`gyre-bench-rl`)
+## Measured: training throughput (`gyre-bench-rl`, `gyre-bench-ops`)
 
 One decision = one set of entities through encoder + GRU + heads; forward + backward + Adam.
-d_model 64, 2 layers, GRU 128, 0.2M params, 32-thread Windows machine, MSVC `/O2`, `f32`:
+d_model 64, 2 layers, GRU 128, 0.2M params, 32-thread Windows machine, MSVC `/O2`, `f32`.
+"before" is the first measurement (naive kernels, fresh allocation per tensor); "after" is the
+current tree.
 
-| entities | train samples/s (feedforward) | acting decisions/s (batch 32) |
-| ---: | ---: | ---: |
-| 32 | ~1150 | ~4900 |
-| 64 | ~490 | ~2200 |
-| 128 | ~210 | ~970 |
+| entities | train samples/s before | after | acting decisions/s before | after |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | ~1150 | ~3300 | ~4900 | ~5800 |
+| 64 | ~490 | ~2500 | ~2200 | ~3750 |
+| 128 | ~210 | ~1150 | ~970 | ~3200 |
 
-At 128 entities the recurrent train step is also ~205 samples/s: a PPO iteration of 100k samples
-x 4 epochs would take ~30 min. Thread scaling is poor (1 thread ~130 samples/s, 8 threads ~205,
-16 threads ~215) because the CPU kernels are plain loops (naive GEMM, element-wise attention,
-per-op allocation). Treat this as the main limiter for CPU-only RL here: use fewer entity slots or
-a smaller encoder, or optimise the kernels, before scaling up PPO.
+At 128 entities a PPO iteration of 100k samples x 4 epochs now takes ~6 min instead of ~30.
+One thread: ~130 -> ~180 samples/s; 8 threads: ~205 -> ~1085 (the old kernels were mostly
+single-threaded and memory-bound, so extra cores did nothing).
+
+What changed:
+
+* **Buffer pool** (`Storage`): buffers >= 1 MiB are recycled instead of freshly page-faulted. This
+  alone was ~3.5 ms per `[B,H,N,N]` tensor. `Tensor::empty` still returns zeroed memory;
+  `Tensor::uninit` skips the zeroing and is used by ops that overwrite their whole output
+  (`add`, `matmul`, `bmm`, `transpose`, `permute`, `gelu`, `softmax`, `layer_norm`, ...).
+* **Fused attention** (`attn_probs`, `attn_probs_backward`): q.k, scale, key mask and softmax in
+  one pass per row instead of transpose + bmm + scale + mask + softmax (four `[B,H,N,N]` tensors),
+  and the backward folds `dy.v`, the softmax Jacobian and the scale into one kernel.
+* **`matmul_tn` / `bmm_tn`**: `A^T B` without materialising the transpose (used by `Linear`
+  weight gradients and the attention backward). Reductions use fixed 256-row blocks, so results
+  do not depend on the thread count (tested).
+* Parallelised and tightened: `gelu_backward` (was serial, ~13 ms), `softmax_last_backward`,
+  `mul_scalar`, `sum_dim` (was a per-element index decode), blocked `transpose_last2`, row-copy
+  `permute`.
+
+No AVX2 is required anywhere: the GEMM is still the plain loop (now ~290 GFLOP/s aggregate on
+this machine once the memory stalls are gone). A register-blocked / runtime-dispatched AVX2
+kernel is the next lever if matmuls become the limiter. The recurrent training loop over many
+short GRU steps (e.g. the Shakespeare example, 128 sequential steps) is overhead-bound and did
+not speed up.
 
 ## Limits / not done
 
