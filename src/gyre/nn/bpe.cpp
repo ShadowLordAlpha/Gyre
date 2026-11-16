@@ -230,8 +230,10 @@ Result<std::pair<std::unique_ptr<BpeModel>, PieceTable>> BpeModel::train(
     if (counts.empty()) break;
     auto best = counts.begin()->first;
     std::int32_t best_n = 0;
+    // Ties go to the smallest pair, so the merges do not depend on the hash map's iteration
+    // order (which differs between standard libraries).
     for (auto& [k, n] : counts)
-      if (n > best_n) {
+      if (n > best_n || (n == best_n && k < best)) {
         best_n = n;
         best = k;
       }
@@ -260,7 +262,7 @@ Result<std::vector<std::pair<std::int32_t, std::int32_t>>> BpeModel::parse_merge
   }
   std::vector<std::pair<std::int32_t, std::int32_t>> m;
   for (auto& row : (*parsed)["merges"]) {
-    if (row.is_array() && row.size() == 2 && row[0].is_number()) {
+    if (row.is_array() && row.size() == 2 && row[0].is_number_integer() && row[1].is_number_integer()) {
       m.emplace_back(row[0].get<std::int32_t>(), row[1].get<std::int32_t>());
     }
   }

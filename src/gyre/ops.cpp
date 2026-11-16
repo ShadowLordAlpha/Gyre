@@ -309,16 +309,44 @@ Result<Tensor> matmul_tn(const Tensor& a, const Tensor& b) {
     return out;
   }
   const std::int64_t nb = (M + BLK - 1) / BLK;
-  std::vector<float> part(static_cast<std::size_t>(nb * K * N), 0.f);
+  const std::int64_t KN = K * N;
+  // Per-block partials cost nb*K*N floats. For a wide output (e.g. a 768 x 50257 LM head) that is
+  // gigabytes, so above this budget split the OUTPUT rows across threads instead: each thread owns
+  // rows [k0,k1) of C and sums over all M in order. No scratch, still thread-count independent.
+  constexpr std::int64_t kMaxPartFloats = std::int64_t{1} << 22;  // 16 MiB of partials
+  if (KN > 0 && nb > kMaxPartFloats / KN) {
+    constexpr std::int64_t KT = 8;  // output rows per task
+    const std::int64_t nt = (K + KT - 1) / KT;
+    const float* A = pa->data();
+    const float* Bp = pb->data();
+    float* C = po->data();
+    init_threads();
+#if defined(GYRE_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (std::int64_t t = 0; t < nt; ++t) {
+      const std::int64_t k0 = t * KT, k1 = std::min(K, k0 + KT);
+      for (std::int64_t m = 0; m < M; ++m) {
+        const float* Bm = Bp + m * N;
+        const float* Am = A + m * K;
+        for (std::int64_t k = k0; k < k1; ++k) {
+          const float av = Am[k];
+          float* Ck = C + k * N;
+          for (std::int64_t j = 0; j < N; ++j) Ck[j] += av * Bm[j];
+        }
+      }
+    }
+    return out;
+  }
+  std::vector<float> part(static_cast<std::size_t>(nb * KN), 0.f);
   init_threads();
 #if defined(GYRE_OPENMP)
 #pragma omp parallel for schedule(static)
 #endif
   for (std::int64_t k = 0; k < nb; ++k) {
     const std::int64_t m0 = k * BLK, m1 = std::min(M, m0 + BLK);
-    gemm_tn_acc(pa->data() + m0 * K, pb->data() + m0 * N, part.data() + k * K * N, m1 - m0, K, N);
+    gemm_tn_acc(pa->data() + m0 * K, pb->data() + m0 * N, part.data() + k * KN, m1 - m0, K, N);
   }
-  const std::int64_t KN = K * N;
 #if defined(GYRE_OPENMP)
 #pragma omp parallel for schedule(static) if (KN > 4096)
 #endif
@@ -690,6 +718,7 @@ Result<Tensor> softmax_last(const Tensor& a) {
 #endif
   auto out = Tensor::uninit(a.shape(), DType::f32, a.device());
   if (!out) return out;
+  if (a.numel() == 0) return out;  // e.g. [4,0]: nothing to normalise, and rows = 0/0 would trap
   auto pa = f32c(a);
   auto po = f32(*out);
   if (!pa || !po) return std::unexpected(make_error(Errc::not_cpu, "host"));
@@ -715,8 +744,8 @@ Result<Tensor> softmax_last(const Tensor& a) {
         if (x == inf) ++ninf;
       }
     }
-    if (nan_row || last <= 0) {
-      const float u = last > 0 ? 1.f / static_cast<float>(last) : 0.f;
+    if (nan_row) {
+      const float u = 1.f / static_cast<float>(last);
       for (std::int64_t i = 0; i < last; ++i) dst[i] = u;
       continue;
     }
@@ -756,6 +785,7 @@ Result<Tensor> layer_norm(const Tensor& x, const Tensor& w, const Tensor& b, flo
 #endif
   auto out = Tensor::uninit(x.shape(), DType::f32, x.device());
   if (!out) return out;
+  if (x.numel() == 0) return out;  // zero rows or zero width: rows = numel / C would divide by 0
   auto px = f32c(x);
   auto pw = f32c(w);
   auto pb = f32c(b);
@@ -803,6 +833,7 @@ Result<Tensor> rms_norm(const Tensor& x, const Tensor& w, float eps) {
 #endif
   auto out = Tensor::empty(x.shape(), DType::f32, x.device());
   if (!out) return out;
+  if (x.numel() == 0) return out;  // zero rows or zero width: rows = numel / C would divide by 0
   auto px = f32c(x);
   auto pw = f32c(w);
   auto po = f32(*out);
@@ -1025,8 +1056,12 @@ Result<Tensor> softmax_last_backward(const Tensor& softmax, const Tensor& d_out)
     return vkops::softmax_last_backward(softmax, d_out);
   }
 #endif
+  if (softmax.rank() < 1 || !std::ranges::equal(softmax.shape(), d_out.shape())) {
+    return std::unexpected(make_error(Errc::invalid_shape, "softmax_last_backward shapes"));
+  }
   auto out = Tensor::uninit(softmax.shape(), DType::f32, softmax.device());
   if (!out) return out;
+  if (softmax.numel() == 0) return out;  // zero width: rows = numel / last would divide by 0
   auto ps = f32c(softmax);
   auto pd = f32c(d_out);
   auto po = f32(*out);
@@ -1175,10 +1210,12 @@ Result<Tensor> layer_norm_backward(const Tensor& x, const Tensor& d_out, const T
   auto pgw = gw.host_span<float>();
   auto pgb = gb.host_span<float>();
   if (!px || !pd || !pw || !pgw || !pgb) return std::unexpected(make_error(Errc::not_cpu, "host"));
+  if (x.rank() < 1) return std::unexpected(make_error(Errc::invalid_shape, "ln backward rank"));
   const auto C = x.shape()[x.rank() - 1];
-  const auto rows = x.numel() / C;
   auto dx = Tensor::empty(x.shape(), DType::f32, x.device());
   if (!dx) return dx;
+  if (x.numel() == 0) return dx;  // zero rows or zero width: rows = numel / C would divide by 0
+  const auto rows = x.numel() / C;
   auto pdx = dx->host_span<float>();
   if (!pdx) return std::unexpected(pdx.error());
   for (std::int64_t r = 0; r < rows; ++r) {
@@ -1260,17 +1297,20 @@ Result<std::int32_t> sample_logit_row(std::span<const float> logits, float tempe
     pr[static_cast<std::size_t>(i)] = std::exp((logits[static_cast<std::size_t>(i)] - maxv) / temperature);
     sum += pr[static_cast<std::size_t>(i)];
   }
+  // Strict `u < acc`: with u == 0 (uniform01 can return exactly 0) a `<=` test would pick a leading
+  // token whose probability underflowed to 0. If rounding leaves u >= the final sum, fall back to the
+  // last token that actually has mass, never to a zero-probability tail token.
   float u = rng->uniform01() * sum;
   float acc = 0;
-  std::int32_t next = V - 1;
+  std::int32_t last_pos = 0;
   for (std::int32_t i = 0; i < V; ++i) {
-    acc += pr[static_cast<std::size_t>(i)];
-    if (u <= acc) {
-      next = i;
-      break;
-    }
+    const float p = pr[static_cast<std::size_t>(i)];
+    if (!(p > 0.f)) continue;
+    last_pos = i;
+    acc += p;
+    if (u < acc) return i;
   }
-  return next;
+  return last_pos;
 }
 
 Result<Tensor> dropout(const Tensor& x, float p, bool train, Rng* rng, std::optional<Tensor>* saved_scale) {

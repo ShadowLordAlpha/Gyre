@@ -42,7 +42,16 @@ void apply_charlm_preset(CharLMOpts& o) {
   o.n_head = c.n_head;
   o.d_model = c.d_model;
   o.d_ff = c.d_ff;
-  if ((o.preset == "tinygpt" || o.preset == "nanogpt") && o.batch == 4) o.batch = 2;
+  // These presets default to batch 2 on CPU. An explicit --batch (batch_set) is kept, even 4.
+  if ((o.preset == "tinygpt" || o.preset == "nanogpt") && !o.batch_set && o.batch == 4) o.batch = 2;
+}
+
+bool is_known_preset(std::string_view n) {
+  return n == "tiny" || n == "medium" || n == "tinygpt" || n == "nanogpt";
+}
+
+bool is_known_tokenizer(std::string_view n) {
+  return n == "bpe" || n == "chars" || n == "bytes" || n == "unigram";
 }
 
 namespace {
@@ -432,8 +441,13 @@ static Result<std::unique_ptr<Tokenizer>> make_tokenizer(const CharLMOpts& opts,
     };
     return Tokenizer::train_unigram(train_text, opts.vocab_size, prog);
   }
-  if (opts.tokenizer == "bytes" || opts.preset == "tinygpt") return Tokenizer::bytes();
+  // tinygpt is byte-level unless the caller explicitly asked for another tokenizer.
+  if (opts.tokenizer == "bytes" || (opts.preset == "tinygpt" && !opts.tokenizer_set)) return Tokenizer::bytes();
   if (opts.tokenizer == "chars") return Tokenizer::chars_from_text(train_text);
+  if (opts.tokenizer != "bpe") {
+    return std::unexpected(make_error(Errc::invalid_shape,
+                                      "unknown tokenizer '" + opts.tokenizer + "' (bpe|chars|bytes|unigram)"));
+  }
   if (log) log("training BPE vocab=" + std::to_string(opts.vocab_size) + " …");
   auto prog = [&](int d, int t) {
     if (log) log(progress_bar("bpe", static_cast<std::uint64_t>(d), static_cast<std::uint64_t>(t)));
@@ -813,9 +827,50 @@ Result<EvalReport> run_charlm_eval(const CharLMOpts& opts_in, double split, LogF
     if (log && n_win % 4 == 0)
       log(progress_bar("eval", static_cast<std::uint64_t>(start + T), static_cast<std::uint64_t>(n)));
   }
+  // Full windows score targets ids[1 .. n_win*T]. Score the remaining tail (< T targets) with one
+  // final window flush with the end, counting only the targets not scored yet, so every token
+  // except the first (no context) is predicted exactly once.
+  const std::int64_t scored = static_cast<std::int64_t>(n_win) * T;
+  if (scored < n - 1) {
+    const std::int64_t start = n - 1 - T;  // >= 0 because n >= T + 1
+    std::int64_t xsh[2] = {1, T};
+    std::vector<std::byte> xb(static_cast<std::size_t>(T) * 4);
+    std::memcpy(xb.data(), ids->data() + start, static_cast<std::size_t>(T) * 4);
+    auto x = Tensor::from_host(xb, xsh, DType::i32, *dev);
+    if (!x) return std::unexpected(x.error());
+    ForwardCtx ctx;
+    ctx.train = false;
+    auto logits = model->forward(*x, ctx);
+    if (!logits) return std::unexpected(logits.error());
+    auto raw = logits->to_host_vec();
+    if (!raw) return std::unexpected(raw.error());
+    const std::int64_t V = cfg.vocab;
+    if (static_cast<std::int64_t>(raw->size()) != T * V * 4)
+      return std::unexpected(make_error(Errc::invalid_shape, "eval tail: unexpected logits size"));
+    std::vector<float> lg(static_cast<std::size_t>(T * V));
+    std::memcpy(lg.data(), raw->data(), raw->size());
+    // row r predicts ids[start + r + 1]; skip rows whose target a full window already scored.
+    for (std::int64_t rr = scored - start; rr < T; ++rr) {
+      const float* row = lg.data() + rr * V;
+      float mx = row[0];
+      for (std::int64_t v = 1; v < V; ++v) mx = std::max(mx, row[v]);
+      double z = 0;
+      for (std::int64_t v = 0; v < V; ++v) z += std::exp(static_cast<double>(row[v] - mx));
+      const auto yv = (*ids)[static_cast<std::size_t>(start + rr + 1)];
+      nll += std::log(z) - static_cast<double>(row[yv] - mx);
+      ++n_pred;
+    }
+    ++n_win;
+  }
+  // Denominator = bytes of the scored tokens (every token but the first), not all of val.
+  std::uint64_t scored_chars = val.size();
+  if (n > 1) {
+    const auto d = tok->decode(std::span<const std::int32_t>(ids->data() + 1, static_cast<std::size_t>(n - 1)));
+    if (!d.empty()) scored_chars = d.size();
+  }
   EvalReport r;
   r.n_pred = n_pred;
-  r.n_chars = val.size();
+  r.n_chars = scored_chars;
   r.n_windows = n_win;
   r.vocab = cfg.vocab;
   r.block = T;

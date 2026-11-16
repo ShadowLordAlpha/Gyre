@@ -284,26 +284,30 @@ T run(const std::vector<Node>& nodes, std::map<std::string, T> env) {
   return env.at("logits");
 }
 
-void check_parity(bool alibi) {
+void check_parity(bool alibi, int n_layer = 2, bool scale = true) {
   auto cpu = *gyre::Device::cpu();
   gyre::CharLMConfig c;
   c.vocab = 11;
   c.block_size = 8;
-  c.n_layer = 2;
+  c.n_layer = n_layer;
   c.n_head = 2;
-  c.d_model = 16;
-  c.d_ff = 32;
+  c.d_model = n_layer > 2 ? 8 : 16;
+  c.d_ff = n_layer > 2 ? 16 : 32;
   c.recency_alibi = alibi;
   gyre::Rng rng(9);
   auto m = gyre::CharLM::create(c, cpu, rng);
   ASSERT_TRUE(m) << m.error().message;
   // Larger weights push fc1 into the range where GELU and x*tanh(x) differ a lot.
-  for (auto& p : m->parameters()) {
-    auto s = p.value.host_span<float>();
-    ASSERT_TRUE(s);
-    if (p.value.rank() >= 2) for (auto& v : *s) v *= 10.f;
+  if (scale) {
+    for (auto& p : m->parameters()) {
+      auto s = p.value.host_span<float>();
+      ASSERT_TRUE(s);
+      if (p.value.rank() >= 2) for (auto& v : *s) v *= 10.f;
+    }
   }
-  auto path = std::filesystem::temp_directory_path() / (alibi ? "gyre-parity-alibi.onnx" : "gyre-parity.onnx");
+  auto path = std::filesystem::temp_directory_path() /
+              ((alibi ? std::string("gyre-parity-alibi") : std::string("gyre-parity")) +
+               (n_layer != 2 ? "-L" + std::to_string(n_layer) : std::string()) + ".onnx");
   auto ex = gyre::export_charlm_onnx(*m, path);
   ASSERT_TRUE(ex) << ex.error().message;
 
@@ -376,3 +380,8 @@ void check_parity(bool alibi) {
 TEST(OnnxExport, MatchesCharLMNoRecency) { check_parity(false); }
 
 TEST(OnnxExport, MatchesCharLMAlibi) { check_parity(true); }
+
+// ~80 pooled names per layer: 60 layers pushes the exporter's name pool past
+// 4096 entries. With a reserved vector<string> that reallocated and left the
+// earlier string_views (SSO names like "tokens", "h") dangling.
+TEST(OnnxExport, DeepModelNamesStayValid) { check_parity(false, 60, false); }

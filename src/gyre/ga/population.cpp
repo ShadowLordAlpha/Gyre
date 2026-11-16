@@ -2,6 +2,9 @@
 #include "gyre/ops.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
+#include <string>
 #include <vector>
 
 namespace gyre::ga {
@@ -66,18 +69,45 @@ Result<void> evaluate(Population& pop, FitnessPtr fitness) {
 
 namespace {
 
-std::uint32_t tournament(const Population& pop, const Config& cfg, Rng& rng) {
-  auto f = pop.fitness.host_span<float>();
+// NaN fitness (a 0/0 in a user callback) ranks below every real value. A raw
+// `a > b` with NaN breaks std::sort's strict weak ordering (undefined behaviour).
+float rank_key(float v) noexcept {
+  return std::isnan(v) ? -std::numeric_limits<float>::infinity() : v;
+}
+
+std::uint32_t tournament(std::span<const float> f, const Config& cfg, Rng& rng) {
   std::uint32_t best = rng.u32(cfg.n);
-  float bf = (*f)[best];
+  float bf = rank_key(f[best]);
   for (std::uint32_t t = 1; t < cfg.tournament_k; ++t) {
     auto i = rng.u32(cfg.n);
-    if ((*f)[i] > bf) {
-      bf = (*f)[i];
+    if (rank_key(f[i]) > bf) {
+      bf = rank_key(f[i]);
       best = i;
     }
   }
   return best;
+}
+
+// step() indexes genes/fitness with cfg.n and cfg.dim, so they must describe
+// this population exactly (a reconfigured or resumed run could pass another cfg).
+Result<void> check_matches(const Population& pop, const Config& cfg) {
+  if (cfg.n == 0 || cfg.dim == 0) {
+    return std::unexpected(make_error(Errc::invalid_shape, "ga: n and dim must be > 0"));
+  }
+  const auto want_dt = cfg.gene == GeneDType::u8 ? DType::u8 : DType::f32;
+  const auto gs = pop.genes.shape();
+  const auto fs = pop.fitness.shape();
+  if (pop.genes.rank() != 2 || gs[0] != static_cast<std::int64_t>(cfg.n) ||
+      gs[1] != static_cast<std::int64_t>(cfg.dim) || pop.genes.dtype() != want_dt) {
+    return std::unexpected(make_error(
+        Errc::invalid_shape, "ga: population genes do not match cfg (n=" + std::to_string(cfg.n) +
+                                 ", dim=" + std::to_string(cfg.dim) + ", gene dtype)"));
+  }
+  if (pop.fitness.rank() != 1 || fs[0] != static_cast<std::int64_t>(cfg.n) ||
+      pop.fitness.dtype() != DType::f32) {
+    return std::unexpected(make_error(Errc::invalid_shape, "ga: fitness must be f32 [n]"));
+  }
+  return {};
 }
 
 }  // namespace
@@ -86,6 +116,7 @@ Result<Population> step(const Population& pop, const Config& cfg, Rng& rng) {
   if (cfg.elite >= cfg.n) {
     return std::unexpected(make_error(Errc::invalid_shape, "elite >= n"));
   }
+  if (auto ok = check_matches(pop, cfg); !ok) return std::unexpected(ok.error());
   auto next = pop.genes.clone();
   auto nfit = pop.fitness.clone();
   if (!next || !nfit) return std::unexpected(next ? nfit.error() : next.error());
@@ -96,7 +127,9 @@ Result<Population> step(const Population& pop, const Config& cfg, Rng& rng) {
   for (std::uint32_t i = 0; i < N; ++i) order[i] = i;
   auto f = pop.fitness.host_span<float>();
   if (!f) return std::unexpected(f.error());
-  std::sort(order.begin(), order.end(), [&](auto a, auto b) { return (*f)[a] > (*f)[b]; });
+  const std::span<const float> fit(*f);
+  std::sort(order.begin(), order.end(),
+            [&](auto a, auto b) { return rank_key(fit[a]) > rank_key(fit[b]); });
 
   if (pop.genes.dtype() == DType::u8) {
     auto src = pop.genes.host_span<std::uint8_t>();
@@ -110,8 +143,8 @@ Result<Population> step(const Population& pop, const Config& cfg, Rng& rng) {
                             ? cfg.mutation_sigma
                             : 1.f / static_cast<float>(D);
     for (std::uint32_t i = cfg.elite; i < N; ++i) {
-      auto p0 = tournament(pop, cfg, rng);
-      auto p1 = tournament(pop, cfg, rng);
+      auto p0 = tournament(fit, cfg, rng);
+      auto p1 = tournament(fit, cfg, rng);
       if (rng.uniform01() < cfg.crossover_p) {
         for (std::uint32_t d = 0; d < D; ++d) {
           auto from = rng.uniform01() < 0.5f ? p0 : p1;
@@ -133,8 +166,8 @@ Result<Population> step(const Population& pop, const Config& cfg, Rng& rng) {
       std::copy(src->begin() + row * D, src->begin() + (row + 1) * D, dst->begin() + e * D);
     }
     for (std::uint32_t i = cfg.elite; i < N; ++i) {
-      auto p0 = tournament(pop, cfg, rng);
-      auto p1 = tournament(pop, cfg, rng);
+      auto p0 = tournament(fit, cfg, rng);
+      auto p1 = tournament(fit, cfg, rng);
       if (rng.uniform01() < cfg.crossover_p) {
         for (std::uint32_t d = 0; d < D; ++d)
           (*dst)[i * D + d] = 0.5f * ((*src)[p0 * D + d] + (*src)[p1 * D + d]);

@@ -269,6 +269,31 @@ TEST(Wpack, LoadRejectsTruncatedAndHostileFiles) {
   EXPECT_FALSE(write(b));  // payload length wraps i + plen
 }
 
+// Regression: wpack_load accepted any raw_bytes, which then capped (and sized) what wpack_decode
+// allocates; it must equal dtype * shape.
+TEST(Wpack, LoadRejectsRawBytesThatDisagreeWithShape) {
+  std::vector<std::uint16_t> w(64, 0x3F80);
+  auto raw = std::as_bytes(std::span(w.data(), w.size()));
+  std::int64_t wrong[] = {32};  // 64 bytes of bf16, but 128 raw bytes
+  auto enc = gyre::wpack_encode("t", gyre::DType::bf16, wrong, raw);
+  ASSERT_TRUE(enc);
+  gyre::WpackFile f;
+  f.source = "unit";
+  f.tensors.push_back(std::move(*enc));
+  const auto dir = std::filesystem::temp_directory_path() / "gyre_wpack_shape";
+  const auto path = dir / "t.gyre.wpack";
+  ASSERT_TRUE(gyre::wpack_save(path, f));
+  EXPECT_FALSE(std::filesystem::exists(dir / "t.gyre.wpack.tmp"));
+  EXPECT_FALSE(gyre::wpack_load(path));
+  f.tensors[0].shape = {64};
+  ASSERT_TRUE(gyre::wpack_save(path, f));
+  auto g = gyre::wpack_load(path);
+  ASSERT_TRUE(g) << g.error().message;
+  auto dec = gyre::wpack_decode(g->tensors[0]);
+  ASSERT_TRUE(dec);
+  EXPECT_EQ(std::memcmp(dec->data(), raw.data(), raw.size()), 0);
+}
+
 TEST(Wpack, MiniGrokStillRuns) {
   auto d = gyre::Device::cpu();
   gyre::Rng rng(2);

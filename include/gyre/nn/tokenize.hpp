@@ -18,6 +18,10 @@ namespace gyre {
 // Tokenizer = Pretokenizer + VocabModel + PieceTable. Encode is non-virtual:
 // split the whole string once, then encode_span per span. See docs/tokenizer.md.
 
+// Largest token id + 1 a tokenizer file may declare. Ids from a file size the piece table, so an
+// unchecked id is an allocation bomb; real vocabularies stay far below this (Grok-2: 131072).
+inline constexpr std::int64_t kMaxTokenizerVocab = std::int64_t{1} << 22;
+
 struct PieceTable {
   std::vector<std::string> pieces;
   // If nonempty, encode maps each input byte through this table. Empty = 1:1 byte id
@@ -37,6 +41,9 @@ class Pretokenizer {
   virtual Result<void> split(std::string_view text, std::string& scratch,
                              std::vector<std::string_view>& spans) const = 0;
   virtual std::string to_json() const;
+  // Undoes the text mapping `split` applies (Metaspace: U+2581 back to spaces, minus the dummy
+  // prefix). Tokenizer::decode runs it on the concatenated pieces; identity for the others.
+  virtual void decode(std::string& text) const { (void)text; }
 };
 
 class VocabModel {

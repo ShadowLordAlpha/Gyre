@@ -38,6 +38,22 @@ class MetaspacePretok final : public Pretokenizer {
     if (!scratch.empty()) spans.emplace_back(scratch);
     return {};
   }
+  // Hugging Face Metaspace decoder: every U+2581 becomes a space, and the space the dummy prefix
+  // put in front of the text is dropped again.
+  void decode(std::string& text) const override {
+    std::string o;
+    o.reserve(text.size());
+    for (std::size_t i = 0; i < text.size();) {
+      if (text.compare(i, 3, "\xe2\x96\x81") == 0) {
+        o.push_back(' ');
+        i += 3;
+      } else {
+        o.push_back(text[i++]);
+      }
+    }
+    if (dummy_ && !o.empty() && o.front() == ' ' && text.compare(0, 3, "\xe2\x96\x81") == 0) o.erase(0, 1);
+    text = std::move(o);
+  }
 
  private:
   bool dummy_{true};

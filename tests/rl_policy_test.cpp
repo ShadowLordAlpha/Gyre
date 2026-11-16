@@ -3,12 +3,17 @@
 #include "gyre/ops.hpp"
 #include "gyre/optim.hpp"
 #include "gyre/rl/losses.hpp"
+#include "gyre/checkpoint.hpp"
 #include "gyre/rl/policy.hpp"
+#include "gyre/rl/policy_io.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <string>
 
 using namespace gyre;
 using namespace gyre::testing;
@@ -164,6 +169,128 @@ TEST(Heads, Errors) {
   EXPECT_FALSE(HeadLayout::make({}));
   EXPECT_FALSE(HeadLayout::make({2, 0}));
   EXPECT_FALSE(head_dist(rand_t({1, 4}, rng), L, m));  // wrong logit width
+}
+
+namespace {
+PolicyConfig small_policy_cfg() {
+  PolicyConfig c;
+  c.encoder.feat_dim = 3;
+  c.encoder.global_dim = 2;
+  c.encoder.max_entities = 4;
+  c.encoder.d_model = 8;
+  c.encoder.n_layer = 1;
+  c.encoder.n_head = 2;
+  c.encoder.d_ff = 16;
+  c.encoder.out_dim = 6;
+  c.head_sizes = {3, 2};
+  return c;
+}
+std::filesystem::path rl_tmp(const char* name) {
+  return std::filesystem::temp_directory_path() / (std::string("gyre-rlpol-") + name);
+}
+}  // namespace
+
+// n_layer=0 skips SetBlock's n_head/d_ff checks, so training accepts configs that
+// gyre-infer rejects with "invalid config". The exporter must refuse them.
+TEST(PolicyIo, ExportRejectsConfigsGyreInferCannotLoad) {
+  auto d = Device::cpu();
+  for (int mut = 0; mut < 4; ++mut) {
+    auto c = small_policy_cfg();
+    c.encoder.n_layer = 0;
+    if (mut == 0) c.encoder.n_head = 0;
+    if (mut == 1) c.encoder.d_ff = 0;
+    if (mut == 2) c.encoder.max_entities = 0;
+    if (mut == 3) c.encoder.n_head = 3;  // d_model 8 % 3 != 0
+    Rng rng(50 + mut);
+    auto net = PolicyNet::create(c, *d, rng);
+    ASSERT_TRUE(net) << "training accepts mutation " << mut << ": " << net.error().message;
+    auto r = export_policy_flat(rl_tmp("bad.gpol"), *net);
+    ASSERT_FALSE(r) << "exported a GPOL1 file gyre-infer refuses (mutation " << mut << ")";
+    EXPECT_EQ(r.error().code, Errc::unsupported);
+  }
+  auto c = small_policy_cfg();
+  c.encoder.n_layer = 0;  // valid n_layer=0 net still exports
+  Rng rng(60);
+  auto net = PolicyNet::create(c, *d, rng);
+  ASSERT_TRUE(net);
+  EXPECT_TRUE(export_policy_flat(rl_tmp("ok0.gpol"), *net));
+}
+
+TEST(PolicyIo, ExportDirectoryErrorIsAResultNotAThrow) {
+  auto d = Device::cpu();
+  Rng rng(61);
+  auto net = PolicyNet::create(small_policy_cfg(), *d, rng);
+  ASSERT_TRUE(net);
+  const auto file = rl_tmp("plain-file");
+  { std::ofstream(file) << "x"; }
+  Result<void> r;
+  EXPECT_NO_THROW(r = export_policy_flat(file / "sub" / "p.gpol", *net));
+  ASSERT_FALSE(r);
+  EXPECT_EQ(r.error().code, Errc::io);
+  std::filesystem::remove(file);
+}
+
+TEST(PolicyIo, LoadRejectsDimsThatDisagreeWithStoredWeights) {
+  auto d = Device::cpu();
+  Rng rng(62);
+  auto net = PolicyNet::create(small_policy_cfg(), *d, rng);
+  ASSERT_TRUE(net);
+  const auto good = rl_tmp("good.gyre");
+  ASSERT_TRUE(save_policy(good, *net));
+  ASSERT_TRUE(load_policy(good, *d));
+  // Same small weights, but a config claiming d_ff = 2^30 (would be terabytes).
+  GyreDoc doc;
+  doc.arch = "policy-net";
+  doc.config_json =
+      R"({"feat_dim":3,"global_dim":2,"max_entities":4,"d_model":8,"n_layer":1,"n_head":2,)"
+      R"("d_ff":1073741824,"out_dim":6,"gru_hidden":0,"head_sizes":[3,2]})";
+  const auto bad = rl_tmp("bad-dims.gyre");
+  ASSERT_TRUE(save_gyre(bad, net->parameters(), nullptr, doc));
+  Result<PolicyNet> back = std::unexpected(Error{});
+  EXPECT_NO_THROW(back = load_policy(bad, *d));
+  ASSERT_FALSE(back);
+  EXPECT_EQ(back.error().code, Errc::ckpt_corrupt);
+  doc.config_json =
+      R"({"feat_dim":3,"global_dim":2,"max_entities":4,"d_model":-8,"n_layer":1,"n_head":2,)"
+      R"("d_ff":16,"out_dim":6,"gru_hidden":0,"head_sizes":[3,2]})";
+  ASSERT_TRUE(save_gyre(bad, net->parameters(), nullptr, doc));
+  EXPECT_FALSE(load_policy(bad, *d));
+  std::filesystem::remove(good);
+  std::filesystem::remove(bad);
+}
+
+// A HeadDist from another minibatch (B=1) used with B=4 masks used to be read
+// past its end; prob/logp must match the masks' [B,total].
+TEST(Heads, DistShapeMustMatchMasks) {
+  Fixture f;
+  Rng rng(41);
+  auto L = f.L;
+  HeadMasks small{mk_u8({1, 9}, {1, 1, 1, 1, 1, 1, 1, 1, 1}), mk_u8({1, 3}, {1, 1, 1})};
+  auto d1 = head_dist(rand_t({1, 9}, rng), L, small);
+  ASSERT_TRUE(d1);
+  auto dl = make_t({4}, {1.f, 1.f, 1.f, 1.f});
+  auto expect_shape_err = [](const auto& r, const char* what) {
+    ASSERT_FALSE(r) << what;
+    EXPECT_EQ(r.error().code, Errc::invalid_shape) << what;
+  };
+  expect_shape_err(sample_actions(*d1, L, f.m, &rng), "sample_actions");
+  expect_shape_err(sample_actions(*d1, L, f.m, nullptr, true), "sample_actions greedy");
+  expect_shape_err(log_prob(*d1, L, f.m, f.actions), "log_prob");
+  expect_shape_err(entropy(*d1, L, f.m), "entropy");
+  expect_shape_err(log_prob_entropy_backward(*d1, L, f.m, f.actions, dl, dl), "backward");
+
+  // logp and prob that disagree with each other (one right, one wrong).
+  auto d4 = head_dist(rand_t({4, 9}, rng), L, f.m);
+  ASSERT_TRUE(d4);
+  HeadDist mixed{d4->logp, d1->prob};
+  expect_shape_err(entropy(mixed, L, f.m), "entropy mixed");
+  expect_shape_err(log_prob_entropy_backward(mixed, L, f.m, f.actions, dl, dl), "backward mixed");
+  EXPECT_TRUE(log_prob(mixed, L, f.m, f.actions));  // only reads logp
+
+  // dlogp/dent must be f32.
+  auto di = mk_i32({4}, {1, 1, 1, 1});
+  expect_shape_err(log_prob_entropy_backward(*d4, L, f.m, f.actions, di, dl), "dlogp i32");
+  EXPECT_TRUE(log_prob_entropy_backward(*d4, L, f.m, f.actions, dl, dl));
 }
 
 TEST(Ppo, GradCheckLogitsAndValue) {

@@ -53,20 +53,25 @@ uint32_t VulkanDevice::memory_index(uint32_t type_bits, VkMemoryPropertyFlags fl
 
 Result<void> VulkanDevice::make_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
                                        VkMemoryPropertyFlags props, VkBuffer& buf,
-                                       VkDeviceMemory& mem_out, void** mapped) {
+                                       VkDeviceMemory& mem_out, void** mapped, VkResult* status) {
+  if (status) *status = VK_SUCCESS;
   if (size < 16) size = 16;
   VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   bi.size = size;
   bi.usage = usage;
   bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   VkResult r = vkCreateBuffer(device, &bi, nullptr, &buf);
-  if (r != VK_SUCCESS) return std::unexpected(vkerr(r, "vkCreateBuffer"));
+  if (r != VK_SUCCESS) {
+    if (status) *status = r;
+    return std::unexpected(vkerr(r, "vkCreateBuffer"));
+  }
   VkMemoryRequirements req{};
   vkGetBufferMemoryRequirements(device, buf, &req);
   uint32_t mi = memory_index(req.memoryTypeBits, props);
   if (mi == UINT32_MAX) {
     vkDestroyBuffer(device, buf, nullptr);
     buf = VK_NULL_HANDLE;
+    if (status) *status = VK_ERROR_FEATURE_NOT_PRESENT;
     return std::unexpected(make_error(Errc::unsupported, "no matching Vulkan memory type"));
   }
   VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -76,6 +81,7 @@ Result<void> VulkanDevice::make_buffer(VkDeviceSize size, VkBufferUsageFlags usa
   if (r != VK_SUCCESS) {
     vkDestroyBuffer(device, buf, nullptr);
     buf = VK_NULL_HANDLE;
+    if (status) *status = r;
     return std::unexpected(vkerr(r, "vkAllocateMemory"));
   }
   r = vkBindBufferMemory(device, buf, mem_out, 0);
@@ -314,6 +320,11 @@ Result<void> VulkanDevice::init() {
   if (r != VK_SUCCESS) return std::unexpected(vkerr(r, "vkCreateDevice"));
   vkGetDeviceQueue(device, qfamily, 0, &queue);
   vkGetPhysicalDeviceMemoryProperties(phys, &mem);
+  {
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(phys, &props);
+    limits = props.limits;
+  }
 
   VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   cpi.queueFamilyIndex = qfamily;
@@ -436,18 +447,34 @@ Result<std::shared_ptr<Storage>> VulkanDevice::alloc(std::size_t bytes) {
       }
     }
   }
-  auto r = make_buffer(n,
-                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                           VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, g->buffer, g->memory, nullptr);
-  if (!r) {
-    r = make_buffer(n,
-                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                    g->buffer, g->memory, nullptr);
-    if (!r) return std::unexpected(r.error());
+  constexpr VkBufferUsageFlags kUsage =
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  VkResult vr = VK_SUCCESS;
+  auto r = make_buffer(n, kUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, g->buffer, g->memory, nullptr, &vr);
+  if (!r && (vr == VK_ERROR_OUT_OF_DEVICE_MEMORY || vr == VK_ERROR_OUT_OF_HOST_MEMORY ||
+             vr == VK_ERROR_TOO_MANY_OBJECTS)) {
+    // VRAM or the driver's allocation-count cap (maxMemoryAllocationCount) is
+    // exhausted. Pooled buffers (up to kMaxPooled) and the graveyard still hold
+    // memory: submit pending work, free them all, then retry device-local once.
+    (void)flush();
+    drain_pool();
+    r = make_buffer(n, kUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, g->buffer, g->memory, nullptr, &vr);
+    if (!r) {
+      return std::unexpected(make_error(
+          Errc::unsupported, "Vulkan device memory exhausted allocating " + std::to_string(n) +
+                                 " bytes (vk=" + std::to_string(static_cast<int>(vr)) +
+                                 "); lower --batch or the model size"));
+    }
   }
+  if (!r && vr == VK_ERROR_FEATURE_NOT_PRESENT) {
+    // No DEVICE_LOCAL memory type for storage buffers at all (some software or
+    // unusual drivers). Host-visible memory is then the only memory there is. An
+    // out-of-VRAM failure never lands here: on a discrete GPU that would silently
+    // move training to system RAM over PCIe.
+    r = make_buffer(n, kUsage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                    g->buffer, g->memory, nullptr);
+  }
+  if (!r) return std::unexpected(r.error());
   g->nbytes = n;
   st->gpu = std::move(g);
   return st;
@@ -517,16 +544,28 @@ Result<void> VulkanDevice::copy(Storage& dst, std::size_t dst_off, const Storage
 Result<void> VulkanDevice::fill_zero(Storage& st, std::size_t offset, std::size_t n) {
   auto* g = gpu(st);
   if (!g) return std::unexpected(make_error(Errc::unsupported, "not a Vulkan buffer"));
-  std::size_t aligned = n & ~std::size_t{3};
-  std::size_t off = offset & ~std::size_t{3};
-  if (aligned == 0) {
-    std::vector<std::byte> z(n);
-    return upload(st, offset, z);
+  if (n == 0) return {};
+  // vkCmdFillBuffer needs a 4-byte aligned offset and size. Zero exactly
+  // [offset, offset+n): the unaligned head and tail (u8 tensors, odd sizes)
+  // go through a small upload of zeros, never touching neighbouring bytes.
+  const std::size_t end = offset + n;
+  const std::size_t a0 = std::min(end, (offset + 3) & ~std::size_t{3});
+  const std::size_t a1 = std::max(a0, end & ~std::size_t{3});
+  if (a1 > a0) {
+    auto room = ensure_room();
+    if (!room) return room;
+    vkCmdFillBuffer(cmd, g->buffer, a0, a1 - a0, 0);
+    memory_barrier(cmd);
   }
-  auto room = ensure_room();
-  if (!room) return room;
-  vkCmdFillBuffer(cmd, g->buffer, off, aligned, 0);
-  memory_barrier(cmd);
+  static constexpr std::byte kZeros[4]{};
+  if (a0 > offset) {
+    auto u = upload(st, offset, std::span<const std::byte>(kZeros, a0 - offset));
+    if (!u) return u;
+  }
+  if (end > a1) {
+    auto u = upload(st, a1, std::span<const std::byte>(kZeros, end - a1));
+    if (!u) return u;
+  }
   return {};
 }
 
@@ -535,6 +574,35 @@ Result<void> VulkanDevice::dispatch(Pipe p, const std::array<Bind, 7>& binds, st
   if (gx == 0) gx = 1;
   if (gy == 0) gy = 1;
   if (gz == 0) gz = 1;
+  // Out-of-limit dispatches and binds are validation errors / undefined behaviour
+  // (devices only guarantee 65535 groups per dimension and a 128 MiB storage
+  // range); fail loudly instead of computing on garbage.
+  if (gx > limits.maxComputeWorkGroupCount[0] || gy > limits.maxComputeWorkGroupCount[1] ||
+      gz > limits.maxComputeWorkGroupCount[2]) {
+    return std::unexpected(make_error(
+        Errc::unsupported, "Vulkan dispatch of " + std::to_string(gx) + "x" + std::to_string(gy) + "x" +
+                               std::to_string(gz) + " workgroups exceeds the device limit " +
+                               std::to_string(limits.maxComputeWorkGroupCount[0]) + "x" +
+                               std::to_string(limits.maxComputeWorkGroupCount[1]) + "x" +
+                               std::to_string(limits.maxComputeWorkGroupCount[2]) + "; lower --batch"));
+  }
+  for (const auto& bd : binds) {
+    if (!bd.t || !bd.t->storage() || !bd.t->storage()->gpu) continue;
+    const auto* g = gpu(*bd.t->storage());
+    const VkDeviceSize off = bd.t->byte_offset();
+    const VkDeviceSize range = std::max<VkDeviceSize>(bd.t->nbytes(), 4);
+    const VkDeviceSize align = std::max<VkDeviceSize>(limits.minStorageBufferOffsetAlignment, 1);
+    if (off % align != 0)
+      return std::unexpected(make_error(Errc::unsupported, "Vulkan bind offset " + std::to_string(off) +
+                                                               " is not a multiple of minStorageBufferOffsetAlignment " +
+                                                               std::to_string(align)));
+    if (range > limits.maxStorageBufferRange)
+      return std::unexpected(make_error(
+          Errc::unsupported, "Vulkan tensor of " + std::to_string(range) + " bytes exceeds maxStorageBufferRange " +
+                                 std::to_string(limits.maxStorageBufferRange) + "; lower --batch"));
+    if (off > g->nbytes || range > g->nbytes - off)
+      return std::unexpected(make_error(Errc::invalid_shape, "Vulkan bind range is outside its buffer"));
+  }
   auto room = ensure_room(1);
   if (!room) return room;
   if (desc_index_ >= desc_sets_.size()) {

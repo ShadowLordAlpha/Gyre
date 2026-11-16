@@ -1,3 +1,4 @@
+#include "gyre/checkpoint.hpp"
 #include "gyre/module.hpp"
 #include "gyre/nn/transformer.hpp"
 #include "gyre/optim.hpp"
@@ -90,6 +91,108 @@ TEST(CharLMLora, ZeroBMatchesBaseThenTrainChanges) {
   auto s = params[0].value.host_span<float>();
   ASSERT_TRUE(s);
   for (std::size_t i = 0; i < w0.size(); ++i) EXPECT_EQ((*s)[i], w0[i]);
+}
+
+namespace {
+
+auto logits_vec(gyre::CharLM& m, const gyre::Tensor& x) -> std::vector<float> {
+  gyre::ForwardCtx ctx;
+  ctx.train = false;
+  auto y = m.forward(x, ctx);
+  if (!y) return {};
+  auto p = y->host_span<float>();
+  return std::vector<float>(p->begin(), p->end());
+}
+
+// A LoRA whose layer `bad_layer` has an fc2.A of the wrong shape (fails on attach).
+auto broken_lora(const gyre::CharLMConfig& cfg, std::size_t bad_layer, const std::shared_ptr<gyre::Device>& d)
+    -> gyre::CharLora {
+  gyre::Rng r(77);
+  auto l = gyre::CharLora::create(cfg, 2, 4.f, d, r);
+  std::int64_t sh[] = {cfg.d_ff + 1, 2};
+  l->layers[bad_layer].fc2.A = *gyre::Tensor::zeros(sh, gyre::DType::f32, d);
+  for (auto& layer : l->layers) {  // non-zero B so an attached adapter changes the logits
+    auto b = layer.q.B.host_span<float>();
+    for (auto& v : *b) v = 0.3f;
+  }
+  return std::move(*l);
+}
+
+}  // namespace
+
+// A failing set_lora must not leave earlier blocks carrying an adapter that lora_parameters(),
+// zero_grad and save_lora cannot see; a previously attached adapter stays in place.
+TEST(CharLMLora, FailedSetLoraKeepsPreviousAdapter) {
+  auto d = gyre::Device::cpu();
+  ASSERT_TRUE(d);
+  gyre::Rng rng(12);
+  auto cfg = tiny_cfg();
+  cfg.n_layer = 2;
+  auto m = gyre::CharLM::create(cfg, *d, rng);
+  ASSERT_TRUE(m);
+  auto x = idx_tensor(*d);
+  const auto base = logits_vec(*m, x);
+
+  // No previous adapter: failure leaves the model exactly at base.
+  auto r0 = m->set_lora(broken_lora(cfg, 1, *d));
+  EXPECT_FALSE(r0);
+  EXPECT_EQ(m->lora(), nullptr);
+  EXPECT_TRUE(m->lora_parameters().empty());
+  EXPECT_EQ(logits_vec(*m, x), base);
+
+  // With a working adapter attached, a failed replacement keeps it.
+  gyre::Rng lrng(13);
+  auto good = gyre::CharLora::create(cfg, 2, 4.f, *d, lrng);
+  ASSERT_TRUE(good);
+  for (auto& layer : good->layers) {
+    auto b = layer.fc1.B.host_span<float>();
+    for (auto& v : *b) v = 0.2f;
+  }
+  ASSERT_TRUE(m->set_lora(std::move(*good)));
+  const auto with_good = logits_vec(*m, x);
+  ASSERT_NE(with_good, base);
+  const auto n_lora = m->lora_parameters().size();
+  ASSERT_EQ(n_lora, 24u);
+
+  auto r1 = m->set_lora(broken_lora(cfg, 1, *d));
+  EXPECT_FALSE(r1);
+  ASSERT_NE(m->lora(), nullptr);
+  EXPECT_EQ(m->lora()->rank, 2);
+  EXPECT_EQ(m->lora_parameters().size(), n_lora);
+  EXPECT_EQ(logits_vec(*m, x), with_good);
+}
+
+TEST(CharLMLora, CreateRejectsZeroHeads) {
+  auto d = gyre::Device::cpu();
+  gyre::Rng rng(1);
+  auto cfg = tiny_cfg();
+  cfg.n_head = 0;  // used to be d_model % 0
+  auto m = gyre::CharLM::create(cfg, *d, rng);
+  ASSERT_FALSE(m);
+  EXPECT_EQ(m.error().code, gyre::Errc::invalid_shape);
+  cfg.n_head = -2;
+  EXPECT_FALSE(gyre::CharLM::create(cfg, *d, rng));
+}
+
+// Typed JSON access on a hand-edited LoRA file must come back as an error, not an exception.
+TEST(CharLMLora, LoadLoraBadConfigIsError) {
+  auto d = gyre::Device::cpu();
+  gyre::Rng rng(2);
+  auto cfg = tiny_cfg();
+  auto m = gyre::CharLM::create(cfg, *d, rng);
+  ASSERT_TRUE(m);
+  const auto path = std::filesystem::temp_directory_path() / "gyre_charlm_bad.lora";
+  for (const char* js : {R"({"arch":"char-lm-lora","config":{"rank":"2","alpha":4}})",
+                         R"({"arch":"char-lm-lora","config":{"rank":2,"d_model":null}})",
+                         R"({"arch":"char-lm-lora","config":{"rank":1000000000,"alpha":4}})"}) {
+    gyre::CheckpointMeta meta;
+    meta.json = js;
+    ASSERT_TRUE(gyre::save_gyre1(path, std::span<const gyre::Param>{}, nullptr, meta)) << js;
+    gyre::Result<void> r;
+    EXPECT_NO_THROW(r = m->load_lora(path, *d)) << js;
+    EXPECT_FALSE(r) << js;
+  }
+  std::filesystem::remove(path);
 }
 
 TEST(CharLMLora, SaveLoadRoundTrip) {

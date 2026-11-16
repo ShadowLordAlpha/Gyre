@@ -65,6 +65,22 @@ TEST(CompressProbe, JsonSchema) {
   EXPECT_NE(j.find("\"target_ratio\":0.5"), std::string::npos);
 }
 
+// Regression: file and tensor names (from untrusted safetensors headers) were written between
+// quotes unescaped, so a name like x","family":"evil produced invalid JSON or injected fields.
+TEST(CompressProbe, JsonEscapesNames) {
+  std::vector<std::byte> b(16, std::byte{0});
+  auto r = gyre::probe_bytes(b, "a\"b\\c\n\x01");
+  r.name = "x\",\"family\":\"evil";
+  r.file = "f\"\\.safetensors";
+  auto j = gyre::compress_probe_json(std::span<const gyre::CompressProbeRow>(&r, 1));
+  EXPECT_NE(j.find(R"("name":"x\",\"family\":\"evil")"), std::string::npos) << j;
+  EXPECT_NE(j.find(R"("file":"f\"\\.safetensors")"), std::string::npos) << j;
+  EXPECT_EQ(j.find("\"family\":\"evil\""), std::string::npos) << j;
+  r.name = "ctl\n\x01";
+  j = gyre::compress_probe_json(std::span<const gyre::CompressProbeRow>(&r, 1));
+  EXPECT_NE(j.find(R"("name":"ctl\n\u0001")"), std::string::npos) << j;
+}
+
 TEST(CompressProbe, GrokNormIfPresent) {
 #ifdef GYRE_SOURCE_DIR
   auto dir = std::filesystem::path(GYRE_SOURCE_DIR) / "data" / "grok2";

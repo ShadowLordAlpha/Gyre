@@ -1,4 +1,5 @@
 #include "gyre/data.hpp"
+#include "gyre/io/safetensors.hpp"
 #include "gyre/nn/grok.hpp"
 #include "gyre/nn/tokenize.hpp"
 
@@ -192,4 +193,108 @@ TEST(GrokLora, SaveLoad) {
   auto pa = a->host_span<float>();
   auto pb = b->host_span<float>();
   for (std::size_t i = 0; i < pa->size(); ++i) EXPECT_NEAR((*pa)[i], (*pb)[i], 1e-5);
+}
+
+namespace {
+
+void write_text(const std::filesystem::path& p, const std::string& s) {
+  std::ofstream o(p, std::ios::binary);
+  o << s;
+}
+
+}  // namespace
+
+// Loaded adapters must match the model's [in,rank]/[rank,out] slots (an adapter saved for another
+// config used to be accepted as-is), and bad lora.json types are an error, not an exception.
+TEST(GrokLora, LoadRejectsMismatchedShapesAndBadJson) {
+  auto d = gyre::Device::cpu();
+  auto other = gyre::GrokConfig::mini();
+  other.n_kv_head = 2;  // k/v adapters are [rank, 8] instead of [rank, 4]
+  gyre::Rng rng(21);
+  auto src = gyre::GrokLM::create(other, *d, rng);
+  ASSERT_TRUE(src) << src.error().message;
+  gyre::Rng lr(22);
+  auto l = gyre::GrokLora::create(other, 2, 4.f, *d, lr);
+  ASSERT_TRUE(l);
+  ASSERT_TRUE(src->set_lora(std::move(*l)));
+  auto dir = std::filesystem::temp_directory_path() / "gyre_lora_mismatch";
+  std::filesystem::remove_all(dir);
+  ASSERT_TRUE(src->save_lora(dir));
+
+  gyre::Rng rng2(23);
+  auto m = gyre::GrokLM::create(gyre::GrokConfig::mini(), *d, rng2);
+  ASSERT_TRUE(m);
+  auto r = m->load_lora(dir, *d);
+  ASSERT_FALSE(r);
+  EXPECT_EQ(r.error().code, gyre::Errc::invalid_shape);
+
+  for (const char* js : {R"({"rank":"2","alpha":4})", R"({"rank":2,"alpha":"x"})", R"({"rank":100000000})"}) {
+    write_text(dir / "lora.json", js);
+    gyre::Result<void> rr;
+    EXPECT_NO_THROW(rr = m->load_lora(dir, *d)) << js;
+    EXPECT_FALSE(rr) << js;
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// f16 adapters are widened to f32 like base weights (matmul is f32-only).
+TEST(GrokLora, LoadF16AdapterMatchesF32) {
+  auto d = gyre::Device::cpu();
+  const auto c = gyre::GrokConfig::mini();
+  const std::int64_t rank = 2, din = c.d_model, qout = c.n_q_head * c.head_dim,
+                     kout = c.n_kv_head * c.head_dim;
+  auto f16 = [&](std::int64_t r, std::int64_t cc, std::uint16_t bits) {
+    std::vector<std::uint16_t> v(static_cast<std::size_t>(r * cc), bits);
+    std::int64_t sh[] = {r, cc};
+    return *gyre::Tensor::from_host(std::as_bytes(std::span<const std::uint16_t>(v)), sh, gyre::DType::f16, *d);
+  };
+  // 0x3800 = 0.5, 0x3000 = 0.125 (exact in f16 and f32)
+  std::vector<gyre::Tensor> keep;
+  std::vector<std::string> names;
+  auto add = [&](const std::string& kind, std::int64_t in, std::int64_t out) {
+    names.push_back("layers.0." + kind + ".A");
+    keep.push_back(f16(in, rank, 0x3800));
+    names.push_back("layers.0." + kind + ".B");
+    keep.push_back(f16(rank, out, 0x3000));
+  };
+  add("q_proj", din, qout);
+  add("k_proj", din, kout);
+  add("v_proj", din, kout);
+  add("o_proj", qout, din);
+  std::vector<gyre::NamedTensor> nt;
+  for (std::size_t i = 0; i < keep.size(); ++i) nt.push_back({names[i], &keep[i]});
+  auto dir = std::filesystem::temp_directory_path() / "gyre_lora_f16";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  ASSERT_TRUE(gyre::safetensors_save(dir / "lora.safetensors", nt));
+  write_text(dir / "lora.json", R"({"gyre":"lora","base_arch":"grok2","rank":2,"alpha":4})");
+
+  gyre::Rng r1(31), r2(31);
+  auto a = gyre::GrokLM::create(c, *d, r1);
+  auto b = gyre::GrokLM::create(c, *d, r2);
+  ASSERT_TRUE(a && b);
+  auto ld = a->load_lora(dir, *d);
+  ASSERT_TRUE(ld) << ld.error().message;
+  gyre::Rng lr(1);
+  auto l = gyre::GrokLora::create(c, rank, 4.f, *d, lr);
+  ASSERT_TRUE(l);
+  for (auto* v : {&l->q, &l->k, &l->v, &l->o})
+    for (auto& p : *v) {
+      for (auto& x : *p.A.host_span<float>()) x = 0.5f;
+      for (auto& x : *p.B.host_span<float>()) x = 0.125f;
+    }
+  ASSERT_TRUE(b->set_lora(std::move(*l)));
+  std::int32_t ids[] = {1, 2, 3};
+  std::int64_t sh[] = {1, 3};
+  auto idx = gyre::Tensor::from_host(std::as_bytes(std::span(ids)), sh, gyre::DType::i32, *d);
+  gyre::ForwardCtx ctx;
+  ctx.train = false;
+  auto ya = a->forward(*idx, ctx);
+  ASSERT_TRUE(ya) << ya.error().message;
+  auto yb = b->forward(*idx, ctx);
+  ASSERT_TRUE(yb);
+  auto pa = ya->host_span<float>();
+  auto pb = yb->host_span<float>();
+  for (std::size_t i = 0; i < pa->size(); ++i) EXPECT_NEAR((*pa)[i], (*pb)[i], 1e-5f);
+  std::filesystem::remove_all(dir);
 }

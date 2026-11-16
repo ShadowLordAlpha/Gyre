@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -61,6 +62,24 @@ void ok(Result<void> r, const char* what) {
   if (!r) die(std::string(what) + ": " + r.error().message);
 }
 
+// Strict numeric flags: atoi/atof turned "abc" into 0 and accepted "12x".
+long long parse_int(const std::string& flag, const char* text, long long lo) {
+  char* end = nullptr;
+  errno = 0;
+  const long long v = std::strtoll(text, &end, 10);
+  if (end == text || *end != '\0' || errno == ERANGE) die("invalid integer '" + std::string(text) + "' for " + flag);
+  if (v < lo) die(flag + " must be >= " + std::to_string(lo));
+  return v;
+}
+double parse_real(const std::string& flag, const char* text) {
+  char* end = nullptr;
+  errno = 0;
+  const double v = std::strtod(text, &end);
+  if (end == text || *end != '\0' || errno == ERANGE || !std::isfinite(v))
+    die("invalid number '" + std::string(text) + "' for " + flag);
+  return v;
+}
+
 Tensor mk(const std::vector<float>& v, std::vector<std::int64_t> sh) {
   auto d = Device::cpu();
   return ok(Tensor::from_host(std::as_bytes(std::span<const float>(v)), sh, DType::f32, *d), "tensor");
@@ -99,6 +118,10 @@ Corpus load_corpus(const Opt& o) {
   c.ids.reserve(raw.size());
   for (unsigned char ch : raw) c.ids.push_back(static_cast<std::uint8_t>(map[ch]));
   c.train_end = static_cast<std::size_t>(double(raw.size()) * (1.0 - o.holdout));
+  // Sampling needs max_start = train_end - seg - 2 > 0 (size_t: it would wrap, or be 0 for `% 0`).
+  if (c.train_end < static_cast<std::size_t>(o.seg) + 3)
+    die("train split (" + std::to_string(c.train_end) + " chars) is too short for --seg " +
+        std::to_string(o.seg) + "; need at least seg+3 (use a bigger --data, lower --holdout or --seg)");
   return c;
 }
 
@@ -181,21 +204,22 @@ int main(int argc, char** argv) {
     };
     if (a == "--data") o.data = next();
     else if (a == "--out") o.out = next();
-    else if (a == "--window") o.window = std::atoi(next());
-    else if (a == "--hidden") o.hidden = std::atoi(next());
-    else if (a == "--d-model") o.d_model = std::atoi(next());
-    else if (a == "--layers") o.layers = std::atoi(next());
-    else if (a == "--steps") o.steps = std::atoi(next());
-    else if (a == "--streams") o.streams = std::atoi(next());
-    else if (a == "--seg") o.seg = std::atoi(next());
-    else if (a == "--lr") o.lr = static_cast<float>(std::atof(next()));
-    else if (a == "--lr-end") o.lr_end = static_cast<float>(std::atof(next()));
-    else if (a == "--holdout") o.holdout = static_cast<float>(std::atof(next()));
-    else if (a == "--max-minutes") o.max_minutes = static_cast<float>(std::atof(next()));
-    else if (a == "--eval-every") o.eval_every = std::atoi(next());
-    else if (a == "--seed") o.seed = static_cast<std::uint64_t>(std::atoll(next()));
+    else if (a == "--window") o.window = static_cast<int>(parse_int(a, next(), 1));
+    else if (a == "--hidden") o.hidden = static_cast<int>(parse_int(a, next(), 1));
+    else if (a == "--d-model") o.d_model = static_cast<int>(parse_int(a, next(), 1));
+    else if (a == "--layers") o.layers = static_cast<int>(parse_int(a, next(), 1));
+    else if (a == "--steps") o.steps = static_cast<int>(parse_int(a, next(), 0));
+    else if (a == "--streams") o.streams = static_cast<int>(parse_int(a, next(), 1));
+    else if (a == "--seg") o.seg = static_cast<int>(parse_int(a, next(), 1));
+    else if (a == "--lr") o.lr = static_cast<float>(parse_real(a, next()));
+    else if (a == "--lr-end") o.lr_end = static_cast<float>(parse_real(a, next()));
+    else if (a == "--holdout") o.holdout = static_cast<float>(parse_real(a, next()));
+    else if (a == "--max-minutes") o.max_minutes = static_cast<float>(parse_real(a, next()));
+    else if (a == "--eval-every") o.eval_every = static_cast<int>(parse_int(a, next(), 0));
+    else if (a == "--seed") o.seed = static_cast<std::uint64_t>(parse_int(a, next(), 0));
     else die("unknown flag " + a);
   }
+  if (!(o.holdout >= 0.f && o.holdout < 1.f)) die("--holdout must be in [0, 1)");
   auto corpus = load_corpus(o);
   const int V = corpus.V();
   std::printf("corpus: %zu chars, V=%d, train %zu / held-out %zu\n", corpus.ids.size(), V, corpus.train_end,
@@ -219,8 +243,16 @@ int main(int argc, char** argv) {
   spec.hidden_dim = o.hidden;
   spec.layout = net.layout();
   auto buf = ok(RolloutBuffer::create(spec), "buffer");
+  // Held-out eval runs on up to 64 full segments. With --holdout 0 or a small file there may be
+  // fewer (even none): size the eval buffer to what exists, and skip eval rather than print NaN.
+  const int n_eval_segs = static_cast<int>(heldout_chunks(corpus, o, 1).size());
+  const int eval_envs = std::min(64, n_eval_segs);
+  const bool have_eval = eval_envs > 0;
+  if (!have_eval)
+    std::printf("held-out eval disabled: no full %d-char segment after the train split (--holdout %.3f)\n", o.seg,
+                double(o.holdout));
   RolloutSpec espec = spec;
-  espec.envs = 64;
+  espec.envs = std::max(1, eval_envs);
   auto ebuf = ok(RolloutBuffer::create(espec), "eval buffer");
 
   ImitationConfig ic;
@@ -233,8 +265,9 @@ int main(int argc, char** argv) {
   auto minutes = [&] {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count() / 60.0;
   };
-  std::printf("untrained held-out: %.4f nats/char (uniform = %.4f)\n",
-              eval_heldout(trainer, ebuf, corpus, o, 64), std::log(double(V)));
+  if (have_eval)
+    std::printf("untrained held-out: %.4f nats/char (uniform = %.4f)\n",
+                eval_heldout(trainer, ebuf, corpus, o, eval_envs), std::log(double(V)));
 
   double ema = 0;
   const std::size_t max_start = corpus.train_end - static_cast<std::size_t>(o.seg) - 2;
@@ -249,17 +282,21 @@ int main(int argc, char** argv) {
     ema = step == 1 ? st.loss : 0.98 * ema + 0.02 * st.loss;
     done_steps = step;
     if (step % 50 == 0) std::printf("step %5d  train %.4f (ema %.4f)  acc %.3f  %.1f min\n", step, st.loss, ema, st.accuracy, minutes());
-    if (o.eval_every > 0 && step % o.eval_every == 0)
-      std::printf("  >> held-out %.4f nats/char\n", eval_heldout(trainer, ebuf, corpus, o, 64));
+    if (have_eval && o.eval_every > 0 && step % o.eval_every == 0)
+      std::printf("  >> held-out %.4f nats/char\n", eval_heldout(trainer, ebuf, corpus, o, eval_envs));
     if (o.max_minutes > 0 && minutes() > o.max_minutes) {
       std::printf("time budget reached after %d steps\n", step);
       break;
     }
   }
-  double acc = 0;
-  const double final_loss = eval_heldout(trainer, ebuf, corpus, o, 64, &acc);
-  std::printf("FINAL held-out: %.4f nats/char  (%.4f bits/char, top-1 acc %.3f) after %d steps, %.1f min\n",
-              final_loss, final_loss / std::log(2.0), acc, done_steps, minutes());
+  if (have_eval) {
+    double acc = 0;
+    const double final_loss = eval_heldout(trainer, ebuf, corpus, o, eval_envs, &acc);
+    std::printf("FINAL held-out: %.4f nats/char  (%.4f bits/char, top-1 acc %.3f) after %d steps, %.1f min\n",
+                final_loss, final_loss / std::log(2.0), acc, done_steps, minutes());
+  } else {
+    std::printf("FINAL: %d steps, %.1f min (no held-out eval)\n", done_steps, minutes());
+  }
 
   // ---- deployment path: checkpoint, flat export, gyre-infer
   std::filesystem::create_directories(o.out);
@@ -269,15 +306,15 @@ int main(int argc, char** argv) {
   auto pol = gyre_infer::Policy::load(o.out + "/model.gpol", &err);
   if (!pol) die("gyre-infer load: " + err);
 
-  // held-out NLL through gyre-infer on the first 64 held-out segments vs the trainer's number
-  {
-    const auto chunks = heldout_chunks(corpus, o, 64);
+  // held-out NLL through gyre-infer on the first held-out segments vs the trainer's number
+  if (have_eval) {
+    const auto chunks = heldout_chunks(corpus, o, eval_envs);
     fill(ebuf, corpus, o, chunks[0]);
     const double train_side = ok(trainer.evaluate(ebuf), "evaluate").loss;
     double nll = 0;
     long n = 0;
     std::vector<float> logits(static_cast<std::size_t>(V)), ent;
-    for (int e = 0; e < 64; ++e) {
+    for (int e = 0; e < eval_envs; ++e) {
       auto sess = pol->make_session();
       for (int t = 0; t < o.seg; ++t) {
         const int K = o.window, F = V + K;
@@ -304,8 +341,8 @@ int main(int argc, char** argv) {
         ++n;
       }
     }
-    std::printf("gyre-infer parity on 64 held-out segments: infer %.4f vs trainer %.4f nats/char\n", nll / double(n),
-                train_side);
+    std::printf("gyre-infer parity on %d held-out segments: infer %.4f vs trainer %.4f nats/char\n", eval_envs,
+                nll / double(n), train_side);
   }
 
   // ---- sample text with gyre-infer

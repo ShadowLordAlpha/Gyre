@@ -5,6 +5,7 @@
 
 #include "gyre/io/codec.hpp"
 
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -342,4 +343,118 @@ TEST(CkptMalformed, V1DescriptorAndTrailerChecks) {
   EXPECT_FALSE(gyre::GyreFile::open(write_file("gyre-v1tr.gyre", make_v1(1, ~0ull - 8))));
   // Trailer before the payload with a payload CRC: rel used to underflow.
   EXPECT_FALSE(gyre::GyreFile::open(write_file("gyre-v1rel.gyre", make_v1(1, kKeep, 2, 330))));
+}
+
+namespace {
+
+std::filesystem::path write_text(const char* name, const std::string& s) {
+  auto p = std::filesystem::temp_directory_path() / name;
+  std::ofstream o(p, std::ios::binary | std::ios::trunc);
+  o.write(s.data(), static_cast<std::streamsize>(s.size()));
+  return p;
+}
+
+std::string twin_with(const std::string& tensor) {
+  return R"({"gyre":"model","version":1,"arch":"x","config":{},"tensors":[)" + tensor + "]}";
+}
+
+}  // namespace
+
+// Regression: JSON has no NaN, nlohmann writes it as null, and get<float>() on null threw out of
+// GyreFile::open, so a model with one NaN weight saved a twin that could never be reloaded.
+TEST(CkptMalformed, JsonTwinWithNaNWeightReloads) {
+  auto d = gyre::Device::cpu();
+  gyre::Rng rng(9);
+  auto lin = gyre::Linear::create(2, 2, *d, rng);
+  ASSERT_TRUE(lin);
+  auto w = lin->parameters()[0].value.host_span<float>();
+  ASSERT_TRUE(w);
+  (*w)[1] = std::numeric_limits<float>::quiet_NaN();
+  gyre::GyreDoc doc;
+  doc.arch = "linear";
+  const auto js = std::filesystem::temp_directory_path() / "gyre-nan-twin.gyre.json";
+  ASSERT_TRUE(gyre::save_gyre_json(js, lin->parameters(), nullptr, doc, {}, true));
+  auto f = gyre::GyreFile::open(js);
+  ASSERT_TRUE(f) << f.error().message;
+  auto lin2 = gyre::Linear::create(2, 2, *d, rng);
+  ASSERT_TRUE(f->load_params(lin2->parameters()));
+  auto w2 = lin2->parameters()[0].value.host_span<float>();
+  EXPECT_TRUE(std::isnan((*w2)[1]));
+  EXPECT_EQ((*w2)[0], (*w)[0]);
+}
+
+// Regression: wrong-typed or out-of-range data elements threw nlohmann::type_error (or wrapped
+// silently), and a huge shape was allocated before the data size was checked.
+TEST(CkptMalformed, JsonTwinDataIsValidatedBeforeUse) {
+  const std::string bad[] = {
+      twin_with(R"({"name":"W","dtype":"f32","shape":[2],"data":[1,"x"]})"),
+      twin_with(R"({"name":"W","dtype":"f32","shape":[2],"data":[1,[2]]})"),
+      twin_with(R"({"name":"W","dtype":"f32","shape":[2],"data":"abc"})"),
+      twin_with(R"({"name":"W","dtype":"i32","shape":[1],"data":[30000000000]})"),
+      twin_with(R"({"name":"W","dtype":"u8","shape":[1],"data":[300]})"),
+      twin_with(R"({"name":"W","dtype":"u8","shape":[1],"data":[-1]})"),
+      // 1e9 x 1e9 floats: must be rejected from the data size, not allocated.
+      twin_with(R"({"name":"W","dtype":"f32","shape":[1000000000,1000000000],"data":[1]})"),
+  };
+  int k = 0;
+  for (const auto& s : bad) {
+    const auto p = write_text(("gyre-bad-twin-" + std::to_string(k++) + ".gyre.json").c_str(), s);
+    gyre::Result<gyre::GyreFile> f = std::unexpected(gyre::make_error(gyre::Errc::ok, ""));
+    EXPECT_NO_THROW(f = gyre::GyreFile::open(p)) << s;
+    EXPECT_FALSE(f) << s;
+  }
+  auto ok = gyre::GyreFile::open(
+      write_text("gyre-ok-twin.gyre.json", twin_with(R"({"name":"W","dtype":"u8","shape":[2],"data":[0,255]})")));
+  ASSERT_TRUE(ok) << ok.error().message;
+}
+
+// Regression: holdout() did an unguarded get<double>() and terminated on "holdout":"x".
+TEST(CkptMalformed, HoldoutFallsBackOnBadValues) {
+  gyre::GyreDoc d;
+  d.config_json = R"({"holdout":"x"})";
+  EXPECT_DOUBLE_EQ(d.holdout(), 0.1);
+  d.config_json = R"({"holdout":-3})";
+  EXPECT_DOUBLE_EQ(d.holdout(), 0.1);
+  d.config_json = R"({"holdout":0.25})";
+  EXPECT_DOUBLE_EQ(d.holdout(), 0.25);
+  d.config_json = R"({"holdout":0})";
+  EXPECT_DOUBLE_EQ(d.holdout(), 0.0);
+  d.config_json = "[1]";
+  EXPECT_DOUBLE_EQ(d.holdout(), 0.1);
+}
+
+// Regression: save_gyre truncated the destination first and wrote the real header last, so a
+// failed save destroyed the previous checkpoint. Saves now go through "<path>.tmp" + rename.
+TEST(Ckpt, SaveReplacesAtomicallyAndKeepsOldFileOnFailure) {
+  auto d = gyre::Device::cpu();
+  gyre::Rng rng(10);
+  auto lin = gyre::Linear::create(2, 2, *d, rng);
+  ASSERT_TRUE(lin);
+  gyre::GyreDoc doc;
+  doc.arch = "linear";
+  const auto dir = std::filesystem::temp_directory_path() / "gyre-atomic-save";
+  std::error_code ec0;
+  std::filesystem::remove_all(dir, ec0);
+  std::filesystem::create_directories(dir);
+  const auto path = dir / "m.gyre";
+  doc.train_step = 1;
+  ASSERT_TRUE(gyre::save_gyre(path, lin->parameters(), nullptr, doc, {}));
+  doc.train_step = 2;
+  ASSERT_TRUE(gyre::save_gyre(path, lin->parameters(), nullptr, doc, {}));  // replaces an existing file
+  EXPECT_EQ(gyre::peek_gyre(path)->train_step, 2u);
+  EXPECT_FALSE(std::filesystem::exists(dir / "m.gyre.tmp"));
+  // Make the temp file impossible to create: the save fails and the old checkpoint survives.
+  std::filesystem::create_directories(dir / "m.gyre.tmp");
+  doc.train_step = 3;
+  EXPECT_FALSE(gyre::save_gyre(path, lin->parameters(), nullptr, doc, {}));
+  EXPECT_FALSE(gyre::save_gyre_json(path, lin->parameters(), nullptr, doc, {}, true));
+  auto peek = gyre::peek_gyre(path);
+  ASSERT_TRUE(peek) << peek.error().message;
+  EXPECT_EQ(peek->train_step, 2u);
+  {
+    auto f = gyre::GyreFile::open(path);  // maps the file: release it before cleanup
+    ASSERT_TRUE(f) << f.error().message;
+  }
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
 }

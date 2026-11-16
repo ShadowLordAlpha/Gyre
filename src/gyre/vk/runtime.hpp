@@ -64,6 +64,7 @@ class VulkanDevice final : public Device {
   VkPipeline pipes[static_cast<int>(Pipe::count)]{};
   VkShaderModule shaders[static_cast<int>(Pipe::count)]{};
   VkPhysicalDeviceMemoryProperties mem{};
+  VkPhysicalDeviceLimits limits{};  // of `phys`; dispatch() checks group counts and bind ranges
   VkBuffer dummy{VK_NULL_HANDLE};
   VkDeviceMemory dummy_mem{VK_NULL_HANDLE};
   static constexpr int kStagingSlots = 4;
@@ -80,8 +81,10 @@ class VulkanDevice final : public Device {
     VkDeviceSize cap{0};
   };
 
+  // `status` (optional) receives the failing VkResult, or VK_ERROR_FEATURE_NOT_PRESENT
+  // when no memory type has `props`.
   Result<void> make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
-                           VkBuffer& buf, VkDeviceMemory& mem, void** mapped);
+                           VkBuffer& buf, VkDeviceMemory& mem, void** mapped, VkResult* status = nullptr);
   Result<void> ensure_staging(int slot, VkDeviceSize size);
   void destroy_staging(int slot) noexcept;
   Result<void> submit_and_wait();

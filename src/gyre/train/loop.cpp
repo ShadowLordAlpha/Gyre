@@ -21,7 +21,10 @@ Result<void> TrainLoop::run(Module& model, Dataset& data, const TrainConfig& cfg
     opt = &*owned;
   }
   if (cfg.weight_decay > 0.f) opt->weight_decay = cfg.weight_decay;
-  Rng rng(cfg.seed);
+  // A resumed run (start_step > 0) must not replay the batch windows and dropout
+  // masks of steps 1..k, so mix the start step into the stream seed. start_step 0
+  // keeps the plain seed so fresh runs stay bit-identical to earlier releases.
+  Rng rng(train_stream_seed(cfg.seed, cfg.start_step));
   if (cfg.steps == 0) return {};
   const std::uint32_t last = cfg.start_step + cfg.steps;
   for (std::uint32_t step = cfg.start_step + 1; step <= last; ++step) {

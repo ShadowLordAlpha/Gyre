@@ -2,6 +2,8 @@
 
 #include "gyre/io/compress_probe.hpp"
 
+#include "atomic_file.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -710,12 +712,10 @@ Result<void> wpack_save(const std::filesystem::path& path, const WpackFile& file
     wr_u64(o, t.payload.size());
     o.insert(o.end(), t.payload.begin(), t.payload.end());
   }
-  auto parent = path.parent_path();
-  if (!parent.empty()) std::filesystem::create_directories(parent);
-  std::ofstream out(path, std::ios::binary);
-  if (!out) return std::unexpected(make_error(Errc::io, path.string()));
-  out.write(reinterpret_cast<const char*>(o.data()), static_cast<std::streamsize>(o.size()));
-  return {};
+  return detail::write_file_atomic(path, [&](std::ofstream& out) -> Result<void> {
+    out.write(reinterpret_cast<const char*>(o.data()), static_cast<std::streamsize>(o.size()));
+    return {};
+  });
 }
 
 Result<WpackFile> wpack_load(const std::filesystem::path& path) {
@@ -769,6 +769,17 @@ Result<WpackFile> wpack_load(const std::filesystem::path& path) {
     if (codec > static_cast<std::uint8_t>(WpackCodec::const_lane)) return corrupt("wpack codec");
     wt.codec = static_cast<WpackCodec>(codec);
     wt.raw_bytes = rd_u64(s, i);
+    // raw_bytes caps what wpack_decode may allocate: it must be exactly dtype * shape.
+    {
+      std::uint64_t want = dtype_size(wt.dtype);
+      for (auto d : wt.shape) {
+        if (d < 0) return corrupt("wpack shape");
+        const auto ud = static_cast<std::uint64_t>(d);
+        if (ud != 0 && want > UINT64_MAX / ud) return corrupt("wpack shape");
+        want *= ud;
+      }
+      if (want != wt.raw_bytes) return corrupt("wpack raw_bytes != dtype * shape");
+    }
     auto plen = rd_u64(s, i);
     if (plen > left()) return corrupt("wpack payload");
     wt.payload.assign(s.begin() + static_cast<std::ptrdiff_t>(i),
@@ -783,6 +794,7 @@ Result<WpackFile> wpack_from_safetensors(const SafetensorFile& st, std::uint64_t
   WpackFile f;
   f.source = st.path.filename().string();
   for (auto& info : st.tensors) {
+    if (!info.dtype_known || info.data_end < info.data_begin) continue;  // no DType to record it under
     const auto nbytes = info.data_end - info.data_begin;
     if (nbytes > max_bytes) continue;
     auto buf = safetensors_read_prefix(st, info, nbytes);

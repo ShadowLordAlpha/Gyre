@@ -243,6 +243,8 @@ CompressProbeRow probe_bytes(std::span<const std::byte> raw, std::string_view na
 Result<std::vector<std::byte>> safetensors_read_prefix(const SafetensorFile& file,
                                                       const SafetensorInfo& info,
                                                       std::uint64_t max_bytes) {
+  if (info.data_end < info.data_begin)
+    return std::unexpected(make_error(Errc::ckpt_corrupt, info.name + ": data_offsets end < begin"));
   const auto nbytes = info.data_end - info.data_begin;
   const auto take = nbytes < max_bytes ? nbytes : max_bytes;
   std::vector<std::byte> buf(static_cast<std::size_t>(take));
@@ -293,14 +295,46 @@ Result<std::vector<CompressProbeRow>> compress_probe_dir(const std::filesystem::
   return rows;
 }
 
+namespace {
+
+// JSON string literal (with quotes). Names come from untrusted safetensors headers and file names.
+std::string json_quote(std::string_view s) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string o;
+  o.reserve(s.size() + 2);
+  o.push_back('"');
+  for (unsigned char c : s) {
+    switch (c) {
+      case '"': o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\n': o += "\\n"; break;
+      case '\r': o += "\\r"; break;
+      case '\t': o += "\\t"; break;
+      default:
+        if (c < 0x20 || c == 0x7f) {
+          o += "\\u00";
+          o.push_back(kHex[c >> 4]);
+          o.push_back(kHex[c & 15]);
+        } else {
+          o.push_back(static_cast<char>(c));
+        }
+    }
+  }
+  o.push_back('"');
+  return o;
+}
+
+}  // namespace
+
 std::string compress_probe_json(std::span<const CompressProbeRow> rows) {
   std::ostringstream o;
   o << "{\"target_ratio\":0.5,\"rows\":[";
   for (std::size_t i = 0; i < rows.size(); ++i) {
     const auto& r = rows[i];
     if (i) o << ',';
-    o << "{\"file\":\"" << r.file << "\",\"name\":\"" << r.name << "\",\"family\":\"" << r.family
-      << "\",\"raw_bytes\":" << r.raw_bytes << ",\"probed_bytes\":" << r.probed_bytes
+    o << "{\"file\":" << json_quote(r.file) << ",\"name\":" << json_quote(r.name)
+      << ",\"family\":" << json_quote(r.family) << ",\"raw_bytes\":" << r.raw_bytes
+      << ",\"probed_bytes\":" << r.probed_bytes
       << ",\"entropy_bpb\":" << r.entropy_bpb << ",\"xor_entropy_bpb\":" << r.xor_entropy_bpb
       << ",\"entropy_bytes\":" << r.entropy_bytes << ",\"rle_bytes\":" << r.rle_bytes
       << ",\"lzss_bytes\":" << r.lzss_bytes << ",\"sign_ent_bytes\":" << r.sign_ent_bytes
@@ -308,10 +342,10 @@ std::string compress_probe_json(std::span<const CompressProbeRow> rows) {
       << ",\"plane_pack_bytes\":" << r.plane_pack_bytes
       << ",\"freq16_exc_bytes\":" << r.freq16_exc_bytes << ",\"estimate_bytes\":" << r.estimate_bytes
       << ",\"stack_bytes\":" << r.stack_bytes << ",\"packed_bytes\":" << r.packed_bytes
-      << ",\"packed_codec\":\"" << r.packed_codec << "\""
+      << ",\"packed_codec\":" << json_quote(r.packed_codec)
       << ",\"unique_exponents\":" << r.unique_exponents << ",\"zero_frac\":" << r.zero_frac
-      << ",\"top_u16_frac\":" << r.top_u16_frac << ",\"best_rule\":\"" << r.best_rule
-      << "\",\"t_ms\":" << r.t_ms << "}";
+      << ",\"top_u16_frac\":" << r.top_u16_frac << ",\"best_rule\":" << json_quote(r.best_rule)
+      << ",\"t_ms\":" << r.t_ms << "}";
   }
   o << "]}";
   return o.str();

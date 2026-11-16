@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <limits>
+#include <queue>
 
 namespace gyre {
 namespace {
@@ -295,33 +297,53 @@ Result<void> TiktokenModel::encode_span(std::string_view span, const PieceTable&
     }
   }
 
-  std::vector<std::string> parts;
-  parts.reserve(span.size());
-  for (unsigned char c : span) parts.emplace_back(1, static_cast<char>(c));
-
-  auto rank_of = [&](const std::string& a, const std::string& b) -> std::int32_t {
-    auto it = ranks_.find(a + b);
-    if (it == ranks_.end()) return std::numeric_limits<std::int32_t>::max();
-    return it->second;
+  // Byte-pair merge in the reference order: the lowest-rank adjacent pair first, the leftmost one
+  // on a tie. Parts are a linked list of [start, nxt[start]) ranges over the span, and the
+  // candidate pairs sit in a min-heap keyed (rank, start) that is invalidated lazily, so a long
+  // span (the pretokenizer does not bound runs of punctuation) costs O(n log n) lookups instead
+  // of rescanning and re-concatenating every pair after each merge.
+  const std::size_t n = span.size();
+  const std::size_t none = n;
+  std::vector<std::size_t> nxt(n), prv(n);
+  std::vector<char> alive(n, 1);
+  for (std::size_t i = 0; i < n; ++i) {
+    nxt[i] = i + 1;
+    prv[i] = i == 0 ? none : i - 1;
+  }
+  std::string key;
+  auto rank_of = [&](std::size_t from, std::size_t to) -> std::int32_t {
+    key.assign(span.data() + from, to - from);
+    auto it = ranks_.find(key);
+    return it == ranks_.end() ? std::numeric_limits<std::int32_t>::max() : it->second;
   };
-
-  while (parts.size() >= 2) {
-    std::int32_t best = std::numeric_limits<std::int32_t>::max();
-    std::size_t best_i = 0;
-    for (std::size_t i = 0; i + 1 < parts.size(); ++i) {
-      auto r = rank_of(parts[i], parts[i + 1]);
-      if (r < best) {
-        best = r;
-        best_i = i;
-      }
-    }
-    if (best == std::numeric_limits<std::int32_t>::max()) break;
-    parts[best_i] += parts[best_i + 1];
-    parts.erase(parts.begin() + static_cast<std::ptrdiff_t>(best_i + 1));
+  struct Cand {
+    std::int32_t rank;
+    std::size_t left, right, right_end;
+    bool operator>(const Cand& o) const { return rank != o.rank ? rank > o.rank : left > o.left; }
+  };
+  std::priority_queue<Cand, std::vector<Cand>, std::greater<>> heap;
+  auto push_pair = [&](std::size_t left) {
+    if (left == none || nxt[left] >= n) return;
+    const auto right = nxt[left];
+    const auto r = rank_of(left, nxt[right]);
+    if (r != std::numeric_limits<std::int32_t>::max()) heap.push({r, left, right, nxt[right]});
+  };
+  for (std::size_t i = 0; i + 1 < n; ++i) push_pair(i);
+  while (!heap.empty()) {
+    const auto c = heap.top();
+    heap.pop();
+    // Stale if either part has merged with something since the pair was pushed.
+    if (!alive[c.left] || !alive[c.right] || nxt[c.left] != c.right || nxt[c.right] != c.right_end) continue;
+    alive[c.right] = 0;
+    nxt[c.left] = c.right_end;
+    if (c.right_end < n) prv[c.right_end] = c.left;
+    push_pair(prv[c.left]);
+    push_pair(c.left);
   }
 
-  for (const auto& p : parts) {
-    auto it = ranks_.find(p);
+  for (std::size_t i = 0; i < n; i = nxt[i]) {
+    key.assign(span.data() + i, nxt[i] - i);
+    auto it = ranks_.find(key);
     if (it == ranks_.end()) {
       return std::unexpected(make_error(Errc::unsupported, "tiktoken byte"));
     }
@@ -384,18 +406,36 @@ Result<void> TiktokenModel::write_huggingface(const std::filesystem::path&, cons
   return std::unexpected(make_error(Errc::unsupported, "tiktoken hf export"));
 }
 
+namespace {
+Result<std::unique_ptr<Tokenizer>> load_tiktoken_json_impl(const nlohmann::json& j);
+}  // namespace
+
 Result<std::unique_ptr<Tokenizer>> load_tiktoken_json(std::string_view json) {
   auto parsed = parse_json(json);
   if (!parsed) return std::unexpected(parsed.error());
-  auto& j = *parsed;
-  if (!j.contains("regular_tokens") || !j.contains("word_split")) {
+  // The file is untrusted: a wrong-typed field must be an error, not an escaping exception.
+  try {
+    return load_tiktoken_json_impl(*parsed);
+  } catch (const nlohmann::json::exception& e) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, std::string("tiktoken tok.json: ") + e.what()));
+  } catch (const std::bad_alloc&) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "tiktoken tok.json: too large"));
+  } catch (const std::length_error&) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "tiktoken tok.json: too large"));
+  }
+}
+
+namespace {
+Result<std::unique_ptr<Tokenizer>> load_tiktoken_json_impl(const nlohmann::json& j) {
+  if (!j.is_object() || !j.contains("regular_tokens") || !j.contains("word_split")) {
     return std::unexpected(make_error(Errc::ckpt_corrupt, "not tiktoken tok.json"));
   }
-  auto ws = j["word_split"].dump();
+  auto ws = j.at("word_split").dump();
   if (ws.find("V1") == std::string::npos) {
     return std::unexpected(make_error(Errc::unsupported, "word_split"));
   }
   std::int64_t vocab = j.value("vocab_size", std::int64_t{0});
+  if (vocab > kMaxTokenizerVocab) return std::unexpected(make_error(Errc::ckpt_corrupt, "tiktoken vocab_size"));
   PieceTable table;
   if (vocab > 0) table.pieces.assign(static_cast<std::size_t>(vocab), {});
   std::unordered_map<std::string, std::int32_t> ranks;
@@ -410,12 +450,14 @@ Result<std::unique_ptr<Tokenizer>> load_tiktoken_json(std::string_view json) {
       }
       std::string bytes;
       for (auto& b : obj["bytes"]) {
-        auto v = b.get<int>();
+        if (!b.is_number_integer()) return std::unexpected(make_error(Errc::ckpt_corrupt, "byte"));
+        auto v = b.get<std::int64_t>();
         if (v < 0 || v > 255) return std::unexpected(make_error(Errc::ckpt_corrupt, "byte"));
         bytes.push_back(static_cast<char>(static_cast<unsigned char>(v)));
       }
       auto tok = obj.value("token", std::int64_t{-1});
-      if (tok < 0) return std::unexpected(make_error(Errc::ckpt_corrupt, "token id"));
+      // Ids size the piece table: refuse ones no real vocabulary reaches (and that would not fit int32).
+      if (tok < 0 || tok >= kMaxTokenizerVocab) return std::unexpected(make_error(Errc::ckpt_corrupt, "token id"));
       auto id = static_cast<std::int32_t>(tok);
       if (static_cast<std::size_t>(id) >= table.pieces.size()) {
         table.pieces.resize(static_cast<std::size_t>(id) + 1);
@@ -431,9 +473,10 @@ Result<std::unique_ptr<Tokenizer>> load_tiktoken_json(std::string_view json) {
     return {};
   };
 
-  auto pr = parse_token_list(j["regular_tokens"], false);
+  auto pr = parse_token_list(j.at("regular_tokens"), false);
   if (!pr) return std::unexpected(pr.error());
-  auto ps = parse_token_list(j["special_tokens"], true);
+  static const nlohmann::json kNoTokens = nlohmann::json::array();
+  auto ps = parse_token_list(j.contains("special_tokens") ? j.at("special_tokens") : kNoTokens, true);
   if (!ps) return std::unexpected(ps.error());
 
   if (vocab <= 0) vocab = static_cast<std::int64_t>(table.pieces.size());
@@ -444,5 +487,6 @@ Result<std::unique_ptr<Tokenizer>> load_tiktoken_json(std::string_view json) {
   auto pretok = make_tiktoken_v1_pretok(std::move(specials));
   return std::make_unique<Tokenizer>(std::move(pretok), std::move(model), std::move(table));
 }
+}  // namespace
 
 }  // namespace gyre

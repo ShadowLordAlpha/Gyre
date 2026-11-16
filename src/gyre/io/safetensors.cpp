@@ -1,11 +1,13 @@
 #include "gyre/io/safetensors.hpp"
 
+#include "atomic_file.hpp"
 #include "json_parse.hpp"
 
 #include <array>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <span>
 #include <string>
 
@@ -21,6 +23,40 @@ DType safetensors_dtype(std::string_view s) {
   return DType::f32;
 }
 
+namespace {
+
+bool gyre_dtype_name(std::string_view s) {
+  return s == "F32" || s == "f32" || s == "F16" || s == "f16" || s == "BF16" || s == "bf16" || s == "I32" ||
+         s == "i32" || s == "U8" || s == "u8" || s == "I8" || s == "i8";
+}
+
+// Element size of a safetensors dtype string; 0 when the name is not a safetensors dtype at all.
+std::uint64_t st_elem_size(std::string_view s) {
+  if (s == "BOOL" || s == "U8" || s == "I8" || s == "F8_E5M2" || s == "F8_E4M3" || s == "u8" || s == "i8")
+    return 1;
+  if (s == "I16" || s == "U16" || s == "F16" || s == "BF16" || s == "f16" || s == "bf16") return 2;
+  if (s == "I32" || s == "U32" || s == "F32" || s == "i32" || s == "f32") return 4;
+  if (s == "I64" || s == "U64" || s == "F64") return 8;
+  return 0;
+}
+
+Error st_corrupt(const std::string& what) { return make_error(Errc::ckpt_corrupt, "safetensors: " + what); }
+
+// numel * es without wraparound; false on overflow or a negative dim.
+bool checked_bytes(std::span<const std::int64_t> shape, std::uint64_t es, std::uint64_t& out) {
+  std::uint64_t n = es;
+  for (auto d : shape) {
+    if (d < 0) return false;
+    const auto ud = static_cast<std::uint64_t>(d);
+    if (ud != 0 && n > std::numeric_limits<std::uint64_t>::max() / ud) return false;
+    n *= ud;
+  }
+  out = n;
+  return true;
+}
+
+}  // namespace
+
 Result<SafetensorFile> safetensors_open_header(std::string_view header_json, std::uint64_t header_len,
                                                const std::filesystem::path& path) {
   auto parsed = parse_json(header_json);
@@ -30,16 +66,45 @@ Result<SafetensorFile> safetensors_open_header(std::string_view header_json, std
   file.path = path;
   file.header_len = header_len;
   file.data_offset = 8 + header_len;
+  // Every field is untrusted: check types and ranges here so a bad header is an error, never an
+  // exception or a wrapped size later.
   for (auto& [key, val] : parsed->items()) {
     if (key == "__metadata__") continue;
     if (!val.is_object()) continue;
     SafetensorInfo info;
     info.name = key;
-    info.dtype = safetensors_dtype(val.value("dtype", std::string{"F32"}));
-    if (val.contains("shape") && val["shape"].is_array()) info.shape = val["shape"].get<std::vector<std::int64_t>>();
-    if (val.contains("data_offsets") && val["data_offsets"].is_array() && val["data_offsets"].size() == 2) {
-      info.data_begin = val["data_offsets"][0].get<std::uint64_t>();
-      info.data_end = val["data_offsets"][1].get<std::uint64_t>();
+    std::string dt = "F32";
+    if (val.contains("dtype")) {
+      if (!val["dtype"].is_string()) return std::unexpected(st_corrupt(key + ": dtype is not a string"));
+      dt = val["dtype"].get<std::string>();
+    }
+    info.dtype = safetensors_dtype(dt);
+    info.dtype_known = gyre_dtype_name(dt);
+    if (val.contains("shape")) {
+      const auto& sh = val["shape"];
+      if (!sh.is_array() || sh.size() > 8) return std::unexpected(st_corrupt(key + ": shape"));
+      for (auto& d : sh) {
+        if (!d.is_number_integer() || d.get<std::int64_t>() < 0)
+          return std::unexpected(st_corrupt(key + ": shape"));
+        info.shape.push_back(d.get<std::int64_t>());
+      }
+    }
+    if (val.contains("data_offsets")) {
+      const auto& off = val["data_offsets"];
+      if (!off.is_array() || off.size() != 2 || !off[0].is_number_unsigned() || !off[1].is_number_unsigned())
+        return std::unexpected(st_corrupt(key + ": data_offsets"));
+      info.data_begin = off[0].get<std::uint64_t>();
+      info.data_end = off[1].get<std::uint64_t>();
+    }
+    if (info.data_end < info.data_begin) return std::unexpected(st_corrupt(key + ": data_offsets end < begin"));
+    if (info.data_begin > std::numeric_limits<std::uint64_t>::max() - file.data_offset ||
+        info.data_end > std::numeric_limits<std::uint64_t>::max() - file.data_offset)
+      return std::unexpected(st_corrupt(key + ": data_offsets"));
+    if (const auto es = st_elem_size(dt)) {
+      std::uint64_t want = 0;
+      if (!checked_bytes(info.shape, es, want)) return std::unexpected(st_corrupt(key + ": shape overflow"));
+      if (want != info.data_end - info.data_begin)
+        return std::unexpected(st_corrupt(key + ": data_offsets do not match dtype * shape"));
     }
     file.tensors.push_back(std::move(info));
   }
@@ -62,7 +127,17 @@ Result<SafetensorFile> safetensors_open(const std::filesystem::path& path) {
   if (static_cast<std::uint64_t>(in.gcount()) != n) {
     return std::unexpected(make_error(Errc::ckpt_corrupt, "st header short"));
   }
-  return safetensors_open_header(json, n, path);
+  auto file = safetensors_open_header(json, n, path);
+  if (!file) return file;
+  std::error_code ec;
+  const auto fsz = static_cast<std::uint64_t>(std::filesystem::file_size(path, ec));
+  if (!ec) {
+    for (auto& t : file->tensors) {
+      if (file->data_offset > fsz || t.data_end > fsz - file->data_offset)
+        return std::unexpected(st_corrupt(t.name + ": data past the end of the file"));
+    }
+  }
+  return file;
 }
 
 Result<Tensor> safetensors_load(const SafetensorFile& file, std::string_view name,
@@ -75,6 +150,14 @@ Result<Tensor> safetensors_load(const SafetensorFile& file, std::string_view nam
     }
   }
   if (!info) return std::unexpected(make_error(Errc::io, "tensor not found"));
+  if (!info->dtype_known)
+    return std::unexpected(make_error(Errc::unsupported, "safetensors: unsupported dtype for " + info->name));
+  // SafetensorFile is a plain struct: re-check what safetensors_open_header validated.
+  std::uint64_t want = 0;
+  if (info->data_end < info->data_begin || !checked_bytes(info->shape, dtype_size(info->dtype), want) ||
+      want != info->data_end - info->data_begin ||
+      info->data_begin > std::numeric_limits<std::uint64_t>::max() - file.data_offset)
+    return std::unexpected(st_corrupt(info->name + ": data_offsets do not match dtype * shape"));
   const auto nbytes = info->data_end - info->data_begin;
   const auto file_off = file.data_offset + info->data_begin;
   if (mmap) {
@@ -170,18 +253,16 @@ Result<void> safetensors_save(const std::filesystem::path& path, std::span<const
   }
   auto json = header.dump();
   std::uint64_t hlen = json.size();
-  auto parent = path.parent_path();
-  if (!parent.empty()) std::filesystem::create_directories(parent);
-  std::ofstream out(path, std::ios::binary);
-  if (!out) return std::unexpected(make_error(Errc::io, path.string()));
-  out.write(reinterpret_cast<const char*>(&hlen), 8);
-  out.write(json.data(), static_cast<std::streamsize>(json.size()));
-  for (auto& nt : tensors) {
-    auto hb = nt.t->host_bytes();
-    if (!hb) return std::unexpected(hb.error());
-    out.write(reinterpret_cast<const char*>(hb->data()), static_cast<std::streamsize>(hb->size()));
-  }
-  return {};
+  return detail::write_file_atomic(path, [&](std::ofstream& out) -> Result<void> {
+    out.write(reinterpret_cast<const char*>(&hlen), 8);
+    out.write(json.data(), static_cast<std::streamsize>(json.size()));
+    for (auto& nt : tensors) {
+      auto hb = nt.t->host_bytes();
+      if (!hb) return std::unexpected(hb.error());
+      out.write(reinterpret_cast<const char*>(hb->data()), static_cast<std::streamsize>(hb->size()));
+    }
+    return {};
+  });
 }
 
 }  // namespace gyre

@@ -168,6 +168,61 @@ TEST(Connectome, ResumeContinuesStep) {
   EXPECT_EQ(opt->t, 4u);
 }
 
+namespace {
+
+// Records the first draw the loop's Rng hands to sample() each step.
+class RecordingDataset final : public gyre::Dataset {
+ public:
+  explicit RecordingDataset(gyre::CharDataset inner) : inner_(std::move(inner)) {}
+  gyre::Result<std::pair<gyre::Tensor, gyre::Tensor>> sample(std::uint32_t batch, std::uint32_t block,
+                                                              gyre::Rng& rng) override {
+    draws.push_back(rng.u64());
+    return inner_.sample(batch, block, rng);
+  }
+  std::vector<std::uint64_t> draws;
+
+ private:
+  gyre::CharDataset inner_;
+};
+
+}  // namespace
+
+TEST(Connectome, ResumeDoesNotReplayBatches) {
+  EXPECT_EQ(gyre::train_stream_seed(7, 0), 7u);
+  EXPECT_NE(gyre::train_stream_seed(7, 1), gyre::train_stream_seed(7, 2));
+  EXPECT_NE(gyre::train_stream_seed(7, 5), 7u);
+
+  auto d = gyre::Device::cpu();
+  const std::string text = "the quick brown fox jumps over the lazy dog. the quick brown fox. ";
+  auto tok = gyre::Tokenizer::chars_from_text(text);
+  ASSERT_TRUE(tok);
+  auto ids = (*tok)->encode(text);
+  ASSERT_TRUE(ids);
+  auto cd = gyre::CharDataset::from_ids(*ids, *d);
+  ASSERT_TRUE(cd);
+  RecordingDataset data(std::move(*cd));
+  gyre::Rng rng(13);
+  auto m = gyre::CharLM::create(tiny_cfg((*tok)->vocab_size()), *d, rng);
+  ASSERT_TRUE(m);
+  gyre::TrainConfig tc;
+  tc.steps = 3;
+  tc.batch = 2;
+  tc.block = 16;
+  tc.log_every = 0;
+  tc.ckpt_every = 0;
+  gyre::TrainLoop loop;
+  ASSERT_TRUE(loop.run(*m, data, tc, *d, {}));
+  tc.start_step = 3;  // resume: steps 4..6 with the same cfg.seed
+  ASSERT_TRUE(loop.run(*m, data, tc, *d, {}));
+  ASSERT_EQ(data.draws.size(), 6u);
+  for (std::size_t i = 0; i < 3; ++i) {
+    EXPECT_NE(data.draws[i], data.draws[i + 3]) << "resumed step " << (i + 4) << " replayed step " << (i + 1);
+  }
+  // A fresh run (start_step 0) still uses the plain seed: same stream as before.
+  gyre::Rng plain(tc.seed);
+  EXPECT_EQ(data.draws[0], plain.u64());
+}
+
 TEST(Connectome, CompactThenTrainFinite) {
   auto d = gyre::Device::cpu();
   const std::string text = "hello hello hello hello hello hello hello hello ";

@@ -3,6 +3,10 @@
 
 #include <fstream>
 #include <filesystem>
+#include <limits>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -263,4 +267,93 @@ TEST(Tiktoken, LoadViaTempFile) {
   ASSERT_TRUE(ids);
   ASSERT_EQ(ids->size(), 1u);
   EXPECT_EQ((*ids)[0], 0);
+}
+
+namespace {
+
+// The original tiktoken byte-pair loop: rescan every adjacent pair, merge the lowest rank
+// (leftmost on a tie), repeat. encode_span must give exactly these ids.
+std::vector<std::int32_t> naive_tiktoken(const std::unordered_map<std::string, std::int32_t>& ranks,
+                                         std::string_view span) {
+  if (auto it = ranks.find(std::string(span)); it != ranks.end()) return {it->second};
+  std::vector<std::string> parts;
+  for (char c : span) parts.emplace_back(1, c);
+  while (parts.size() >= 2) {
+    std::int32_t best = std::numeric_limits<std::int32_t>::max();
+    std::size_t at = 0;
+    for (std::size_t i = 0; i + 1 < parts.size(); ++i) {
+      auto it = ranks.find(parts[i] + parts[i + 1]);
+      if (it != ranks.end() && it->second < best) {
+        best = it->second;
+        at = i;
+      }
+    }
+    if (best == std::numeric_limits<std::int32_t>::max()) break;
+    parts[at] += parts[at + 1];
+    parts.erase(parts.begin() + static_cast<std::ptrdiff_t>(at + 1));
+  }
+  std::vector<std::int32_t> ids;
+  for (auto& p : parts) ids.push_back(ranks.at(p));
+  return ids;
+}
+
+}  // namespace
+
+// Regression: encode_span used a rescan-everything loop (quadratic, one string concat per pair per
+// merge). The heap version must keep the exact merge order, including ties between equal ranks.
+TEST(Tiktoken, HeapMergeMatchesSequentialReference) {
+  std::uint64_t state = 12345;
+  auto next = [&] {
+    state = state * 6364136223846793005ull + 1442695040888963407ull;
+    return static_cast<std::uint32_t>(state >> 33);
+  };
+  std::unordered_map<std::string, std::int32_t> ranks{{"a", 0}, {"b", 1}, {"c", 2}};
+  std::int32_t id = 3;
+  for (int k = 0; k < 40; ++k) {
+    std::string s;
+    const auto len = 2 + next() % 4;
+    for (std::uint32_t i = 0; i < len; ++i) s.push_back(static_cast<char>('a' + next() % 3));
+    if (ranks.emplace(s, id).second) ++id;
+  }
+  gyre::TiktokenModel m;
+  m.set_ranks(ranks);
+  m.set_vocab_size(id);
+  gyre::PieceTable none;
+  for (int t = 0; t < 300; ++t) {
+    std::string span;
+    const auto len = 1 + next() % 40;
+    for (std::uint32_t i = 0; i < len; ++i) span.push_back(static_cast<char>('a' + next() % 3));
+    std::vector<std::int32_t> got;
+    ASSERT_TRUE(m.encode_span(span, none, got));
+    EXPECT_EQ(got, naive_tiktoken(ranks, span)) << span;
+  }
+  // A long single-piece run (the pretokenizer does not bound punctuation runs) stays fast and
+  // still tiles the input.
+  const std::string run(200000, 'a');
+  std::vector<std::int32_t> got;
+  ASSERT_TRUE(m.encode_span(run, none, got));
+  std::vector<std::string> by_id(static_cast<std::size_t>(id));
+  for (auto& [s, r] : ranks) by_id[static_cast<std::size_t>(r)] = s;
+  std::string back;
+  for (auto g : got) back += by_id[static_cast<std::size_t>(g)];
+  EXPECT_EQ(back, run);
+}
+
+// Regression: wrong-typed fields threw nlohmann::type_error out of the Result API, and a huge
+// token id resized the piece table to match.
+TEST(Tiktoken, MalformedTokJsonIsAnErrorNotAThrow) {
+  const char* bad[] = {
+      R"({"regular_tokens":[{"bytes":["x"],"token":0}],"special_tokens":[],"word_split":"V1"})",
+      R"({"regular_tokens":[{"bytes":[97],"token":"0"}],"special_tokens":[],"word_split":"V1"})",
+      R"({"regular_tokens":[{"bytes":[97],"token":2147483647}],"special_tokens":[],"word_split":"V1"})",
+      R"({"regular_tokens":[{"bytes":[97],"token":99999999999}],"special_tokens":[],"word_split":"V1"})",
+      R"({"regular_tokens":[{"bytes":[97],"token":0}],"special_tokens":[],"word_split":"V1","vocab_size":"9"})",
+      R"({"regular_tokens":[{"bytes":[97],"token":0}],"special_tokens":[],"word_split":"V1","vocab_size":4000000000})",
+      R"({"regular_tokens":7,"word_split":"V1"})",
+  };
+  for (const char* j : bad) EXPECT_FALSE(gyre::load_tiktoken_json(j)) << j;
+  // No special_tokens list at all is a tokenizer without specials.
+  auto ok = gyre::load_tiktoken_json(R"({"regular_tokens":[{"bytes":[97],"token":0}],"word_split":"V1"})");
+  ASSERT_TRUE(ok) << ok.error().message;
+  EXPECT_EQ((*ok)->encode("aa").value(), (std::vector<std::int32_t>{0, 0}));
 }

@@ -15,6 +15,9 @@ struct SafetensorInfo {
   std::vector<std::int64_t> shape;
   std::uint64_t data_begin{0};  // offset from start of data section
   std::uint64_t data_end{0};
+  // False for a dtype Gyre has no DType for (I64, F64, BOOL, F8_*, ...). `dtype` is then only a
+  // placeholder and safetensors_load refuses the tensor instead of reinterpreting it as f32.
+  bool dtype_known{true};
 };
 
 struct SafetensorFile {

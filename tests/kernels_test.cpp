@@ -75,6 +75,27 @@ TEST(Kernels, ReductionsAreThreadCountIndependent) {
   set_num_threads(0);  // back to automatic for the other tests
 }
 
+// Wide outputs (K*N large, M > 512) take the scratch-free row-split path instead of nb*K*N
+// per-block partials (GBs for an LM head). It must match the reference and stay thread-count
+// independent. 4400 rows -> 18 blocks; 18 * 128*2048 floats exceeds the 16 MiB partial budget.
+TEST(Kernels, MatmulTnWideOutputNoScratchPath) {
+  Rng rng(11);
+  auto a = rand_t({4400, 128}, rng), b = rand_t({4400, 2048}, rng);
+  set_num_threads(1);
+  auto g1 = matmul_tn(a, b);
+  set_num_threads(8);
+  auto g8 = matmul_tn(a, b);
+  set_num_threads(0);
+  ASSERT_TRUE(g1 && g8);
+  EXPECT_EQ(g1->shape()[0], 128);
+  EXPECT_EQ(g1->shape()[1], 2048);
+  auto v1 = to_vec(*g1), v8 = to_vec(*g8);
+  EXPECT_EQ(0, std::memcmp(v1.data(), v8.data(), v1.size() * sizeof(float)));
+  auto ref = matmul(*transpose_last2(a), b);
+  ASSERT_TRUE(ref);
+  expect_near_vec(v1, to_vec(*ref), 1e-3f, "matmul_tn wide");
+}
+
 TEST(Kernels, SumDimMatchesNaive) {
   Rng rng(4);
   auto a = rand_t({4, 5, 6, 3}, rng);

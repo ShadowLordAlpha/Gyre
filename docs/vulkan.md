@@ -52,6 +52,19 @@ is clamped to ±20 on GPU only so `exp` does not overflow to NaN (`std::tanh`
 saturates). Mixed-device LN/CE/bias operands error (`mixed_device`); OOB
 embedding/CE ids error (`index OOB` / `target OOB`) like CPU.
 
+Limits and memory are checked, not assumed: a dispatch past
+`maxComputeWorkGroupCount`, a tensor larger than `maxStorageBufferRange`, or a
+misaligned bind offset is an error (lower `--batch`). Out of VRAM (or the
+driver's allocation-count cap) frees the buffer pool and retries once, then
+errors; it never falls back to host-visible memory (that would move a discrete
+GPU's training to system RAM over PCIe). Host-visible memory is used only on a
+device with no device-local storage memory type.
+
+Vulkan runs are **not bit-reproducible**: LayerNorm gamma/beta grads and
+embedding grads accumulate with float atomics whose order follows GPU
+scheduling, so two runs with the same seed differ in the low bits and slowly
+drift apart. Use CPU with `set_deterministic(true)` when bit-exact replay matters.
+
 Grok RoPE / MoE / GQA kernels are not implemented on Vulkan. OpenCL and CUDA are not in tree.
 
 ## Tests

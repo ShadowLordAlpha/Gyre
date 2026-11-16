@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 
 namespace gyre {
 namespace {
@@ -25,6 +26,18 @@ Result<Views> views(const HeadLayout& L, const HeadMasks& m) {
   auto pa = m.active.host_span<std::uint8_t>();
   if (!pl || !pa) return std::unexpected(pl ? pa.error() : pl.error());
   return Views{*pl, *pa, m.legal.shape()[0]};
+}
+
+// HeadDist tensors are indexed as [b*total + j]; one computed for another batch
+// (or with logp/prob shapes that disagree) would be read past its end.
+Result<std::span<const float>> dist_span(const Tensor& t, const HeadLayout& L, std::int64_t B,
+                                         const char* what) {
+  if (t.dtype() != DType::f32 || t.rank() != 2 || t.shape()[0] != B || t.shape()[1] != L.total())
+    return std::unexpected(make_error(Errc::invalid_shape, std::string("HeadDist.") + what +
+                                                               " must be f32 [B,total] matching the masks"));
+  auto s = t.host_span<float>();
+  if (!s) return std::unexpected(s.error());
+  return std::span<const float>(*s);
 }
 
 }  // namespace
@@ -102,7 +115,7 @@ Result<Tensor> sample_actions(const HeadDist& d, const HeadLayout& L, const Head
   auto v = views(L, m);
   if (!v) return std::unexpected(v.error());
   if (!greedy && !rng) return std::unexpected(err(Errc::unsupported, "sampling needs an Rng"));
-  auto pp = d.prob.host_span<float>();
+  auto pp = dist_span(d.prob, L, v->B, "prob");
   if (!pp) return std::unexpected(pp.error());
   std::int64_t sh[2] = {v->B, L.heads()};
   auto out = Tensor::empty(sh, DType::i32, d.prob.device());
@@ -230,7 +243,7 @@ Result<Tensor> log_prob(const HeadDist& d, const HeadLayout& L, const HeadMasks&
   if (!v) return std::unexpected(v.error());
   auto pa = check_actions(actions, L, v->B);
   if (!pa) return std::unexpected(pa.error());
-  auto plp = d.logp.host_span<float>();
+  auto plp = dist_span(d.logp, L, v->B, "logp");
   if (!plp) return std::unexpected(plp.error());
   std::int64_t sh[1] = {v->B};
   auto out = Tensor::zeros(sh, DType::f32, d.logp.device());
@@ -256,9 +269,10 @@ Result<Tensor> log_prob(const HeadDist& d, const HeadLayout& L, const HeadMasks&
 Result<Tensor> entropy(const HeadDist& d, const HeadLayout& L, const HeadMasks& m) {
   auto v = views(L, m);
   if (!v) return std::unexpected(v.error());
-  auto plp = d.logp.host_span<float>();
-  auto ppr = d.prob.host_span<float>();
-  if (!plp || !ppr) return std::unexpected(plp ? ppr.error() : plp.error());
+  auto plp = dist_span(d.logp, L, v->B, "logp");
+  if (!plp) return std::unexpected(plp.error());
+  auto ppr = dist_span(d.prob, L, v->B, "prob");
+  if (!ppr) return std::unexpected(ppr.error());
   std::int64_t sh[1] = {v->B};
   auto out = Tensor::zeros(sh, DType::f32, d.logp.device());
   if (!out) return std::unexpected(out.error());
@@ -286,13 +300,17 @@ Result<Tensor> log_prob_entropy_backward(const HeadDist& d, const HeadLayout& L,
   if (!v) return std::unexpected(v.error());
   auto pa = check_actions(actions, L, v->B);
   if (!pa) return std::unexpected(pa.error());
-  if (dlogp.rank() != 1 || dent.rank() != 1 || dlogp.shape()[0] != v->B || dent.shape()[0] != v->B)
-    return std::unexpected(err(Errc::invalid_shape, "dlogp/dent [B]"));
-  auto plp = d.logp.host_span<float>();
-  auto ppr = d.prob.host_span<float>();
+  if (dlogp.dtype() != DType::f32 || dent.dtype() != DType::f32 || dlogp.rank() != 1 || dent.rank() != 1 ||
+      dlogp.shape()[0] != v->B || dent.shape()[0] != v->B)
+    return std::unexpected(err(Errc::invalid_shape, "dlogp/dent f32 [B]"));
+  auto plp = dist_span(d.logp, L, v->B, "logp");
+  if (!plp) return std::unexpected(plp.error());
+  auto ppr = dist_span(d.prob, L, v->B, "prob");
+  if (!ppr) return std::unexpected(ppr.error());
   auto pdl = dlogp.host_span<float>();
+  if (!pdl) return std::unexpected(pdl.error());
   auto pde = dent.host_span<float>();
-  if (!plp || !ppr || !pdl || !pde) return std::unexpected(err(Errc::not_cpu, "host"));
+  if (!pde) return std::unexpected(pde.error());
   auto out = Tensor::zeros(d.logp.shape(), DType::f32, d.logp.device());
   if (!out) return std::unexpected(out.error());
   auto po = out->host_span<float>();

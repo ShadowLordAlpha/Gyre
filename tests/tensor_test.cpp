@@ -25,3 +25,18 @@ TEST(Tensor, CopyDeletedClone) {
   auto s = c->host_span<float>();
   EXPECT_EQ((*s)[1], 2.f);
 }
+
+// product_shape used to return 0 at the first zero dim, so a later negative dim was never checked.
+TEST(Tensor, NegativeDimAfterZeroRejected) {
+  auto d = gyre::Device::cpu();
+  ASSERT_TRUE(d);
+  std::int64_t bad[] = {0, -5};
+  auto z = gyre::Tensor::zeros(bad, gyre::DType::f32, *d);
+  ASSERT_FALSE(z);
+  EXPECT_EQ(z.error().code, gyre::Errc::invalid_shape);
+  std::int64_t ok[] = {0, 5};
+  auto e = gyre::Tensor::zeros(ok, gyre::DType::f32, *d);
+  ASSERT_TRUE(e);
+  EXPECT_EQ(e->numel(), 0);
+  EXPECT_FALSE(gyre::Tensor::view_reshape(*e, bad));
+}

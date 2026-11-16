@@ -50,6 +50,18 @@ inline float scheduled_lr(const TrainConfig& cfg, std::uint32_t step) {
   return hi + (cfg.lr - hi) * t;
 }
 
+// Seed of the batch/dropout Rng for a run that starts after `start_step`.
+// start_step 0 returns `seed` unchanged; otherwise splitmix64 mixes the step in,
+// so a resumed run (or a later --prune-gens generation) draws fresh batches
+// instead of replaying steps 1..k of the original run.
+inline std::uint64_t train_stream_seed(std::uint64_t seed, std::uint32_t start_step) noexcept {
+  if (start_step == 0) return seed;
+  std::uint64_t z = seed + 0x9E3779B97F4A7C15ull * (static_cast<std::uint64_t>(start_step) + 1);
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  return z ^ (z >> 31);
+}
+
 class TrainLoop {
  public:
   Result<void> run(Module& model, Dataset& data, const TrainConfig& cfg, std::shared_ptr<Device> device,

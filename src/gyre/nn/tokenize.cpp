@@ -4,12 +4,14 @@
 #include "gyre/nn/tiktoken.hpp"
 #include "gyre/nn/unigram.hpp"
 
+#include "atomic_file.hpp"
 #include "json_parse.hpp"
 
 #include <algorithm>
 #include <fstream>
 #include <string>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace gyre {
@@ -84,7 +86,11 @@ Result<std::vector<std::int32_t>> Tokenizer::encode(std::string_view text,
   return out;
 }
 
-std::string Tokenizer::decode(std::span<const std::int32_t> ids) const { return pieces_.concat(ids); }
+std::string Tokenizer::decode(std::span<const std::int32_t> ids) const {
+  auto s = pieces_.concat(ids);
+  pretok_->decode(s);
+  return s;
+}
 
 std::int64_t Tokenizer::vocab_size() const { return pieces_.size() ? pieces_.size() : model_->vocab_size(); }
 
@@ -116,13 +122,11 @@ std::string Tokenizer::to_json() const {
 }
 
 Result<void> Tokenizer::save(const std::filesystem::path& path) const {
-  auto parent = path.parent_path();
-  if (!parent.empty()) std::filesystem::create_directories(parent);
-  std::ofstream out(path, std::ios::binary);
-  if (!out) return std::unexpected(make_error(Errc::io, path.string()));
   auto j = to_json();
-  out.write(j.data(), static_cast<std::streamsize>(j.size()));
-  return {};
+  return detail::write_file_atomic(path, [&](std::ofstream& out) -> Result<void> {
+    out.write(j.data(), static_cast<std::streamsize>(j.size()));
+    return {};
+  });
 }
 
 Result<void> Tokenizer::save_huggingface(const std::filesystem::path& dir) const {
@@ -175,6 +179,7 @@ static PieceTable table_from_vocab_object(const nlohmann::json& obj, bool gyre_t
   std::int32_t maxid = -1;
   for (auto& [k, v] : obj.items()) maxid = std::max(maxid, v.get<std::int32_t>());
   if (maxid < 0) return t;
+  if (maxid >= kMaxTokenizerVocab) throw std::length_error("vocab id");
   t.pieces.assign(static_cast<std::size_t>(maxid + 1), {});
   t.identity256 = false;
   for (auto& [k, v] : obj.items()) {
@@ -207,6 +212,8 @@ static Result<std::unique_ptr<Tokenizer>> bytelevel_bpe_tokenizer(
   std::int32_t maxid = -1;
   for (auto& [k, v] : vocab.items()) maxid = std::max(maxid, v.get<std::int32_t>());
   for (auto& [content, id] : added) maxid = std::max(maxid, id);
+  if (maxid >= kMaxTokenizerVocab)
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "byte-level BPE: token id too large"));
   PieceTable t;
   t.identity256 = false;
   t.pieces.assign(static_cast<std::size_t>(maxid + 1), {});
@@ -338,6 +345,17 @@ static Result<std::unique_ptr<Tokenizer>> from_nested_json(const nlohmann::json&
     bool fallback = obj.value("byte_fallback", false);
     auto um = UnigramModel::from_scores(std::move(scores), fallback);
     if (!um) return std::unexpected(um.error());
+    if (obj.contains("unk_id")) {
+      const auto unk = obj["unk_id"].get<std::int32_t>();
+      if (unk < -1 || unk >= t.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "tokenizer: unk_id out of range"));
+      (*um)->set_unk_id(unk);
+    }
+    if (obj.contains("piece_types")) {
+      auto types = obj["piece_types"].get<std::vector<std::uint8_t>>();
+      if (types.size() != t.pieces.size())
+        return std::unexpected(make_error(Errc::ckpt_corrupt, "tokenizer: piece_types size != vocab size"));
+      (*um)->set_piece_types(std::move(types));
+    }
     return std::make_unique<Tokenizer>(std::move(*pt), std::move(*um), std::move(t));
   }
   auto merges = BpeModel::parse_merges(obj.dump());
@@ -377,12 +395,38 @@ static Result<std::unique_ptr<Tokenizer>> from_nested_json(const nlohmann::json&
   return tok;
 }
 
+// Tokenizer files are untrusted: a wrong-typed field (nlohmann type_error) or a size that cannot
+// be allocated must come back as an error, not escape the Result API.
+template <class F>
+static Result<std::unique_ptr<Tokenizer>> guard_tokenizer_load(const char* what, F&& f) {
+  try {
+    return f();
+  } catch (const nlohmann::json::exception& e) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, std::string(what) + ": " + e.what()));
+  } catch (const std::bad_alloc&) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, std::string(what) + ": too large"));
+  } catch (const std::length_error&) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, std::string(what) + ": too large"));
+  }
+}
+
+static Result<std::unique_ptr<Tokenizer>> from_json_impl(std::string_view json);
+static Result<std::unique_ptr<Tokenizer>> load_huggingface_impl(const std::filesystem::path& dir);
+
 Result<std::unique_ptr<Tokenizer>> Tokenizer::from_json(std::string_view json) {
+  return guard_tokenizer_load("tokenizer", [&] { return from_json_impl(json); });
+}
+
+Result<std::unique_ptr<Tokenizer>> Tokenizer::load_huggingface(const std::filesystem::path& dir) {
+  return guard_tokenizer_load("tokenizer.json", [&] { return load_huggingface_impl(dir); });
+}
+
+static Result<std::unique_ptr<Tokenizer>> from_json_impl(std::string_view json) {
   auto p = parse_json(json);
   if (!p) return std::unexpected(p.error());
   auto& j = *p;
   if (j.contains("tokenizer") && j["tokenizer"].is_object()) return from_nested_json(j["tokenizer"]);
-  if (j.contains("tokenizer") && j["tokenizer"].is_string() && j["tokenizer"] == "bytes") return bytes();
+  if (j.contains("tokenizer") && j["tokenizer"].is_string() && j["tokenizer"] == "bytes") return Tokenizer::bytes();
   if ((j.contains("tokenizer") && j["tokenizer"] == "bpe") || j.contains("merges")) {
     auto merges = BpeModel::parse_merges(std::string(json));
     if (!merges) return std::unexpected(merges.error());
@@ -394,7 +438,7 @@ Result<std::unique_ptr<Tokenizer>> Tokenizer::from_json(std::string_view json) {
     if (!bm) return std::unexpected(bm.error());
     return std::make_unique<Tokenizer>(make_identity_pretok(), std::move(*bm), std::move(*table));
   }
-  if (j.contains("vocab") && j["vocab"].is_string() && j["vocab"] == "bytes") return bytes();
+  if (j.contains("vocab") && j["vocab"].is_string() && j["vocab"] == "bytes") return Tokenizer::bytes();
   if (j.contains("vocab") && j["vocab"].is_array()) {
     auto t = table_from_vocab_array(j["vocab"]);
     auto bm = std::make_unique<BpeModel>();
@@ -425,7 +469,7 @@ Result<std::unique_ptr<Tokenizer>> Tokenizer::load(const std::filesystem::path& 
   return from_json(s);
 }
 
-Result<std::unique_ptr<Tokenizer>> Tokenizer::load_huggingface(const std::filesystem::path& dir) {
+static Result<std::unique_ptr<Tokenizer>> load_huggingface_impl(const std::filesystem::path& dir) {
   auto tokj = dir;
   if (std::filesystem::is_directory(dir)) tokj = dir / "tokenizer.json";
   if (std::filesystem::exists(tokj) && tokj.filename() == "tokenizer.json") {
@@ -489,16 +533,47 @@ Result<std::unique_ptr<Tokenizer>> Tokenizer::load_huggingface(const std::filesy
     if (type == "Unigram") {
       PieceTable table;
       std::vector<float> scores;
+      // byte_fallback models name the byte pieces <0xNN>: keep them as the raw byte, typed BYTE,
+      // so unknown characters fall back to them (as Hugging Face does) instead of to unk_id.
+      const bool byte_fallback = model.value("byte_fallback", false);
+      std::vector<std::uint8_t> types;
+      auto byte_piece = [](const std::string& s, char& out) {
+        auto hex = [](char c) -> int {
+          if (c >= '0' && c <= '9') return c - '0';
+          if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+          return -1;
+        };
+        if (s.size() != 6 || s.compare(0, 3, "<0x") != 0 || s[5] != '>') return false;
+        const int hi = hex(s[3]), lo = hex(s[4]);
+        if (hi < 0 || lo < 0) return false;
+        out = static_cast<char>(hi * 16 + lo);
+        return true;
+      };
       if (model.contains("vocab") && model["vocab"].is_array()) {
         for (auto& row : model["vocab"]) {
           if (row.is_array() && row.size() >= 2) {
-            table.pieces.push_back(piece_bytes(row[0].get<std::string>()));
+            const auto text = row[0].get<std::string>();
+            char raw = 0;
+            if (byte_fallback && byte_piece(text, raw)) {
+              table.pieces.emplace_back(1, raw);
+              types.push_back(UnigramModel::kByte);
+            } else {
+              table.pieces.push_back(piece_bytes(text));
+              types.push_back(UnigramModel::kNormal);
+            }
             scores.push_back(row[1].get<float>());
           }
         }
       }
+      // unk_id null: Hugging Face refuses text no piece covers; Gyre returns an error for it.
+      std::int32_t unk = -1;
+      if (model.contains("unk_id") && !model["unk_id"].is_null()) unk = model["unk_id"].get<std::int32_t>();
+      if (unk < -1 || unk >= table.size())
+        return std::unexpected(make_error(Errc::ckpt_corrupt, "tokenizer.json: unk_id out of range"));
       auto um = UnigramModel::from_scores(std::move(scores), true);
       if (!um) return std::unexpected(um.error());
+      (*um)->set_unk_id(unk);
+      if (byte_fallback) (*um)->set_piece_types(std::move(types));
       return std::make_unique<Tokenizer>(std::move(pt), std::move(*um), std::move(table));
     }
     if (ptype == "ByteLevel" && model.contains("vocab") && model["vocab"].is_object()) {
@@ -533,6 +608,7 @@ Result<std::unique_ptr<Tokenizer>> Tokenizer::load_huggingface(const std::filesy
     };
     for (auto& [content, id] : added) {  // added tokens may sit past the model vocab
       if (id < 0) return bad("negative added token id");
+      if (id >= kMaxTokenizerVocab) return bad("added token id too large");
       if (static_cast<std::size_t>(id) >= table.pieces.size()) table.pieces.resize(static_cast<std::size_t>(id) + 1);
       if (table.pieces[static_cast<std::size_t>(id)].empty()) table.pieces[static_cast<std::size_t>(id)] = content;
     }

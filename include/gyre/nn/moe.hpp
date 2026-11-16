@@ -24,6 +24,8 @@ Result<MoeTopK> moe_topk(const Tensor& logits, int k, float router_softcap);
 Result<Tensor> swiglu_ffn(const Tensor& x, const SwiGLUWeights& w);
 
 // residual_moe: dense SwiGLU(x) + sum_j weight_j * expert_{idx_j}(x)
+// A default (all-null) `dense` drops the dense branch: plain sparse MoE, experts only.
+// Dense and expert outputs must be [N, D]; a narrower w2 is an invalid_shape error.
 Result<Tensor> residual_moe(const Tensor& x, const SwiGLUWeights& dense, const Tensor& router_w,
                             std::span<const SwiGLUWeights> experts, int k, float router_softcap);
 

@@ -4,8 +4,12 @@
 #include "json_parse.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <exception>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace gyre {
@@ -54,11 +58,19 @@ Result<DecoderBlock> DecoderBlock::create(const CharLMConfig& c, std::shared_ptr
 }
 
 Result<void> DecoderBlock::set_lora(const CharLoraLayer& layer, float scale) {
+  // All-or-nothing: a shape error on any projection detaches the whole block, so no layer keeps a
+  // half-attached adapter that the owner's lora parameter list cannot see.
   auto ra = attn_.set_lora(layer.q, layer.k, layer.v, layer.o, scale);
-  if (!ra) return ra;
+  if (!ra) {
+    clear_lora();
+    return ra;
+  }
   auto r1 = fc1_.set_lora(layer.fc1.A, layer.fc1.B, scale);
-  auto r2 = fc2_.set_lora(layer.fc2.A, layer.fc2.B, scale);
-  if (!r1 || !r2) return std::unexpected(r1 ? r2.error() : r1.error());
+  auto r2 = r1 ? fc2_.set_lora(layer.fc2.A, layer.fc2.B, scale) : Result<void>{};
+  if (!r1 || !r2) {
+    clear_lora();
+    return std::unexpected(r1 ? r2.error() : r1.error());
+  }
   return {};
 }
 
@@ -217,6 +229,12 @@ void CharLM::rebind() {
 }
 
 Result<CharLM> CharLM::create(CharLMConfig c, std::shared_ptr<Device> d, Rng& rng) {
+  // Range-check before the modulo: a corrupt or hand-edited config with n_head = 0 would otherwise
+  // divide by zero instead of returning an error.
+  if (c.n_head <= 0 || c.d_model <= 0 || c.vocab <= 0 || c.block_size <= 0 || c.n_layer < 0 || c.d_ff < 0) {
+    return std::unexpected(make_error(Errc::invalid_shape, "char-lm config: n_head, d_model, vocab and "
+                                                           "block_size must be > 0; n_layer, d_ff >= 0"));
+  }
   if (c.d_model % c.n_head != 0) {
     return std::unexpected(make_error(Errc::invalid_shape, "d_model % n_head"));
   }
@@ -358,7 +376,10 @@ Result<std::vector<std::int32_t>> CharLM::generate(std::vector<std::int32_t> pre
     }
     auto p = logits_h.host_span<float>();
     if (!p) return std::unexpected(p.error());
-    const auto V = cfg_.vocab;
+    const auto V = logits_h.shape()[logits_h.rank() - 1];  // real width, not cfg_.vocab
+    if (V <= 0 || static_cast<std::int64_t>(p->size()) != ctx_n * V) {
+      return std::unexpected(make_error(Errc::invalid_shape, "generate: logits shape"));
+    }
     const float* last = p->data() + (ctx_n - 1) * V;
     auto next = sample_logit_row(std::span<const float>(last, static_cast<std::size_t>(V)), temperature,
                                  rng);
@@ -382,22 +403,39 @@ Result<void> CharLM::set_lora(CharLora lora) {
   if (lora.rank > 0 && static_cast<std::int64_t>(lora.layers.size()) != cfg_.n_layer) {
     return std::unexpected(make_error(Errc::invalid_shape, "lora layers"));
   }
+  // Keep the current adapter so a failed attach can put it back instead of leaving blocks
+  // 0..i-1 carrying a partial adapter that lora_flat_ (optimizer, zero_grad, save) cannot see.
+  std::optional<CharLora> prev = std::exchange(lora_, std::nullopt);
   clear_lora();
   if (lora.rank <= 0) {
     lora_ = std::move(lora);
     return {};
   }
-  const float scale = lora.scale();
-  for (std::size_t i = 0; i < blocks_.size(); ++i) {
-    auto r = blocks_[i].set_lora(lora.layers[i], scale);
-    if (!r) return r;
+  auto attach = [this](const CharLora& l) -> Result<void> {
+    const float scale = l.scale();
+    for (std::size_t i = 0; i < blocks_.size(); ++i) {
+      auto r = blocks_[i].set_lora(l.layers[i], scale);
+      if (!r) return r;
+    }
+    lora_flat_.clear();
+    for (auto& b : blocks_) {
+      auto part = b.lora_parameters();
+      for (auto& p : part) lora_flat_.push_back(std::move(p));
+    }
+    return {};
+  };
+  if (auto r = attach(lora); !r) {
+    clear_lora();
+    if (prev && prev->rank > 0 && attach(*prev)) {
+      lora_ = std::move(prev);
+    } else if (prev && prev->rank <= 0) {
+      lora_ = std::move(prev);
+    } else {
+      clear_lora();
+    }
+    return r;
   }
   lora_ = std::move(lora);
-  lora_flat_.clear();
-  for (auto& b : blocks_) {
-    auto part = b.lora_parameters();
-    for (auto& p : part) lora_flat_.push_back(std::move(p));
-  }
   return {};
 }
 
@@ -451,19 +489,30 @@ Result<void> CharLM::load_lora(const std::filesystem::path& path, std::shared_pt
     auto parsed = parse_json(peek->json);
     if (parsed && (*parsed).contains("config") && (*parsed)["config"].is_object()) {
       const auto& cfg = (*parsed)["config"];
-      rank = cfg.value("rank", rank);
-      alpha = cfg.value("alpha", alpha);
-      if (cfg.contains("d_model") && cfg["d_model"].get<std::int64_t>() != cfg_.d_model) {
-        return std::unexpected(make_error(Errc::invalid_shape, "lora d_model"));
-      }
-      if (cfg.contains("n_layer") && cfg["n_layer"].get<std::int64_t>() != cfg_.n_layer) {
-        return std::unexpected(make_error(Errc::invalid_shape, "lora n_layer"));
-      }
-      if (cfg.contains("d_ff") && cfg["d_ff"].get<std::int64_t>() != cfg_.d_ff) {
-        return std::unexpected(make_error(Errc::invalid_shape, "lora d_ff"));
+      // Typed access throws on e.g. "rank":"8" or "d_model":null; keep this a Result API.
+      try {
+        rank = cfg.value("rank", rank);
+        alpha = cfg.value("alpha", alpha);
+        if (cfg.contains("d_model") && cfg["d_model"].get<std::int64_t>() != cfg_.d_model) {
+          return std::unexpected(make_error(Errc::invalid_shape, "lora d_model"));
+        }
+        if (cfg.contains("n_layer") && cfg["n_layer"].get<std::int64_t>() != cfg_.n_layer) {
+          return std::unexpected(make_error(Errc::invalid_shape, "lora n_layer"));
+        }
+        if (cfg.contains("d_ff") && cfg["d_ff"].get<std::int64_t>() != cfg_.d_ff) {
+          return std::unexpected(make_error(Errc::invalid_shape, "lora d_ff"));
+        }
+      } catch (const std::exception& e) {
+        return std::unexpected(make_error(Errc::ckpt_corrupt, std::string("lora config: ") + e.what()));
       }
     }
   }
+  // A rank above the widest adapted dim is never useful and would only drive a huge allocation
+  // before any tensor is read.
+  if (rank < 0 || rank > std::max(cfg_.d_model, cfg_.d_ff)) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "lora rank out of range: " + std::to_string(rank)));
+  }
+  if (!std::isfinite(alpha)) return std::unexpected(make_error(Errc::ckpt_corrupt, "lora alpha"));
   Rng rng(1);
   auto created = CharLora::create(cfg_, rank, alpha, d, rng);
   if (!created) return std::unexpected(created.error());

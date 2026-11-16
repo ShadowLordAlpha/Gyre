@@ -69,6 +69,7 @@ Result<std::unique_ptr<Tokenizer>> Tokenizer::load_sentencepiece(const std::file
   ProtoReader r{buf.data(), buf.data() + buf.size()};
   PieceTable table;
   std::vector<float> scores;
+  std::vector<std::uint8_t> types;
   int model_type = 1;  // UNIGRAM
   while (r.ok && r.p < r.end) {
     auto tag = r.varint();
@@ -84,6 +85,7 @@ Result<std::unique_ptr<Tokenizer>> Tokenizer::load_sentencepiece(const std::file
       r.p = sub_end;
       std::string piece;
       float score = 0;
+      std::uint64_t type = UnigramModel::kNormal;
       while (s.ok && s.p < s.end) {
         auto t2 = s.varint();
         int f2 = static_cast<int>(t2 >> 3);
@@ -97,12 +99,31 @@ Result<std::unique_ptr<Tokenizer>> Tokenizer::load_sentencepiece(const std::file
           if (!s.remain(4)) break;
           score = decode_f32(s.p);
           s.p += 4;
+        } else if (f2 == 3 && w2 == 0) {
+          type = s.varint();
         } else {
           if (!s.skip_value(w2)) break;
         }
       }
+      if (type < UnigramModel::kNormal || type > UnigramModel::kByte) type = UnigramModel::kNormal;
+      // BYTE pieces are named <0xNN>: store the raw byte so byte fallback finds it and decode
+      // yields the byte itself.
+      if (type == UnigramModel::kByte) {
+        auto hex = [](char c) -> int {
+          if (c >= '0' && c <= '9') return c - '0';
+          if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+          if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+          return -1;
+        };
+        if (piece.size() == 6 && piece.compare(0, 3, "<0x") == 0 && piece[5] == '>' && hex(piece[3]) >= 0 &&
+            hex(piece[4]) >= 0)
+          piece.assign(1, static_cast<char>(hex(piece[3]) * 16 + hex(piece[4])));
+        else
+          type = UnigramModel::kUnused;  // malformed byte piece: never matched
+      }
       table.pieces.push_back(std::move(piece));
       scores.push_back(score);
+      types.push_back(static_cast<std::uint8_t>(type));
     } else if (fn == 2 && wt == 2) {  // trainer_spec
       auto n = r.varint();
       if (!r.ok || !r.remain(static_cast<std::size_t>(n))) break;
@@ -129,8 +150,19 @@ Result<std::unique_ptr<Tokenizer>> Tokenizer::load_sentencepiece(const std::file
     return std::unexpected(make_error(Errc::unsupported, "sentencepiece BPE not imported"));
   if (model_type == 3)
     return std::unexpected(make_error(Errc::unsupported, "sentencepiece WORD"));
-  auto um = UnigramModel::from_scores(std::move(scores), true);
+  // Piece types decide what Viterbi may match: CONTROL (<s>, </s>), UNKNOWN and UNUSED pieces are
+  // never matched in text, an uncovered character becomes BYTE pieces when the model has them
+  // (byte_fallback) and the UNKNOWN piece otherwise.
+  std::int32_t unk = -1;
+  bool has_bytes = false;
+  for (std::size_t i = 0; i < types.size(); ++i) {
+    if (types[i] == UnigramModel::kUnknown && unk < 0) unk = static_cast<std::int32_t>(i);
+    if (types[i] == UnigramModel::kByte) has_bytes = true;
+  }
+  auto um = UnigramModel::from_scores(std::move(scores), has_bytes);
   if (!um) return std::unexpected(um.error());
+  (*um)->set_unk_id(unk);
+  (*um)->set_piece_types(std::move(types));
   return std::make_unique<Tokenizer>(make_metaspace_pretok(true), std::move(*um), std::move(table));
 }
 

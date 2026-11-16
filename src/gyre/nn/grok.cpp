@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <fstream>
 #include <span>
 #include <sstream>
@@ -375,9 +376,12 @@ Result<Tensor> GrokLM::forward(const Tensor& idx, ForwardCtx& ctx) {
       ex[static_cast<std::size_t>(e)] = SwiGLUWeights{&p[off].value, &p[off + 1].value, &p[off + 2].value};
       off += 3;
     }
-    auto ffn = residual_moe(*n2, dense, p[10].value, ex,
+    // residual_moe: dense SwiGLU + routed experts. Otherwise a plain sparse MoE (experts only): an
+    // empty dense slot tells residual_moe to skip the dense branch. Either way one call, so a shape
+    // error from the router or experts is returned, not computed and thrown away.
+    const SwiGLUWeights dense_or_none = cfg_.residual_moe ? dense : SwiGLUWeights{};
+    auto ffn = residual_moe(*n2, dense_or_none, p[10].value, ex,
                             static_cast<int>(cfg_.n_experts_per_tok), cfg_.router_softcap);
-    if (!cfg_.residual_moe) ffn = swiglu_ffn(*n2, dense);
     if (!ffn) return ffn;
     auto post_m = rms_norm(*ffn, p[off].value, cfg_.rms_eps);
     if (!post_m) return post_m;
@@ -421,7 +425,11 @@ Result<std::vector<std::int32_t>> GrokLM::generate(std::vector<std::int32_t> pre
     if (!logits) return std::unexpected(logits.error());
     auto p = logits->host_span<float>();
     if (!p) return std::unexpected(make_error(Errc::not_cpu, "host"));
-    const auto V = cfg_.vocab;
+    // Use the logits' real width, not cfg_.vocab: a mismatched lm_head must not read past the end.
+    const auto V = logits->shape()[logits->rank() - 1];
+    if (V <= 0 || static_cast<std::int64_t>(p->size()) != T * V) {
+      return std::unexpected(make_error(Errc::invalid_shape, "generate: logits shape"));
+    }
     const float* row = p->data() + (T - 1) * V;
     auto tok = sample_logit_row(std::span<const float>(row, static_cast<std::size_t>(V)), temperature, rng);
     if (!tok) return std::unexpected(tok.error());
@@ -670,10 +678,21 @@ Result<void> GrokLM::load_lora(const std::filesystem::path& dir, std::shared_ptr
   float alpha = 4.f;
   if (!js.empty()) {
     if (auto parsed = parse_json(js); parsed) {
-      rank = (*parsed).value("rank", rank);
-      alpha = (*parsed).value("alpha", alpha);
+      // Typed access throws on e.g. "rank":"4"; keep this a Result API.
+      try {
+        rank = (*parsed).value("rank", rank);
+        alpha = (*parsed).value("alpha", alpha);
+      } catch (const std::exception& e) {
+        return std::unexpected(make_error(Errc::ckpt_corrupt, std::string("lora.json: ") + e.what()));
+      }
     }
   }
+  // A rank above the widest adapted dim is never useful and would only drive a huge allocation.
+  const auto max_rank = std::max({cfg_.d_model, cfg_.n_q_head * cfg_.head_dim, cfg_.n_kv_head * cfg_.head_dim});
+  if (rank < 0 || rank > max_rank) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "lora rank out of range: " + std::to_string(rank)));
+  }
+  if (!std::isfinite(alpha)) return std::unexpected(make_error(Errc::ckpt_corrupt, "lora alpha"));
   Rng rng(1);
   auto l = GrokLora::create(cfg_, rank, alpha, d, rng);
   if (!l) return std::unexpected(l.error());
@@ -683,14 +702,26 @@ Result<void> GrokLM::load_lora(const std::filesystem::path& dir, std::shared_ptr
   }
   auto st = safetensors_open(dir / "lora.safetensors");
   if (!st) return std::unexpected(st.error());
-  auto loadp = [&](GrokLoraPair& p, const std::string& a, const std::string& b) -> Result<void> {
-    auto A = safetensors_load(*st, a, d, false);
-    auto B = safetensors_load(*st, b, d, false);
-    if (!A) return std::unexpected(A.error());
-    if (!B) return std::unexpected(B.error());
-    p.A = std::move(*A);
-    p.B = std::move(*B);
+  // Each loaded A/B must match the freshly created [in,rank] / [rank,out] slot, and f16/bf16
+  // adapters are widened to f32 like base weights (matmul is f32-only).
+  auto load1 = [&](Tensor& slot, const std::string& name) -> Result<void> {
+    auto t = safetensors_load(*st, name, d, false);
+    if (!t) return std::unexpected(t.error());
+    if (!std::ranges::equal(t->shape(), slot.shape())) {
+      return std::unexpected(make_error(Errc::invalid_shape, "lora shape mismatch: " + name));
+    }
+    if (t->dtype() != DType::f32) {
+      auto f = t->to_f32();
+      if (!f) return std::unexpected(f.error());
+      t = std::move(f);
+    }
+    slot = std::move(*t);
     return {};
+  };
+  auto loadp = [&](GrokLoraPair& p, const std::string& a, const std::string& b) -> Result<void> {
+    auto ra = load1(p.A, a);
+    if (!ra) return ra;
+    return load1(p.B, b);
   };
   for (std::int64_t i = 0; i < cfg_.n_layer; ++i) {
     auto s = std::string("layers.") + std::to_string(i);

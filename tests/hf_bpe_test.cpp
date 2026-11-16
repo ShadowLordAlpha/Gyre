@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 
@@ -227,6 +228,164 @@ TEST(HfImport, GyreExportRoundTripNonAscii) {
     EXPECT_STREQ((*re)->model_name(), tok->model_name());
     EXPECT_EQ((*re)->pieces().pieces, tok->pieces().pieces) << tok->model_name();
     EXPECT_EQ((*re)->encode(text).value(), tok->encode(text).value()) << tok->model_name();
+    std::filesystem::remove_all(dir);
+  }
+}
+
+// Regression: decode was a plain concat, so Metaspace tokenizers returned "▁café▁naïve".
+TEST(HfImport, MetaspaceDecodeRestoresSpaces) {
+  const auto dir = write_hf_dir("gyre_hf_unigram_decode", R"({"version":"1.0","truncation":null,"padding":null,
+    "added_tokens":[],"normalizer":null,
+    "pre_tokenizer":{"type":"Metaspace","replacement":"▁","prepend_scheme":"always","split":false},
+    "post_processor":null,"decoder":null,
+    "model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],["▁",-3.0],["▁café",-1.0],
+      ["é",-4.0],["c",-4.0],["a",-4.0],["f",-4.0],["а",-2.0],["0",-2.0],["▁naïve",-1.0],
+      ["n",-4.0]],"byte_fallback":false}})");
+  auto tok = Tokenizer::load_huggingface(dir);
+  ASSERT_TRUE(tok) << tok.error().message;
+  for (const std::string s : {"caf\xC3\xA9 na\xC3\xAFve", "caf\xC3\xA9", "a  0", " caf\xC3\xA9"}) {
+    auto ids = (*tok)->encode(s);
+    ASSERT_TRUE(ids) << s;
+    EXPECT_EQ((*tok)->decode(*ids), s);
+  }
+  std::filesystem::remove_all(dir);
+}
+
+namespace {
+
+void pb_varint(std::string& o, std::uint64_t v) {
+  while (v >= 0x80) {
+    o.push_back(static_cast<char>((v & 0x7F) | 0x80));
+    v >>= 7;
+  }
+  o.push_back(static_cast<char>(v));
+}
+
+// ModelProto.pieces entry {piece, score, type}.
+void pb_piece(std::string& model, const std::string& piece, float score, int type) {
+  std::string sub;
+  pb_varint(sub, (1 << 3) | 2);
+  pb_varint(sub, piece.size());
+  sub += piece;
+  pb_varint(sub, (2 << 3) | 5);
+  char f[4];
+  std::memcpy(f, &score, 4);
+  sub.append(f, 4);
+  pb_varint(sub, (3 << 3) | 0);
+  pb_varint(sub, static_cast<std::uint64_t>(type));
+  pb_varint(model, (1 << 3) | 2);
+  pb_varint(model, sub.size());
+  model += sub;
+}
+
+}  // namespace
+
+// Regression: SentencePiece piece types were ignored. <s>/</s> (CONTROL) matched literal text,
+// byte-fallback pieces <0xNN> were never used (unknown characters became id 0), and decode left
+// the U+2581 markers in.
+TEST(SentencePiece, PieceTypesByteFallbackAndUnk) {
+  const std::string ms = "\xE2\x96\x81";
+  std::string m;
+  pb_piece(m, "<unk>", 0.f, 2);         // 0 UNKNOWN
+  pb_piece(m, "<s>", 0.f, 3);           // 1 CONTROL
+  pb_piece(m, "</s>", 0.f, 3);          // 2 CONTROL
+  pb_piece(m, "<0xE2>", 0.f, 6);        // 3 BYTE
+  pb_piece(m, "<0x82>", 0.f, 6);        // 4 BYTE
+  pb_piece(m, "<0xAC>", 0.f, 6);        // 5 BYTE
+  pb_piece(m, ms, -2.f, 1);             // 6
+  pb_piece(m, ms + "hi", -1.f, 1);      // 7
+  pb_piece(m, "h", -3.f, 1);            // 8
+  pb_piece(m, "i", -3.f, 1);            // 9
+  const auto path = std::filesystem::temp_directory_path() / "gyre_sp_types.model";
+  {
+    std::ofstream o(path, std::ios::binary);
+    o.write(m.data(), static_cast<std::streamsize>(m.size()));
+  }
+  auto tok = Tokenizer::load(path);
+  ASSERT_TRUE(tok) << tok.error().message;
+  EXPECT_EQ((*tok)->encode("hi").value(), (Ids{7}));
+  // "€" has no piece: its UTF-8 bytes become the BYTE pieces, and decode gives the text back.
+  const std::string euro = "hi \xE2\x82\xAC";
+  auto ids = (*tok)->encode(euro);
+  ASSERT_TRUE(ids) << ids.error().message;
+  EXPECT_EQ(*ids, (Ids{7, 6, 3, 4, 5}));
+  EXPECT_EQ((*tok)->decode(*ids), euro);
+  // "<s>" is not matched as the CONTROL piece; uncovered characters without byte pieces become
+  // one merged <unk>.
+  EXPECT_EQ((*tok)->encode("<s>").value(), (Ids{6, 0}));
+  // The Gyre document keeps the types and the unk id.
+  auto re = Tokenizer::from_json((*tok)->to_json());
+  ASSERT_TRUE(re) << re.error().message;
+  EXPECT_EQ((*re)->encode(euro).value(), *ids);
+  EXPECT_EQ((*re)->encode("<s>").value(), (Ids{6, 0}));
+  std::filesystem::remove(path);
+}
+
+// Regression: Unigram train cut rare single bytes by count, and the byte fallback then emitted
+// id 0 for them, so decode(encode(x)) != x.
+TEST(UnigramTrain, KeepsEveryByteAndNeverEmitsSilentZero) {
+  std::string text;
+  for (int i = 0; i < 200; ++i) text += "the cat sat on the mat. ";
+  text += "\xC3\xA9";  // a rare non-ASCII character, seen once
+  auto big = Tokenizer::train_unigram(text, 600);
+  ASSERT_TRUE(big) << big.error().message;
+  for (const std::string s : {text, std::string("caf\xC3\xA9 \x01\xFF z"), std::string("\xE2\x82\xAC")}) {
+    auto ids = (*big)->encode(s);
+    ASSERT_TRUE(ids) << ids.error().message;
+    EXPECT_EQ((*big)->decode(*ids), s);
+  }
+  // A small vocab keeps every byte of the training text; an unseen byte is an error, not id 0.
+  auto small = Tokenizer::train_unigram(text, 40);
+  ASSERT_TRUE(small) << small.error().message;
+  auto ids = (*small)->encode(text);
+  ASSERT_TRUE(ids) << ids.error().message;
+  EXPECT_EQ((*small)->decode(*ids), text);
+  EXPECT_FALSE((*small)->encode("zzz"));
+  // ... and survives a Gyre document round trip.
+  auto re = Tokenizer::from_json((*small)->to_json());
+  ASSERT_TRUE(re) << re.error().message;
+  EXPECT_FALSE((*re)->encode("zzz"));
+  EXPECT_EQ((*re)->encode(text).value(), *ids);
+  EXPECT_FALSE(Tokenizer::train_unigram("abcdefghijklmnopqrstu", 16));  // fewer slots than distinct bytes
+}
+
+// Regression: BPE train broke count ties by unordered_map iteration order (toolchain dependent).
+TEST(BpeTrain, TiesGoToTheSmallestPair) {
+  // xy and ab both occur twice; (a,b) < (x,y).
+  auto tok = Tokenizer::train_bpe("xyxyabab", 257);
+  ASSERT_TRUE(tok) << tok.error().message;
+  ASSERT_GE((*tok)->pieces().pieces.size(), 257u);
+  EXPECT_EQ((*tok)->pieces().pieces[256], "ab");
+}
+
+// Regression: wrong-typed fields in tokenizer files threw nlohmann::type_error out of the Result
+// API (terminating the CLI), and huge ids sized the piece table.
+TEST(TokenizerLoad, MalformedFilesAreErrorsNotThrows) {
+  const char* docs[] = {
+      R"({"gyre":"tokenizer","version":1,"tokenizer":{"model":"bpe","pretoken":"identity","vocab":[1]}})",
+      R"({"gyre":"tokenizer","version":1,"tokenizer":{"model":"unigram","pretoken":"identity","vocab":["a"],"scores":["x"]}})",
+      R"({"gyre":"tokenizer","version":1,"tokenizer":{"model":"bpe","pretoken":"identity","vocab":{"a":"x"}}})",
+      R"({"gyre":"tokenizer","version":1,"tokenizer":{"model":"bpe","pretoken":"identity","vocab":{"a":2000000000}}})",
+      R"({"gyre":"tokenizer","version":1,"tokenizer":{"model":"unigram","pretoken":"identity","vocab":["a"],"scores":[0],"unk_id":5}})",
+      R"({"gyre":"tokenizer","version":1,"tokenizer":{"model":"tiktoken_bpe","ranks":"vocab","vocab":[3]}})",
+  };
+  for (const char* d : docs) {
+    Result<std::unique_ptr<Tokenizer>> r = std::unexpected(make_error(Errc::ok, ""));
+    EXPECT_NO_THROW(r = Tokenizer::from_json(d)) << d;
+    EXPECT_FALSE(r) << d;
+  }
+  EXPECT_NO_THROW((void)Tokenizer::from_json(R"({"merges":[[1,"x"]]})"));
+  const char* hf[] = {
+      R"({"model":{"type":"BPE","vocab":{"a":"x"},"merges":[]}})",
+      R"({"model":{"type":"BPE","vocab":{"a":2000000000},"merges":[]}})",
+      R"({"model":{"type":"Unigram","unk_id":0,"vocab":[["a","x"]]}})",
+      R"({"model":{"type":"Unigram","unk_id":7,"vocab":[["a",0.0]]}})",
+  };
+  for (const char* j : hf) {
+    const auto dir = write_hf_dir("gyre_hf_malformed", j);
+    Result<std::unique_ptr<Tokenizer>> r = std::unexpected(make_error(Errc::ok, ""));
+    EXPECT_NO_THROW(r = Tokenizer::load_huggingface(dir)) << j;
+    EXPECT_FALSE(r) << j;
     std::filesystem::remove_all(dir);
   }
 }

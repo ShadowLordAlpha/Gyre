@@ -1,6 +1,7 @@
 #include "gyre/checkpoint.hpp"
 
 #include "gyre/io/codec.hpp"
+#include "atomic_file.hpp"
 #include "json_parse.hpp"
 
 #include <array>
@@ -220,30 +221,62 @@ Result<nlohmann::json> tensor_data_json(const Tensor& t) {
   return a;
 }
 
+// Integer element of a twin's "data" array, range-checked (get<> would wrap silently).
+template <class T>
+bool json_int_in_range(const nlohmann::json& v, T& out) {
+  if (v.is_number_unsigned()) {
+    const auto u = v.get<std::uint64_t>();
+    if (u > static_cast<std::uint64_t>(std::numeric_limits<T>::max())) return false;
+    out = static_cast<T>(u);
+    return true;
+  }
+  if (v.is_number_integer()) {
+    const auto s = v.get<std::int64_t>();
+    if (s < static_cast<std::int64_t>(std::numeric_limits<T>::min()) ||
+        s > static_cast<std::int64_t>(std::numeric_limits<T>::max()))
+      return false;
+    out = static_cast<T>(s);
+    return true;
+  }
+  return false;
+}
+
 Result<Tensor> tensor_from_data_json(const GyreTensorDesc& d, const nlohmann::json& data,
                                      std::shared_ptr<Device> device) {
+  // Validate the array against the descriptor before allocating: the shape comes from the file.
+  if (!data.is_array()) return std::unexpected(make_error(Errc::ckpt_corrupt, "data array"));
+  if (d.dtype != DType::f32 && d.dtype != DType::i32 && d.dtype != DType::u8)
+    return std::unexpected(make_error(Errc::unsupported, "json data dtype"));
+  auto nb = checked_nbytes(d.dtype, d.shape);
+  if (!nb) return std::unexpected(nb.error());
+  if (data.size() != *nb / dtype_size(d.dtype)) return std::unexpected(make_error(Errc::invalid_shape, d.name));
   auto cpu = Device::cpu();
   if (!cpu) return std::unexpected(cpu.error());
   auto t = Tensor::empty(d.shape, d.dtype, *cpu);
   if (!t) return t;
-  if (!data.is_array()) return std::unexpected(make_error(Errc::ckpt_corrupt, "data array"));
+  const auto bad = [&](std::size_t i) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, d.name + ": bad data element " + std::to_string(i)));
+  };
   if (d.dtype == DType::f32) {
     auto p = t->host_span<float>();
     if (!p) return std::unexpected(p.error());
-    if (data.size() != p->size()) return std::unexpected(make_error(Errc::invalid_shape, d.name));
-    for (std::size_t i = 0; i < p->size(); ++i) (*p)[i] = data[i].get<float>();
+    for (std::size_t i = 0; i < p->size(); ++i) {
+      const auto& v = data[i];
+      // JSON has no NaN/Inf: nlohmann dumps them as null, so read null back as NaN.
+      if (v.is_null()) (*p)[i] = std::numeric_limits<float>::quiet_NaN();
+      else if (v.is_number()) (*p)[i] = v.get<float>();
+      else return bad(i);
+    }
   } else if (d.dtype == DType::i32) {
     auto p = t->host_span<std::int32_t>();
     if (!p) return std::unexpected(p.error());
-    if (data.size() != p->size()) return std::unexpected(make_error(Errc::invalid_shape, d.name));
-    for (std::size_t i = 0; i < p->size(); ++i) (*p)[i] = data[i].get<std::int32_t>();
-  } else if (d.dtype == DType::u8) {
+    for (std::size_t i = 0; i < p->size(); ++i)
+      if (!json_int_in_range(data[i], (*p)[i])) return bad(i);
+  } else {
     auto p = t->host_span<std::uint8_t>();
     if (!p) return std::unexpected(p.error());
-    if (data.size() != p->size()) return std::unexpected(make_error(Errc::invalid_shape, d.name));
-    for (std::size_t i = 0; i < p->size(); ++i) (*p)[i] = data[i].get<std::uint8_t>();
-  } else {
-    return std::unexpected(make_error(Errc::unsupported, "json data dtype"));
+    for (std::size_t i = 0; i < p->size(); ++i)
+      if (!json_int_in_range(data[i], (*p)[i])) return bad(i);
   }
   if (device && device->kind() != DeviceKind::cpu) {
     return t->to(std::move(device));
@@ -419,14 +452,18 @@ Result<GyreFile> open_json_file(std::string raw, std::shared_ptr<Device> device)
   auto j = parse_json(raw);
   if (!j) return std::unexpected(j.error());
   GyreFile gf{std::move(*doc), nullptr, 0};
-  if (j->contains("tensors") && (*j)["tensors"].is_array()) {
-    const auto& arr = (*j)["tensors"];
-    for (std::size_t i = 0; i < gf.doc().tensors.size() && i < arr.size(); ++i) {
-      if (!arr[i].contains("data")) continue;
-      auto t = tensor_from_data_json(gf.doc().tensors[i], arr[i]["data"], device);
-      if (!t) return std::unexpected(t.error());
-      gf.add_json_tensor(gf.doc().tensors[i].name, std::move(*t));
+  try {
+    if (j->contains("tensors") && (*j)["tensors"].is_array()) {
+      const auto& arr = (*j)["tensors"];
+      for (std::size_t i = 0; i < gf.doc().tensors.size() && i < arr.size(); ++i) {
+        if (!arr[i].is_object() || !arr[i].contains("data")) continue;
+        auto t = tensor_from_data_json(gf.doc().tensors[i], arr[i]["data"], device);
+        if (!t) return std::unexpected(t.error());
+        gf.add_json_tensor(gf.doc().tensors[i].name, std::move(*t));
+      }
     }
+  } catch (const nlohmann::json::exception& e) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, std::string("json tensor data: ") + e.what()));
   }
   return gf;
 }
@@ -539,8 +576,14 @@ bool GyreDoc::recency_alibi() const {
 
 double GyreDoc::holdout() const {
   auto c = parse_json(config_json);
-  if (!c || !c->contains("holdout")) return 0.1;
-  return (*c)["holdout"].get<double>();
+  if (!c || !c->is_object() || !c->contains("holdout")) return 0.1;
+  const auto& h = (*c)["holdout"];
+  // Config comes from the file: a non-number or out-of-range value falls back to the default
+  // instead of throwing out of a non-Result accessor.
+  if (!h.is_number()) return 0.1;
+  const auto v = h.get<double>();
+  if (!(v >= 0.0 && v < 1.0)) return 0.1;
+  return v;
 }
 
 Result<void> save_gyre(const std::filesystem::path& path, std::span<const Param> params, const Adam* adam,
@@ -582,50 +625,48 @@ Result<void> save_gyre(const std::filesystem::path& path, std::span<const Param>
     payload_bytes = align64(static_cast<std::size_t>(last.offset + last.packed_bytes));
   }
 
-  auto parent = path.parent_path();
-  if (!parent.empty()) std::filesystem::create_directories(parent);
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out) return std::unexpected(make_error(Errc::io, "open write"));
+  // Written through a temp file and renamed: a crash mid-save keeps the previous checkpoint.
+  return detail::write_file_atomic(path, [&](std::ofstream& out) -> Result<void> {
+    std::array<std::byte, 64> hdr{};
+    out.write(reinterpret_cast<const char*>(hdr.data()), 64);
+    out.write(js.data(), static_cast<std::streamsize>(js.size()));
+    std::vector<char> pad(static_cast<std::size_t>(payload_off - (json_off + json_len)), 0);
+    if (!pad.empty()) out.write(pad.data(), static_cast<std::streamsize>(pad.size()));
 
-  std::array<std::byte, 64> hdr{};
-  out.write(reinterpret_cast<const char*>(hdr.data()), 64);
-  out.write(js.data(), static_cast<std::streamsize>(js.size()));
-  std::vector<char> pad(static_cast<std::size_t>(payload_off - (json_off + json_len)), 0);
-  if (!pad.empty()) out.write(pad.data(), static_cast<std::streamsize>(pad.size()));
-
-  std::uint32_t pcrc = 0;
-  std::vector<std::byte> zpad(64, std::byte{0});
-  for (auto& blob : packed) {
-    out.write(reinterpret_cast<const char*>(blob.data()), static_cast<std::streamsize>(blob.size()));
-    pcrc = crc32c_update(pcrc, std::span<const std::byte>(blob.data(), blob.size()));
-    const auto need = align64(blob.size()) - blob.size();
-    if (need) {
-      out.write(reinterpret_cast<const char*>(zpad.data()), static_cast<std::streamsize>(need));
-      pcrc = crc32c_update(pcrc, std::span<const std::byte>(zpad.data(), need));
+    std::uint32_t pcrc = 0;
+    std::vector<std::byte> zpad(64, std::byte{0});
+    for (auto& blob : packed) {
+      out.write(reinterpret_cast<const char*>(blob.data()), static_cast<std::streamsize>(blob.size()));
+      pcrc = crc32c_update(pcrc, std::span<const std::byte>(blob.data(), blob.size()));
+      const auto need = align64(blob.size()) - blob.size();
+      if (need) {
+        out.write(reinterpret_cast<const char*>(zpad.data()), static_cast<std::streamsize>(need));
+        pcrc = crc32c_update(pcrc, std::span<const std::byte>(zpad.data(), need));
+      }
     }
-  }
-  put_u32(hdr.data(), pcrc);  // temp store
-  std::array<std::byte, 4> crcbuf{};
-  put_u32(crcbuf.data(), pcrc);
-  out.write(reinterpret_cast<const char*>(crcbuf.data()), 4);
+    put_u32(hdr.data(), pcrc);  // temp store
+    std::array<std::byte, 4> crcbuf{};
+    put_u32(crcbuf.data(), pcrc);
+    out.write(reinterpret_cast<const char*>(crcbuf.data()), 4);
 
-  hdr = {};
-  std::memcpy(hdr.data(), "GYRE1\0\0\0", 8);
-  put_u32(hdr.data() + 8, 2);
-  put_u32(hdr.data() + 12, 2);  // payload crc
-  put_u64(hdr.data() + 16, items.size());
-  put_u64(hdr.data() + 24, json_len);
-  put_u64(hdr.data() + 32, json_off);
-  put_u64(hdr.data() + 40, payload_off);
-  put_u64(hdr.data() + 48, payload_bytes);
-  put_u16(hdr.data() + 56, 0);
-  put_u16(hdr.data() + 58, 1);
-  auto hcrc = crc32c(std::span<const std::byte>(hdr.data(), 60));
-  put_u32(hdr.data() + 60, hcrc);
-  out.seekp(0);
-  out.write(reinterpret_cast<const char*>(hdr.data()), 64);
-  if (!out) return std::unexpected(make_error(Errc::io, "write"));
-  return {};
+    hdr = {};
+    std::memcpy(hdr.data(), "GYRE1\0\0\0", 8);
+    put_u32(hdr.data() + 8, 2);
+    put_u32(hdr.data() + 12, 2);  // payload crc
+    put_u64(hdr.data() + 16, items.size());
+    put_u64(hdr.data() + 24, json_len);
+    put_u64(hdr.data() + 32, json_off);
+    put_u64(hdr.data() + 40, payload_off);
+    put_u64(hdr.data() + 48, payload_bytes);
+    put_u16(hdr.data() + 56, 0);
+    put_u16(hdr.data() + 58, 1);
+    auto hcrc = crc32c(std::span<const std::byte>(hdr.data(), 60));
+    put_u32(hdr.data() + 60, hcrc);
+    out.seekp(0);
+    out.write(reinterpret_cast<const char*>(hdr.data()), 64);
+    if (!out) return std::unexpected(make_error(Errc::io, "write"));
+    return {};
+  });
 }
 
 Result<void> save_gyre_json(const std::filesystem::path& path, std::span<const Param> params, const Adam* adam,
@@ -644,13 +685,11 @@ Result<void> save_gyre_json(const std::filesystem::path& path, std::span<const P
       (*j)["tensors"][i].erase("offset");
     }
   }
-  auto parent = path.parent_path();
-  if (!parent.empty()) std::filesystem::create_directories(parent);
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out) return std::unexpected(make_error(Errc::io, path.string()));
   auto s = j->dump(2);
-  out.write(s.data(), static_cast<std::streamsize>(s.size()));
-  return {};
+  return detail::write_file_atomic(path, [&](std::ofstream& out) -> Result<void> {
+    out.write(s.data(), static_cast<std::streamsize>(s.size()));
+    return {};
+  });
 }
 
 Result<GyreFile> GyreFile::open(const std::filesystem::path& path) {

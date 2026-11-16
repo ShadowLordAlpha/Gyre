@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <string_view>
 
 namespace gyre::app {
 
@@ -25,6 +26,8 @@ struct CharLMOpts {
   double holdout{0.1};  // last fraction of raw bytes reserved; 0 = train on full file
   std::uint32_t steps{2000};
   std::uint32_t batch{4};
+  bool batch_set{false};      // --batch given: apply_charlm_preset keeps it (else tinygpt/nanogpt 4 -> 2)
+  bool tokenizer_set{false};  // --tokenizer given: wins over the tinygpt byte-level default
   std::uint32_t block{128};
   std::int64_t d_model{128};
   std::int64_t n_layer{4};
@@ -53,6 +56,10 @@ struct CharLMOpts {
 };
 
 void apply_charlm_preset(CharLMOpts& o);
+
+// Names accepted by apply_charlm_preset / make_tokenizer; the CLI rejects anything else.
+bool is_known_preset(std::string_view name);
+bool is_known_tokenizer(std::string_view name);
 
 struct GaOpts {
   std::uint32_t generations{80};

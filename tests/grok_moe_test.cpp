@@ -174,3 +174,89 @@ TEST(GrokMoe, TwoTokensDifferentExperts) {
   EXPECT_NEAR((*py)[2], (*p1)[2], 1e-4f);
   EXPECT_NEAR((*py)[3], (*p1)[3], 1e-4f);
 }
+
+namespace {
+
+gyre::Tensor randn2(std::int64_t r, std::int64_t c, std::uint64_t seed, std::shared_ptr<gyre::Device> d) {
+  gyre::Rng rng(seed);
+  auto t = zeros2(r, c, d);
+  auto p = t->host_span<float>();
+  for (auto& x : *p) x = rng.normal(0.f, 0.5f);
+  return std::move(*t);
+}
+
+}  // namespace
+
+// Grouped-by-expert compute must equal the per-token definition:
+// y[n] = dense(x[n]) + sum_j w[n,j] * expert_{idx[n,j]}(x[n]).
+TEST(GrokMoe, ManyTokensMatchPerTokenReference) {
+  auto d = gyre::Device::cpu();
+  const std::int64_t N = 9, Dim = 6, I = 5, E = 3;
+  const int k = 2;
+  auto x = randn2(N, Dim, 1, *d);
+  std::vector<gyre::Tensor> w;
+  for (std::uint64_t s = 0; s < 3 * (E + 1); ++s) {
+    const bool down = (s % 3) == 2;
+    w.push_back(randn2(down ? I : Dim, down ? Dim : I, 100 + s, *d));
+  }
+  gyre::SwiGLUWeights dense{&w[0], &w[1], &w[2]};
+  std::vector<gyre::SwiGLUWeights> ex;
+  for (std::int64_t e = 0; e < E; ++e) ex.push_back({&w[3 + 3 * e], &w[4 + 3 * e], &w[5 + 3 * e]});
+  auto rw = randn2(Dim, E, 50, *d);
+  auto y = gyre::residual_moe(x, dense, rw, ex, k, 0.f);
+  ASSERT_TRUE(y) << y.error().message;
+  auto y_sparse = gyre::residual_moe(x, gyre::SwiGLUWeights{}, rw, ex, k, 0.f);
+  ASSERT_TRUE(y_sparse) << y_sparse.error().message;
+
+  auto logits = gyre::matmul(x, rw);
+  auto top = gyre::moe_topk(*logits, k, 0.f);
+  auto dens = gyre::swiglu_ffn(x, dense);
+  ASSERT_TRUE(top && dens);
+  auto pi = top->indices.host_span<std::int32_t>();
+  auto pw = top->weights.host_span<float>();
+  auto px = x.host_span<float>();
+  auto pd = dens->host_span<float>();
+  auto py = y->host_span<float>();
+  auto ps = y_sparse->host_span<float>();
+  for (std::int64_t n = 0; n < N; ++n) {
+    std::vector<float> ref(static_cast<std::size_t>(Dim), 0.f);
+    std::int64_t one[] = {1, Dim};
+    auto tok = gyre::Tensor::from_host(std::as_bytes(std::span(px->data() + n * Dim, Dim)), one,
+                                       gyre::DType::f32, *d);
+    for (int j = 0; j < k; ++j) {
+      auto e = (*pi)[static_cast<std::size_t>(n * k + j)];
+      auto ye = gyre::swiglu_ffn(*tok, ex[static_cast<std::size_t>(e)]);
+      ASSERT_TRUE(ye);
+      auto pe = ye->host_span<float>();
+      for (std::int64_t c = 0; c < Dim; ++c)
+        ref[static_cast<std::size_t>(c)] += (*pw)[static_cast<std::size_t>(n * k + j)] * (*pe)[static_cast<std::size_t>(c)];
+    }
+    for (std::int64_t c = 0; c < Dim; ++c) {
+      const auto i = static_cast<std::size_t>(n * Dim + c);
+      EXPECT_NEAR((*ps)[i], ref[static_cast<std::size_t>(c)], 1e-5f);
+      EXPECT_NEAR((*py)[i], (*pd)[i] + ref[static_cast<std::size_t>(c)], 1e-5f);
+    }
+  }
+}
+
+// matmul only checks inner dims, so a dense or expert w2 narrower than D used to be read past its
+// end (memcpy of N*D floats / D floats per expert row). Now an invalid_shape error.
+TEST(GrokMoe, NarrowOutputWidthIsError) {
+  auto d = gyre::Device::cpu();
+  const std::int64_t N = 3, Dim = 4, I = 5;
+  auto x = randn2(N, Dim, 2, *d);
+  auto w1 = randn2(Dim, I, 3, *d), w3 = randn2(Dim, I, 4, *d), w2 = randn2(I, Dim, 5, *d);
+  auto narrow = randn2(I, Dim - 1, 6, *d);
+  auto rw = randn2(Dim, 2, 7, *d);
+  gyre::SwiGLUWeights good{&w1, &w3, &w2};
+  gyre::SwiGLUWeights bad{&w1, &w3, &narrow};
+  gyre::SwiGLUWeights ok_ex[] = {good, good};
+  gyre::SwiGLUWeights bad_ex[] = {bad, bad};
+  ASSERT_TRUE(gyre::residual_moe(x, good, rw, ok_ex, 1, 0.f));
+  auto r1 = gyre::residual_moe(x, bad, rw, ok_ex, 1, 0.f);
+  ASSERT_FALSE(r1);
+  EXPECT_EQ(r1.error().code, gyre::Errc::invalid_shape);
+  auto r2 = gyre::residual_moe(x, good, rw, bad_ex, 1, 0.f);
+  ASSERT_FALSE(r2);
+  EXPECT_EQ(r2.error().code, gyre::Errc::invalid_shape);
+}

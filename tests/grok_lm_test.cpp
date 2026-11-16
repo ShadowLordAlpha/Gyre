@@ -110,3 +110,49 @@ TEST(GrokLM, OneLayerLogitsSeed1) {
   auto p2 = y2->host_span<float>();
   for (std::size_t i = 0; i < p->size(); ++i) EXPECT_EQ((*p)[i], (*p2)[i]);
 }
+
+namespace {
+
+std::vector<float> grok_logits(gyre::GrokLM& m, const std::shared_ptr<gyre::Device>& d) {
+  std::int32_t ids[] = {1, 2, 3, 4};
+  std::int64_t sh[] = {1, 4};
+  auto idx = gyre::Tensor::from_host(std::as_bytes(std::span(ids)), sh, gyre::DType::i32, d);
+  gyre::ForwardCtx ctx;
+  ctx.train = false;
+  auto y = m.forward(*idx, ctx);
+  if (!y) return {};
+  auto p = y->host_span<float>();
+  return std::vector<float>(p->begin(), p->end());
+}
+
+}  // namespace
+
+// residual_moe=false used to run the full MoE, throw it away and use only the dense MLP. It is now
+// a plain sparse MoE: experts only. Check: residual model with its dense MLP zeroed == sparse model.
+TEST(GrokLM, NonResidualMoeUsesExpertsOnly) {
+  auto c = gyre::GrokConfig::tiny();
+  c.n_layer = 1;
+  auto d = gyre::Device::cpu();
+  gyre::Rng r1(5), r2(5);
+  auto res = gyre::GrokLM::create(c, *d, r1);
+  c.residual_moe = false;
+  auto sparse = gyre::GrokLM::create(c, *d, r2);
+  ASSERT_TRUE(res && sparse);
+  const auto y_sparse = grok_logits(*sparse, *d);
+  ASSERT_FALSE(y_sparse.empty());
+  EXPECT_NE(grok_logits(*res, *d), y_sparse);  // dense branch matters when present
+
+  auto names = res->param_names();
+  int zeroed = 0;
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    const auto& n = names[i];
+    if (n.ends_with(".mlp.gate_proj.weight") || n.ends_with(".mlp.up_proj.weight") ||
+        n.ends_with(".mlp.down_proj.weight")) {
+      auto p = res->parameters()[i].value.host_span<float>();
+      for (auto& v : *p) v = 0.f;
+      ++zeroed;
+    }
+  }
+  ASSERT_EQ(zeroed, 3);
+  EXPECT_EQ(grok_logits(*res, *d), y_sparse);
+}

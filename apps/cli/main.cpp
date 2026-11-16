@@ -1,9 +1,15 @@
 #include "jobs.hpp"
 #include "gyre/nn/tokenize.hpp"
 
+#include <charconv>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
+#include <type_traits>
 
 static void usage() {
   std::cout <<
@@ -56,8 +62,50 @@ static void usage() {
       "--data is any UTF-8 text; default path is a Shakespeare corpus.\n";
 }
 
+namespace {
+
+struct ArgError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+// Whole-string numeric parse: rejects junk ("abc", "12x"), empty, out-of-range, a '-' on an
+// unsigned flag (stoul would wrap it to ~4e9) and non-finite floats.
+template <class T>
+T num(const std::string& flag, const char* text) {
+  const std::string_view sv(text);
+  T v{};
+  const auto [end, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), v);
+  if (sv.empty() || ec != std::errc{} || end != sv.data() + sv.size())
+    throw ArgError("invalid value '" + std::string(sv) + "' for " + flag);
+  if constexpr (std::is_floating_point_v<T>) {
+    if (!std::isfinite(v)) throw ArgError("invalid value '" + std::string(sv) + "' for " + flag);
+  }
+  return v;
+}
+
+}  // namespace
+
+static int run(int argc, char** argv);
+
 int main(int argc, char** argv) {
+  try {
+    return run(argc, argv);
+  } catch (const ArgError& e) {
+    std::cerr << "error: " << e.what() << "\n(see gyre-cli --help)\n";
+    return 2;
+  } catch (const std::exception& e) {
+    std::cerr << "error: " << e.what() << '\n';
+    return 1;
+  }
+}
+
+static int run(int argc, char** argv) {
   using namespace gyre::app;
+  // Value of the flag at argv[i]; advances i. A flag given last without a value is an error.
+  auto next = [&](int& i) -> const char* {
+    if (i + 1 >= argc) throw ArgError(std::string("missing value for ") + argv[i]);
+    return argv[++i];
+  };
   bool bar_on = false;
   auto log = [&](std::string s) {
     if (!s.empty() && s.front() == '\r') {
@@ -96,15 +144,16 @@ int main(int argc, char** argv) {
     std::string enc_text = "hello world";
     for (int i = 3; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--data" && i + 1 < argc) o.data = argv[++i];
-      else if (a == "--tokenizer" && i + 1 < argc) o.tokenizer = argv[++i];
-      else if (a == "--vocab-size" && i + 1 < argc) o.vocab_size = std::stoi(argv[++i]);
-      else if (a == "--out" && i + 1 < argc) out = argv[++i];
-      else if (a == "--tok" && i + 1 < argc) o.tok = argv[++i];
-      else if (a == "--hf-dir" && i + 1 < argc) o.hf_dir = argv[++i];
-      else if (a == "--sp" && i + 1 < argc) o.sp_model = argv[++i];
-      else if (a == "--holdout" && i + 1 < argc) o.holdout = std::stod(argv[++i]);
-      else if (a == "--text" && i + 1 < argc) enc_text = argv[++i];
+      if (a == "--data") o.data = next(i);
+      else if (a == "--tokenizer") o.tokenizer = next(i);
+      else if (a == "--vocab-size") o.vocab_size = num<int>(a, next(i));
+      else if (a == "--out") out = next(i);
+      else if (a == "--tok") o.tok = next(i);
+      else if (a == "--hf-dir") o.hf_dir = next(i);
+      else if (a == "--sp") o.sp_model = next(i);
+      else if (a == "--holdout") o.holdout = num<double>(a, next(i));
+      else if (a == "--text") enc_text = next(i);
+      else throw ArgError("unknown option " + a);
     }
     if (sub == "train") {
       auto r = run_tok_train(o, out, log);
@@ -165,33 +214,35 @@ int main(int argc, char** argv) {
         sub = a;
         if ((a == "inspect" || a == "compress-probe" || a == "pack" || a == "import" || a == "gen") &&
             i + 1 < argc && argv[i + 1][0] != '-')
-          go.weights = argv[++i];
-      } else if (a == "--config" && i + 1 < argc)
-        go.config = argv[++i];
-      else if (a == "--weights" && i + 1 < argc)
-        go.weights = argv[++i];
-      else if (a == "--out" && i + 1 < argc)
-        go.out = argv[++i];
-      else if (a == "--file" && i + 1 < argc)
-        go.file_substr = argv[++i];
-      else if (a == "--preset" && i + 1 < argc)
-        go.preset = argv[++i];
-      else if (a == "--prompt" && i + 1 < argc)
-        go.prompt = argv[++i];
-      else if (a == "--max-new" && i + 1 < argc)
-        go.max_new = std::stoi(argv[++i]);
-      else if (a == "--tok" && i + 1 < argc)
-        go.tok = argv[++i];
-      else if (a == "--lora" && i + 1 < argc)
-        go.lora = argv[++i];
-      else if (a == "--codec" && i + 1 < argc)
-        go.codec = argv[++i];
-      else if (a == "--max-bytes" && i + 1 < argc)
-        go.pack_max = std::stoull(argv[++i]);
-      else if (a == "--max-tensors" && i + 1 < argc)
-        go.max_tensors = std::stoi(argv[++i]);
-      else if (a == "--chunk-bytes" && i + 1 < argc)
-        go.chunk_bytes = std::stoull(argv[++i]);
+          go.weights = next(i);
+      } else if (a == "--config")
+        go.config = next(i);
+      else if (a == "--weights")
+        go.weights = next(i);
+      else if (a == "--out")
+        go.out = next(i);
+      else if (a == "--file")
+        go.file_substr = next(i);
+      else if (a == "--preset")
+        go.preset = next(i);
+      else if (a == "--prompt")
+        go.prompt = next(i);
+      else if (a == "--max-new")
+        go.max_new = num<int>(a, next(i));
+      else if (a == "--tok")
+        go.tok = next(i);
+      else if (a == "--lora")
+        go.lora = next(i);
+      else if (a == "--codec")
+        go.codec = next(i);
+      else if (a == "--max-bytes")
+        go.pack_max = num<std::uint64_t>(a, next(i));
+      else if (a == "--max-tensors")
+        go.max_tensors = num<int>(a, next(i));
+      else if (a == "--chunk-bytes")
+        go.chunk_bytes = num<std::uint64_t>(a, next(i));
+      else if (!a.empty() && a[0] == '-')
+        throw ArgError("unknown option " + a);
     }
     gyre::Result<void> r;
     if (sub == "info")
@@ -227,10 +278,12 @@ int main(int argc, char** argv) {
     int max_t = 32;
     for (int i = 3; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--max-tensors" && i + 1 < argc)
-        max_t = std::stoi(argv[++i]);
+      if (a == "--max-tensors")
+        max_t = num<int>(a, next(i));
       else if (!a.empty() && a[0] != '-')
         ckpt = a;
+      else
+        throw ArgError("unknown option " + a);
     }
     auto r = run_ckpt_probe(ckpt, max_t, log);
     if (!r) {
@@ -243,9 +296,10 @@ int main(int argc, char** argv) {
     GaOpts o;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--gens" && i + 1 < argc) o.generations = static_cast<std::uint32_t>(std::stoul(argv[++i]));
-      else if (a == "--n" && i + 1 < argc) o.n = static_cast<std::uint32_t>(std::stoul(argv[++i]));
-      else if (a == "--dim" && i + 1 < argc) o.dim = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      if (a == "--gens") o.generations = num<std::uint32_t>(a, next(i));
+      else if (a == "--n") o.n = num<std::uint32_t>(a, next(i));
+      else if (a == "--dim") o.dim = num<std::uint32_t>(a, next(i));
+      else throw ArgError("unknown option " + a);
     }
     auto r = run_onemax(o, log);
     if (!r) {
@@ -275,73 +329,88 @@ int main(int argc, char** argv) {
     std::int64_t d_model_ov = 0, n_layer_ov = 0, n_head_ov = 0, d_ff_ov = 0;
     for (int i = 3; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--data" && i + 1 < argc) o.data = argv[++i];
-      else if (a == "--ckpt" && i + 1 < argc) o.ckpt = argv[++i];
-      else if (a == "--steps" && i + 1 < argc) o.steps = static_cast<std::uint32_t>(std::stoul(argv[++i]));
-      else if (a == "--batch" && i + 1 < argc) o.batch = static_cast<std::uint32_t>(std::stoul(argv[++i]));
-      else if (a == "--block" && i + 1 < argc) {
-        block_ov = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      if (a == "--data") o.data = next(i);
+      else if (a == "--ckpt") o.ckpt = next(i);
+      else if (a == "--steps") o.steps = num<std::uint32_t>(a, next(i));
+      else if (a == "--batch") {
+        o.batch = num<std::uint32_t>(a, next(i));
+        o.batch_set = true;
+      }
+      else if (a == "--block") {
+        block_ov = num<std::uint32_t>(a, next(i));
         block_set = true;
       }
-      else if (a == "--prompt" && i + 1 < argc) prompt = argv[++i];
-      else if (a == "--chars" && i + 1 < argc) chars = std::stoi(argv[++i]);
-      else if (a == "--temp" && i + 1 < argc) o.temperature = std::stof(argv[++i]);
-      else if (a == "--preset" && i + 1 < argc) o.preset = argv[++i];
-      else if (a == "--ckpt-every" && i + 1 < argc)
-        o.ckpt_every = static_cast<std::uint32_t>(std::stoul(argv[++i]));
-      else if (a == "--lr" && i + 1 < argc) o.lr = std::stof(argv[++i]);
-      else if (a == "--lr-start" && i + 1 < argc) o.lr_start = std::stof(argv[++i]);
-      else if (a == "--lr-decay-steps" && i + 1 < argc)
-        o.lr_decay_steps = static_cast<std::uint32_t>(std::stoul(argv[++i]));
-      else if (a == "--grad-clip" && i + 1 < argc) o.grad_clip = std::stof(argv[++i]);
-      else if (a == "--onnx" && i + 1 < argc) onnx_path = argv[++i];
-      else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
-      else if (a == "--tokenizer" && i + 1 < argc) o.tokenizer = argv[++i];
-      else if (a == "--tok" && i + 1 < argc) o.tok = argv[++i];
-      else if (a == "--hf-dir" && i + 1 < argc) o.hf_dir = argv[++i];
-      else if (a == "--sp" && i + 1 < argc) o.sp_model = argv[++i];
-      else if (a == "--vocab-size" && i + 1 < argc) o.vocab_size = std::stoi(argv[++i]);
-      else if (a == "--split" && i + 1 < argc) {
-        split = std::stod(argv[++i]);
+      else if (a == "--prompt") prompt = next(i);
+      else if (a == "--chars") chars = num<int>(a, next(i));
+      else if (a == "--temp") o.temperature = num<float>(a, next(i));
+      else if (a == "--preset") o.preset = next(i);
+      else if (a == "--ckpt-every")
+        o.ckpt_every = num<std::uint32_t>(a, next(i));
+      else if (a == "--lr") o.lr = num<float>(a, next(i));
+      else if (a == "--lr-start") o.lr_start = num<float>(a, next(i));
+      else if (a == "--lr-decay-steps")
+        o.lr_decay_steps = num<std::uint32_t>(a, next(i));
+      else if (a == "--grad-clip") o.grad_clip = num<float>(a, next(i));
+      else if (a == "--onnx") onnx_path = next(i);
+      else if (a == "--out") out_path = next(i);
+      else if (a == "--tokenizer") {
+        o.tokenizer = next(i);
+        o.tokenizer_set = true;
+      }
+      else if (a == "--tok") o.tok = next(i);
+      else if (a == "--hf-dir") o.hf_dir = next(i);
+      else if (a == "--sp") o.sp_model = next(i);
+      else if (a == "--vocab-size") o.vocab_size = num<int>(a, next(i));
+      else if (a == "--split") {
+        split = num<double>(a, next(i));
         split_set = true;
       }
-      else if (a == "--holdout" && i + 1 < argc) {
-        o.holdout = std::stod(argv[++i]);
+      else if (a == "--holdout") {
+        o.holdout = num<double>(a, next(i));
         holdout_set = true;
       }
-      else if (a == "--d-model" && i + 1 < argc) {
-        d_model_ov = std::stoll(argv[++i]);
+      else if (a == "--d-model") {
+        d_model_ov = num<std::int64_t>(a, next(i));
         d_model_set = true;
       }
-      else if (a == "--n-layer" && i + 1 < argc) {
-        n_layer_ov = std::stoll(argv[++i]);
+      else if (a == "--n-layer") {
+        n_layer_ov = num<std::int64_t>(a, next(i));
         n_layer_set = true;
       }
-      else if (a == "--n-head" && i + 1 < argc) {
-        n_head_ov = std::stoll(argv[++i]);
+      else if (a == "--n-head") {
+        n_head_ov = num<std::int64_t>(a, next(i));
         n_head_set = true;
       }
-      else if (a == "--d-ff" && i + 1 < argc) {
-        d_ff_ov = std::stoll(argv[++i]);
+      else if (a == "--d-ff") {
+        d_ff_ov = num<std::int64_t>(a, next(i));
         d_ff_set = true;
       }
-      else if (a == "--recency" && i + 1 < argc) {
-        std::string r = argv[++i];
-        o.recency_alibi = (r != "none" && r != "off" && r != "0");
+      else if (a == "--recency") {
+        std::string r = next(i);
+        if (r == "alibi" || r == "on" || r == "1") o.recency_alibi = true;
+        else if (r == "none" || r == "off" || r == "0") o.recency_alibi = false;
+        else throw ArgError("--recency must be alibi|none (got '" + r + "')");
       }
-      else if (a == "--device" && i + 1 < argc) o.device = argv[++i];
-      else if (a == "--prune" && i + 1 < argc) o.prune = std::stof(argv[++i]);
-      else if (a == "--prune-gens" && i + 1 < argc)
-        o.prune_gens = static_cast<std::uint32_t>(std::stoul(argv[++i]));
-      else if (a == "--wire" && i + 1 < argc) o.wire = argv[++i];
+      else if (a == "--device") o.device = next(i);
+      else if (a == "--prune") o.prune = num<float>(a, next(i));
+      else if (a == "--prune-gens")
+        o.prune_gens = num<std::uint32_t>(a, next(i));
+      else if (a == "--wire") o.wire = next(i);
       else if (a == "--resume") o.resume = true;
       else if (a == "--shuffle-wire") o.shuffle_wire = true;
-      else if (a == "--dropout" && i + 1 < argc) o.dropout = std::stof(argv[++i]);
-      else if (a == "--decay" && i + 1 < argc) o.decay = std::stof(argv[++i]);
-      else if (a == "--window" && i + 1 < argc) o.eval_window = std::stoll(argv[++i]);
-      else if (a == "--stride" && i + 1 < argc) o.eval_stride = std::stoll(argv[++i]);
+      else if (a == "--dropout") o.dropout = num<float>(a, next(i));
+      else if (a == "--decay") o.decay = num<float>(a, next(i));
+      else if (a == "--window") o.eval_window = num<std::int64_t>(a, next(i));
+      else if (a == "--stride") o.eval_stride = num<std::int64_t>(a, next(i));
       else if (a == "--no-kv-cache") o.kv_cache = false;
+      else throw ArgError("unknown option " + a);
     }
+    if (!is_known_preset(o.preset))
+      throw ArgError("unknown --preset '" + o.preset + "' (tiny|medium|tinygpt|nanogpt)");
+    if (!is_known_tokenizer(o.tokenizer))
+      throw ArgError("unknown --tokenizer '" + o.tokenizer + "' (bpe|chars|bytes|unigram)");
+    if (o.device != "cpu" && o.device != "vulkan" && o.device != "gpu")
+      throw ArgError("unknown --device '" + o.device + "' (cpu|vulkan)");
     apply_charlm_preset(o);
     if (block_set) o.block = block_ov;
     if (d_model_set) o.d_model = d_model_ov;
@@ -350,6 +419,8 @@ int main(int argc, char** argv) {
     if (d_ff_set) o.d_ff = d_ff_ov;
     if (!holdout_set && split_set) o.holdout = split;
     if (sub == "train") {
+      if (o.batch == 0) throw ArgError("--batch must be >= 1");
+      if (o.vocab_size < 1) throw ArgError("--vocab-size must be >= 1");
       if (o.prune < 0.f || o.prune >= 1.f) {
         std::cerr << "--prune must be in (0, 1)\n";
         return 1;

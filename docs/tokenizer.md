@@ -74,6 +74,8 @@ Versioned nested document (not a flat `"tokenizer":"bpe"` string):
 | `tokenizer.vocab` | Piece strings (id = index). Restricted alphabets (chars) always write this. Identity-256 BPE may omit it and rebuild 0..255 + merges |
 | `tokenizer.scores` | Unigram log scores, parallel to `vocab` |
 | `tokenizer.byte_fallback` | Unigram: if true, 1-byte fallback when Viterbi fails |
+| `tokenizer.unk_id` | Unigram, optional: id for text no piece covers; `-1` = encode error (native train writes `-1`). Absent → `0` (older files) |
+| `tokenizer.piece_types` | Unigram, optional: SentencePiece piece types parallel to `vocab` (1 normal, 2 unknown, 3 control, 4 user-defined, 5 unused, 6 byte). With types only normal/user-defined pieces match text and byte pieces (stored as the raw byte) serve byte fallback |
 
 A full model `.gyre` / `.gyre.json` nests this object under `"tokenizer"` (see [gyre-file.md](gyre-file.md)). Standalone tokenizer files keep `"gyre":"tokenizer"`.
 
@@ -119,7 +121,7 @@ The `bytelevel` pre-tokenizer splits raw text with the GPT-2 pattern using the g
 | BPE (2) | Error until merge reconstruction is reliable |
 | WORD (3) | Error |
 
-NFKC is not applied (no ICU). `add_dummy_prefix` is on for metaspace. Native `train_unigram` is **not** bit-identical `spm_train`.
+NFKC is not applied (no ICU). `add_dummy_prefix` is on for metaspace; `decode` turns `▁` back into spaces and drops the dummy-prefix space. Piece types are read: `<s>`/`</s>` (CONTROL), `<unk>` and UNUSED pieces never match text, `<0xNN>` BYTE pieces are used for characters with no one-character piece (byte fallback), otherwise those characters become one merged `<unk>`. Native `train_unigram` is **not** bit-identical `spm_train`.
 
 ## CLI
 
@@ -158,5 +160,5 @@ Report **nats/char or BPC**, never nats/token across different tokenizers. Holdo
 
 - No WordPiece in this pass (`VocabModel` is the hook).
 - No GPT-2 / T5 **weight** import.
-- Native unigram train: frequent substrings + log-count scores, then Viterbi.
+- Native unigram train: frequent substrings + log-count scores, then Viterbi. Every byte of the training text is always kept; with `--vocab-size` ≥ 512 all 256 bytes are, so any text round-trips. With a smaller vocab a byte unseen in training is an encode error, never a silent id 0.
 - Unigram encode is O(n × max_piece_len) per span.

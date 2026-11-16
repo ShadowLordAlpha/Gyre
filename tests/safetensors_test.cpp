@@ -103,3 +103,51 @@ TEST(Safetensors, LoadGrokNormIfPresent) {
   auto p = f32->host_span<float>();
   EXPECT_TRUE(std::isfinite((*p)[0]));
 }
+
+// Regression: header fields were read with unguarded get<> (type_error escaped the Result API),
+// data_end < data_begin wrapped into an exabyte allocation, offsets were never checked against
+// dtype * shape or the file size, and unknown dtypes silently loaded as f32.
+TEST(Safetensors, HostileHeadersAreErrors) {
+  auto dir = std::filesystem::temp_directory_path() / "gyre_st";
+  std::filesystem::create_directories(dir);
+  std::vector<std::byte> payload(16, std::byte{0});
+  const std::string bad[] = {
+      R"({"a":{"dtype":7,"shape":[4],"data_offsets":[0,16]}})",
+      R"({"a":{"dtype":"F32","shape":["4"],"data_offsets":[0,16]}})",
+      R"({"a":{"dtype":"F32","shape":[-4],"data_offsets":[0,16]}})",
+      R"({"a":{"dtype":"F32","shape":[4],"data_offsets":[0,"16"]}})",
+      R"({"a":{"dtype":"F32","shape":[4],"data_offsets":[-1,16]}})",
+      R"({"a":{"dtype":"F32","shape":[0],"data_offsets":[16,0]}})",          // end < begin
+      R"({"a":{"dtype":"F32","shape":[4],"data_offsets":[0,12]}})",          // != dtype * shape
+      R"({"a":{"dtype":"F32","shape":[8],"data_offsets":[0,32]}})",          // past the end of the file
+      R"({"a":{"dtype":"F32","shape":[4294967296,4294967296],"data_offsets":[0,16]}})",
+  };
+  int k = 0;
+  for (const auto& json : bad) {
+    auto path = dir / ("hostile" + std::to_string(k++) + ".safetensors");
+    write_safetensors(path, json, payload);
+    gyre::Result<gyre::SafetensorFile> f = std::unexpected(gyre::make_error(gyre::Errc::ok, ""));
+    EXPECT_NO_THROW(f = gyre::safetensors_open(path)) << json;
+    EXPECT_FALSE(f) << json;
+  }
+  // An I64 tensor is listed but refused on load; its F32 neighbour still loads.
+  std::vector<std::byte> two(32, std::byte{0});
+  auto path = dir / "i64.safetensors";
+  write_safetensors(path,
+                    R"({"ids":{"dtype":"I64","shape":[2],"data_offsets":[0,16]},)"
+                    R"("w":{"dtype":"F32","shape":[4],"data_offsets":[16,32]}})",
+                    two);
+  auto f = gyre::safetensors_open(path);
+  ASSERT_TRUE(f) << f.error().message;
+  ASSERT_EQ(f->tensors.size(), 2u);
+  auto d = gyre::Device::cpu();
+  EXPECT_FALSE(gyre::safetensors_load(*f, "ids", *d, false));
+  EXPECT_FALSE(gyre::safetensors_load(*f, "ids", *d, true));
+  auto w = gyre::safetensors_load(*f, "w", *d, false);
+  ASSERT_TRUE(w) << w.error().message;
+  EXPECT_EQ(w->numel(), 4);
+  // A hand-made SafetensorFile with inconsistent offsets is refused too.
+  auto forged = *f;
+  forged.tensors[1].data_begin = 20;
+  EXPECT_FALSE(gyre::safetensors_load(forged, "w", *d, false));
+}

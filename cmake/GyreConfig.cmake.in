@@ -1,3 +1,13 @@
 @PACKAGE_INIT@
+
+# The exported gyre target links these PUBLIC; the consumer needs them to resolve the imports.
+include(CMakeFindDependencyMacro)
+if(@GYRE_HAS_OPENMP@)
+  find_dependency(OpenMP)
+endif()
+if(@GYRE_HAS_VULKAN@)
+  find_dependency(Vulkan)
+endif()
+
 include("${CMAKE_CURRENT_LIST_DIR}/GyreTargets.cmake")
 check_required_components(Gyre)

@@ -17,9 +17,12 @@ Result<std::int64_t> product_shape(std::span<const std::int64_t> shape) {
   if (shape.size() > 8) {
     return std::unexpected(make_error(Errc::invalid_shape, "rank > 8"));
   }
-  std::int64_t n = 1;
+  // Validate every dim before the zero short-cut: {0,-5} must not slip through as numel 0.
   for (auto d : shape) {
     if (d < 0) return std::unexpected(make_error(Errc::invalid_shape, "negative dim"));
+  }
+  std::int64_t n = 1;
+  for (auto d : shape) {
     if (d == 0) return 0;
     if (n > (std::numeric_limits<std::int64_t>::max() / d)) {
       return std::unexpected(make_error(Errc::overflow, "numel overflow"));

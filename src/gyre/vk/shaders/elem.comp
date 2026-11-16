@@ -55,7 +55,10 @@ void main() {
   } else if (op == 8u) {
     z[i] = x[i] / (1.0 + exp(-x[i]));
   } else if (op == 9u) {
-    z[i] = pc.f0 * tanh(x[i] / pc.f0);
+    // Same clamp as op 2: tanh(u) is NaN for large |u| on some drivers, and
+    // |u| >= 20 is already +/-1 in float, so this matches CPU std::tanh.
+    float u = clamp(x[i] / pc.f0, -20.0, 20.0);
+    z[i] = pc.f0 * tanh(u);
   } else if (op == 10u) {
     z[i] = x[i] + y[i % cols];
   } else if (op == 11u) {

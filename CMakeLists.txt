@@ -4,11 +4,19 @@ project(Gyre VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(GYRE_BUILD_TESTS "Build tests" ON)
-option(GYRE_ENABLE_TUI "Build gyre-tui (FTXUI)" ON)
-option(GYRE_BUILD_EXAMPLE_BINS "Build gyre-charlm / gyre-ga-onemax example binaries" ON)
+# Tests and the TUI pull third-party packages (googletest, FTXUI): on by default only when Gyre is
+# the top-level project, off when a host project add_subdirectory()s it. Both look for an installed
+# package (vcpkg, system) first and only fall back to a git clone.
+if(PROJECT_IS_TOP_LEVEL)
+  set(_gyre_top_default ON)
+else()
+  set(_gyre_top_default OFF)
+endif()
+option(GYRE_BUILD_TESTS "Build tests (googletest)" ${_gyre_top_default})
+option(GYRE_ENABLE_TUI "Build gyre-tui (FTXUI)" ${_gyre_top_default})
+option(GYRE_BUILD_EXAMPLE_BINS "Build gyre-charlm / gyre-ga-onemax example binaries" ${_gyre_top_default})
 option(GYRE_ENABLE_VULKAN "Vulkan compute backend (auto-off if SDK missing)" ON)
-option(GYRE_ENABLE_ASAN "Sanitize tests" OFF)
+option(GYRE_ENABLE_ASAN "AddressSanitizer on the gyre/gyre-infer libraries and everything linking them" OFF)
 option(GYRE_ENABLE_OPENMP "Multi-thread CPU kernels (matmul/bmm)" ON)
 
 add_library(gyre STATIC
@@ -129,9 +137,12 @@ if(GYRE_ENABLE_VULKAN)
   message(STATUS "Gyre: Vulkan compute enabled")
 endif()
 
+set(GYRE_HAS_OPENMP OFF)
+set(GYRE_HAS_VULKAN ${GYRE_ENABLE_VULKAN})
 if(GYRE_ENABLE_OPENMP)
   find_package(OpenMP)
   if(OpenMP_CXX_FOUND)
+    set(GYRE_HAS_OPENMP ON)
     target_link_libraries(gyre PUBLIC OpenMP::OpenMP_CXX)
     target_compile_definitions(gyre PUBLIC GYRE_OPENMP=1)
     message(STATUS "Gyre: OpenMP enabled")
@@ -152,6 +163,19 @@ if(MSVC)
   target_compile_options(gyre-infer PRIVATE /W4 /permissive-)
 else()
   target_compile_options(gyre-infer PRIVATE -Wall -Wextra)
+endif()
+
+# ASan must instrument the libraries (kernels, checkpoint parsing, the Storage pool), not just the
+# test executable, so it is applied PUBLIC and inherited by every target that links them.
+if(GYRE_ENABLE_ASAN)
+  foreach(_t gyre gyre-infer)
+    if(MSVC)
+      target_compile_options(${_t} PUBLIC /fsanitize=address /Zi)
+    else()
+      target_compile_options(${_t} PUBLIC -fsanitize=address -fno-omit-frame-pointer)
+      target_link_options(${_t} PUBLIC -fsanitize=address)
+    endif()
+  endforeach()
 endif()
 
 add_library(gyre-app-jobs STATIC apps/common/jobs.cpp)
@@ -187,7 +211,10 @@ if(GYRE_ENABLE_TUI)
     ftxui
     GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
     GIT_TAG v5.0.0
+    FIND_PACKAGE_ARGS NAMES ftxui CONFIG
   )
+  # Fetched build-only deps must not leak into `cmake --install` of Gyre.
+  set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(ftxui)
   add_executable(gyre-tui apps/tui/main.cpp)
   target_link_libraries(gyre-tui PRIVATE gyre-app-jobs ftxui::screen ftxui::dom ftxui::component)
@@ -203,6 +230,16 @@ configure_package_config_file(
   ${CMAKE_CURRENT_BINARY_DIR}/GyreConfig.cmake
   INSTALL_DESTINATION lib/cmake/Gyre
 )
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/GyreConfigVersion.cmake
+  VERSION ${PROJECT_VERSION}
+  COMPATIBILITY SameMajorVersion
+)
+install(FILES
+  ${CMAKE_CURRENT_BINARY_DIR}/GyreConfig.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/GyreConfigVersion.cmake
+  DESTINATION lib/cmake/Gyre
+)
 
 if(GYRE_BUILD_TESTS)
   include(FetchContent)
@@ -210,8 +247,10 @@ if(GYRE_BUILD_TESTS)
     googletest
     GIT_REPOSITORY https://github.com/google/googletest.git
     GIT_TAG v1.14.0
+    FIND_PACKAGE_ARGS NAMES GTest CONFIG
   )
   set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+  set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest)
   enable_testing()
   add_executable(gyre-tests
@@ -253,14 +292,25 @@ if(GYRE_BUILD_TESTS)
   )
   target_link_libraries(gyre-tests PRIVATE gyre gyre-infer gyre-app-jobs GTest::gtest_main)
   target_compile_definitions(gyre-tests PRIVATE GYRE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-  if(GYRE_ENABLE_ASAN AND NOT MSVC)
-    target_compile_options(gyre-tests PRIVATE -fsanitize=address)
-    target_link_options(gyre-tests PRIVATE -fsanitize=address)
-  endif()
   # Proves gyre-infer is self-contained: this binary links ONLY gyre-infer.
   add_executable(gyre-infer-standalone tests/infer_standalone.cpp)
   target_link_libraries(gyre-infer-standalone PRIVATE gyre-infer)
   add_test(NAME InferStandalone COMMAND gyre-infer-standalone)
   include(GoogleTest)
   gtest_discover_tests(gyre-tests)
+
+  # gyre-cli must reject bad flags with a message (and no work done) instead of aborting on an
+  # uncaught std::stoi exception, wrapping a negative into stoul, or silently ignoring a typo.
+  function(gyre_cli_rejects name regex)
+    add_test(NAME CliReject.${name} COMMAND gyre-cli ${ARGN})
+    set_tests_properties(CliReject.${name} PROPERTIES PASS_REGULAR_EXPRESSION "${regex}")
+  endfunction()
+  gyre_cli_rejects(NonNumeric "invalid value 'abc' for --steps" lm train --steps abc)
+  gyre_cli_rejects(NegativeUnsigned "invalid value '-1' for --steps" lm train --steps -1)
+  gyre_cli_rejects(TrailingFlag "missing value for --steps" lm train --steps)
+  gyre_cli_rejects(UnknownFlag "unknown option --bogus" lm train --bogus 1)
+  gyre_cli_rejects(TokenizerTypo "unknown --tokenizer 'char'" lm train --tokenizer char)
+  gyre_cli_rejects(PresetTypo "unknown --preset 'nano'" lm train --preset nano)
+  gyre_cli_rejects(RecencyTypo "--recency must be alibi[|]none" lm train --recency nonee)
+  gyre_cli_rejects(TokNonNumeric "invalid value 'x' for --vocab-size" tok train --vocab-size x)
 endif()
