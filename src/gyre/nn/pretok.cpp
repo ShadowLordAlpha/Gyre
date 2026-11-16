@@ -19,8 +19,12 @@ class IdentityPretok final : public Pretokenizer {
 
 class MetaspacePretok final : public Pretokenizer {
  public:
-  explicit MetaspacePretok(bool dummy) : dummy_(dummy) {}
-  const char* name() const noexcept override { return "metaspace"; }
+  MetaspacePretok(bool dummy, bool split) : dummy_(dummy), split_(split) {}
+  // The name round-trips through Gyre documents (pretok_from_name), so it encodes both options.
+  const char* name() const noexcept override {
+    if (dummy_) return split_ ? "metaspace_split" : "metaspace";
+    return split_ ? "metaspace_noprefix_split" : "metaspace_noprefix";
+  }
   Result<void> split(std::string_view text, std::string& scratch,
                      std::vector<std::string_view>& spans) const override {
     scratch.clear();
@@ -35,7 +39,21 @@ class MetaspacePretok final : public Pretokenizer {
       }
     }
     spans.clear();
-    if (!scratch.empty()) spans.emplace_back(scratch);
+    if (scratch.empty()) return {};
+    if (!split_) {
+      spans.emplace_back(scratch);
+      return {};
+    }
+    // Hugging Face Metaspace split=true (MergedWithNext): every U+2581 starts a new span.
+    const std::string_view s(scratch);
+    std::size_t start = 0;
+    for (std::size_t i = 3; i + 3 <= s.size(); ++i) {
+      if (s.compare(i, 3, "\xe2\x96\x81") != 0) continue;
+      spans.push_back(s.substr(start, i - start));
+      start = i;
+      i += 2;
+    }
+    spans.push_back(s.substr(start));
     return {};
   }
   // Hugging Face Metaspace decoder: every U+2581 becomes a space, and the space the dummy prefix
@@ -57,6 +75,7 @@ class MetaspacePretok final : public Pretokenizer {
 
  private:
   bool dummy_{true};
+  bool split_{false};
 };
 
 // GPT-2 byte-level pre-tokenizer. Splits the RAW text with the published pattern
@@ -183,15 +202,18 @@ std::unique_ptr<Pretokenizer> make_identity_pretok() {
 }
 std::unique_ptr<Pretokenizer> make_gpt2_pretok() { return std::make_unique<Gpt2Pretok>(); }
 std::unique_ptr<Pretokenizer> make_digits_bytelevel_pretok() { return std::make_unique<DigitsBytelevelPretok>(); }
-std::unique_ptr<Pretokenizer> make_metaspace_pretok(bool dummy_prefix) {
-  return std::make_unique<MetaspacePretok>(dummy_prefix);
+std::unique_ptr<Pretokenizer> make_metaspace_pretok(bool dummy_prefix, bool split) {
+  return std::make_unique<MetaspacePretok>(dummy_prefix, split);
 }
 
 Result<std::unique_ptr<Pretokenizer>> pretok_from_name(std::string_view name) {
   if (name.empty() || name == "identity") return make_identity_pretok();
   if (name == "bytelevel" || name == "gpt2") return make_gpt2_pretok();
   if (name == "digits_bytelevel") return make_digits_bytelevel_pretok();
-  if (name == "metaspace") return make_metaspace_pretok(true);
+  if (name == "metaspace") return make_metaspace_pretok(true, false);
+  if (name == "metaspace_split") return make_metaspace_pretok(true, true);
+  if (name == "metaspace_noprefix") return make_metaspace_pretok(false, false);
+  if (name == "metaspace_noprefix_split") return make_metaspace_pretok(false, true);
   if (name == "tiktoken_v1") return make_tiktoken_v1_pretok({});
   return std::unexpected(make_error(Errc::unsupported, "unknown pretok"));
 }

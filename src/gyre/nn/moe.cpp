@@ -15,7 +15,7 @@ Result<Tensor> restore_like(Tensor y, const Tensor& like) { return unflatten_lik
 
 }  // namespace
 
-Result<MoeTopK> moe_topk(const Tensor& logits, int k, float router_softcap) {
+Result<MoeTopK> moe_topk(const Tensor& logits, int k, float router_softcap, bool renormalize) {
   if (logits.dtype() != DType::f32 || logits.rank() != 2) {
     return std::unexpected(make_error(Errc::invalid_shape, "moe logits [N,E]"));
   }
@@ -49,9 +49,12 @@ Result<MoeTopK> moe_topk(const Tensor& logits, int k, float router_softcap) {
     }
     std::partial_sort(row.begin(), row.begin() + k, row.end(),
                       [](auto a, auto b) { return a.first > b.first; });
-    float z = 0.f;
-    for (int j = 0; j < k; ++j) z += row[static_cast<std::size_t>(j)].first;
-    if (z <= 0.f) z = 1.f;
+    float z = 1.f;
+    if (renormalize) {
+      z = 0.f;
+      for (int j = 0; j < k; ++j) z += row[static_cast<std::size_t>(j)].first;
+      if (z <= 0.f) z = 1.f;
+    }
     for (int j = 0; j < k; ++j) {
       (*pi)[static_cast<std::size_t>(n * k + j)] = row[static_cast<std::size_t>(j)].second;
       (*pw)[static_cast<std::size_t>(n * k + j)] = row[static_cast<std::size_t>(j)].first / z;
@@ -60,7 +63,7 @@ Result<MoeTopK> moe_topk(const Tensor& logits, int k, float router_softcap) {
   return MoeTopK{std::move(*idx), std::move(*wts)};
 }
 
-Result<Tensor> swiglu_ffn(const Tensor& x, const SwiGLUWeights& w) {
+Result<Tensor> swiglu_ffn(const Tensor& x, const SwiGLUWeights& w, GateAct act) {
   if (!w.w1 || !w.w3 || !w.w2) {
     return std::unexpected(make_error(Errc::invalid_shape, "swiglu weights"));
   }
@@ -70,7 +73,14 @@ Result<Tensor> swiglu_ffn(const Tensor& x, const SwiGLUWeights& w) {
   if (!g) return g;
   auto u = matmul(*x2, *w.w3);
   if (!u) return u;
-  auto h = swiglu(*g, *u);
+  Result<Tensor> h = std::unexpected(make_error(Errc::invalid_shape, "gate act"));
+  if (act == GateAct::silu) {
+    h = swiglu(*g, *u);
+  } else {
+    auto ga = gelu(*g);  // tanh GELU, as Grok's jax.nn.gelu / GeluAndMul(approximate="tanh")
+    if (!ga) return ga;
+    h = mul(*ga, *u);
+  }
   if (!h) return h;
   auto y = matmul(*h, *w.w2);
   if (!y) return y;
@@ -78,7 +88,8 @@ Result<Tensor> swiglu_ffn(const Tensor& x, const SwiGLUWeights& w) {
 }
 
 Result<Tensor> residual_moe(const Tensor& x, const SwiGLUWeights& dense, const Tensor& router_w,
-                            std::span<const SwiGLUWeights> experts, int k, float router_softcap) {
+                            std::span<const SwiGLUWeights> experts, int k, float router_softcap,
+                            const MoeSpec& spec) {
   auto x2 = as_2d(x);
   if (!x2) return x2;
   const auto N = x2->shape()[0];
@@ -89,7 +100,7 @@ Result<Tensor> residual_moe(const Tensor& x, const SwiGLUWeights& dense, const T
   }
   auto logits = matmul(*x2, router_w);
   if (!logits) return logits;
-  auto top = moe_topk(*logits, k, router_softcap);
+  auto top = moe_topk(*logits, k, router_softcap, spec.renormalize);
   if (!top) return std::unexpected(top.error());
 
   // An all-null `dense` means a plain sparse MoE (experts only, Grok residual_moe = false).
@@ -103,7 +114,7 @@ Result<Tensor> residual_moe(const Tensor& x, const SwiGLUWeights& dense, const T
   auto pw = top->weights.host_span<float>();
   if (!po || !px || !pi || !pw) return std::unexpected(make_error(Errc::not_cpu, "host"));
   if (has_dense) {
-    auto dens = swiglu_ffn(*x2, dense);
+    auto dens = swiglu_ffn(*x2, dense, spec.act);
     if (!dens) return dens;
     // matmul only checks inner dims, so a dense w2 narrower than D would be read past its end.
     if (dens->rank() != 2 || dens->shape()[0] != N || dens->shape()[1] != D) {
@@ -139,7 +150,7 @@ Result<Tensor> residual_moe(const Tensor& x, const SwiGLUWeights& dense, const T
     std::int64_t rsh[] = {ne, D};
     auto tok = Tensor::from_host(std::as_bytes(std::span<const float>(rows)), rsh, DType::f32, x.device());
     if (!tok) return std::unexpected(tok.error());
-    auto ye = swiglu_ffn(*tok, experts[e]);
+    auto ye = swiglu_ffn(*tok, experts[e], spec.act);
     if (!ye) return ye;
     if (ye->rank() != 2 || ye->shape()[0] != ne || ye->shape()[1] != D) {
       return std::unexpected(make_error(Errc::invalid_shape, "moe expert output width != D"));
@@ -154,6 +165,11 @@ Result<Tensor> residual_moe(const Tensor& x, const SwiGLUWeights& dense, const T
       float* o = po->data() + n * D;
       for (std::int64_t d = 0; d < D; ++d) o[d] += wt * y[d];
     }
+  }
+  if (has_dense && spec.scale_residual) {
+    // Grok-2 residual MoE: (mlp(x) + moe(x)) / sqrt(2) (SGLang Grok1DecoderLayer.moe_with_rmoe).
+    constexpr float kInvSqrt2 = 0.70710678118654752f;
+    for (auto& v : *po) v *= kInvSqrt2;
   }
   return restore_like(std::move(*out), x);
 }

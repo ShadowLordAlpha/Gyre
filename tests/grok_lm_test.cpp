@@ -154,5 +154,26 @@ TEST(GrokLM, NonResidualMoeUsesExpertsOnly) {
     }
   }
   ASSERT_EQ(zeroed, 3);
-  EXPECT_EQ(grok_logits(*res, *d), y_sparse);
+  // The residual output is (0 + moe) / sqrt(2) (Grok-2 moe_with_rmoe), so it differs from the
+  // sparse model (the post-MoE RMSNorm only removes the scale up to its eps)...
+  const auto y_res = grok_logits(*res, *d);
+  ASSERT_EQ(y_res.size(), y_sparse.size());
+  EXPECT_NE(y_res, y_sparse);
+  // ...and equals a sparse model whose expert down projections are scaled by 1/sqrt(2) (the
+  // experts are linear in w2 and routing does not read it), up to float rounding.
+  auto snames = sparse->param_names();
+  int scaled = 0;
+  for (std::size_t i = 0; i < snames.size(); ++i) {
+    if (snames[i].find(".mlp.experts.") != std::string::npos && snames[i].ends_with(".down_proj.weight")) {
+      auto p = sparse->parameters()[i].value.host_span<float>();
+      for (auto& v : *p) v *= 0.70710678118654752f;
+      ++scaled;
+    }
+  }
+  ASSERT_EQ(scaled, c.n_experts);
+  const auto y_scaled = grok_logits(*sparse, *d);
+  ASSERT_EQ(y_res.size(), y_scaled.size());
+  for (std::size_t i = 0; i < y_res.size(); ++i) {
+    EXPECT_NEAR(y_res[i], y_scaled[i], 1e-4f * (1.f + std::fabs(y_scaled[i]))) << i;
+  }
 }

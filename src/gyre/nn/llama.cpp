@@ -68,14 +68,16 @@ GYRE_AVX2_FN inline float hsum256(__m256 v) {
   return _mm_cvtss_f32(lo);
 }
 
-// C[MR rows, 16 cols] (+)= A[MR, K] @ B[K, 16-col panel]
+// C[MR rows, 16 cols] (+)= A[MR, K] @ B[K, 16-col panel]. With `acc` the chain still starts at
+// zero and C is added once at the end: starting the chain at C (the residual stream) rounds every
+// FMA at ulp(|C|), which on SmolLM2-1.7B's ~25000 first-token activations cost 2e-2 in the logits.
 template <int MR>
 GYRE_AVX2_FN void micro_avx2(const float* A, std::int64_t lda, const float* B, std::int64_t ldb, float* C,
                              std::int64_t ldc, std::int64_t K, bool acc) {
   __m256 c0[MR], c1[MR];
   for (int r = 0; r < MR; ++r) {
-    c0[r] = acc ? _mm256_loadu_ps(C + r * ldc) : _mm256_setzero_ps();
-    c1[r] = acc ? _mm256_loadu_ps(C + r * ldc + 8) : _mm256_setzero_ps();
+    c0[r] = _mm256_setzero_ps();
+    c1[r] = _mm256_setzero_ps();
   }
   for (std::int64_t k = 0; k < K; ++k) {
     const __m256 b0 = _mm256_loadu_ps(B + k * ldb);
@@ -87,6 +89,10 @@ GYRE_AVX2_FN void micro_avx2(const float* A, std::int64_t lda, const float* B, s
     }
   }
   for (int r = 0; r < MR; ++r) {
+    if (acc) {
+      c0[r] = _mm256_add_ps(_mm256_loadu_ps(C + r * ldc), c0[r]);
+      c1[r] = _mm256_add_ps(_mm256_loadu_ps(C + r * ldc + 8), c1[r]);
+    }
     _mm256_storeu_ps(C + r * ldc, c0[r]);
     _mm256_storeu_ps(C + r * ldc + 8, c1[r]);
   }
@@ -138,7 +144,7 @@ void micro_scalar(const float* A, std::int64_t lda, const float* B, std::int64_t
                   std::int64_t K, std::int64_t nr, bool acc) {
   float c[MR][16];
   for (int r = 0; r < MR; ++r)
-    for (std::int64_t j = 0; j < nr; ++j) c[r][j] = acc ? C[r * ldc + j] : 0.f;
+    for (std::int64_t j = 0; j < nr; ++j) c[r][j] = 0.f;  // chain from zero; C added at the end (see micro_avx2)
   for (std::int64_t k = 0; k < K; ++k) {
     const float* b = B + k * ldb;
     for (int r = 0; r < MR; ++r) {
@@ -147,7 +153,7 @@ void micro_scalar(const float* A, std::int64_t lda, const float* B, std::int64_t
     }
   }
   for (int r = 0; r < MR; ++r)
-    for (std::int64_t j = 0; j < nr; ++j) C[r * ldc + j] = c[r][j];
+    for (std::int64_t j = 0; j < nr; ++j) C[r * ldc + j] = acc ? C[r * ldc + j] + c[r][j] : c[r][j];
 }
 
 template <int MR>

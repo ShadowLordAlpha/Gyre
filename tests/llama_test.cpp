@@ -3,7 +3,8 @@
 // multiple of the 16-column kernel panel) and check the imported model against an independent
 // double-precision reference of the HF forward pass (rotate_half RoPE on the ORIGINAL [out, in]
 // weights), so the transposition and the per-head q/k permutation are both covered. The KV cache
-// must reproduce a full recompute. Real-model tests skip unless data/smollm2-360m exists.
+// must reproduce a full recompute. Real-model tests skip unless data/smollm2-360m (or -1.7b)
+// holds the converted checkpoint.
 #include "gradcheck.hpp"
 
 #include "gyre/io/safetensors.hpp"
@@ -168,7 +169,25 @@ std::vector<int> tokens(int n, int V, Rng& rng) {
   return t;
 }
 
-const std::filesystem::path kSmolDir = std::filesystem::path(GYRE_SOURCE_DIR) / "data" / "smollm2-360m";
+std::filesystem::path smol_ckpt(const char* name) {
+  return std::filesystem::path(GYRE_SOURCE_DIR) / "data" / name / (std::string(name) + ".gyre");
+}
+
+// Greedy continuation of a factual prompt from a converted checkpoint (`gyre-cli lm import-llama`).
+void expect_knows_capital_of_france(const std::filesystem::path& ckpt) {
+  auto m = LlamaLM::load_gyre(ckpt);
+  ASSERT_TRUE(m) << m.error().message;
+  auto doc = peek_gyre(ckpt);
+  ASSERT_TRUE(doc);
+  auto tok = Tokenizer::from_json(doc->to_json());
+  ASSERT_TRUE(tok) << tok.error().message;
+  auto ids = (*tok)->encode("The capital of France is");
+  ASSERT_TRUE(ids);
+  auto out = m->generate(*ids, 6, 0.f, nullptr, true);
+  ASSERT_TRUE(out) << out.error().message;
+  const auto text = (*tok)->decode(*out);
+  EXPECT_NE(text.find("Paris"), std::string::npos) << text;
+}
 
 }  // namespace
 
@@ -302,21 +321,16 @@ TEST(Llama, HfConfigRejectsWhatIsNotImplemented) {
   EXPECT_FALSE(c.validate());
 }
 
-// Real SmolLM2-360M: greedy continuation of a factual prompt (needs the converted checkpoint
-// data/smollm2-360m/smollm2-360m.gyre from `gyre-cli lm import-llama`).
+// Real SmolLM2-360M / 1.7B: each skips unless its converted checkpoint
+// data/smollm2-<size>/smollm2-<size>.gyre exists (`gyre-cli lm import-llama`).
 TEST(Llama, RealSmolLM2KnowsTheCapitalOfFrance) {
-  const auto ckpt = kSmolDir / "smollm2-360m.gyre";
+  const auto ckpt = smol_ckpt("smollm2-360m");
   if (!std::filesystem::exists(ckpt)) GTEST_SKIP() << "run gyre-cli lm import-llama first";
-  auto m = LlamaLM::load_gyre(ckpt);
-  ASSERT_TRUE(m) << m.error().message;
-  auto doc = peek_gyre(ckpt);
-  ASSERT_TRUE(doc);
-  auto tok = Tokenizer::from_json(doc->to_json());
-  ASSERT_TRUE(tok) << tok.error().message;
-  auto ids = (*tok)->encode("The capital of France is");
-  ASSERT_TRUE(ids);
-  auto out = m->generate(*ids, 6, 0.f, nullptr, true);
-  ASSERT_TRUE(out) << out.error().message;
-  const auto text = (*tok)->decode(*out);
-  EXPECT_NE(text.find("Paris"), std::string::npos) << text;
+  expect_knows_capital_of_france(ckpt);
+}
+
+TEST(Llama, RealSmolLM2_1_7BKnowsTheCapitalOfFrance) {
+  const auto ckpt = smol_ckpt("smollm2-1.7b");
+  if (!std::filesystem::exists(ckpt)) GTEST_SKIP() << "run gyre-cli lm import-llama first";
+  expect_knows_capital_of_france(ckpt);
 }

@@ -54,7 +54,13 @@ embedding/CE ids error (`index OOB` / `target OOB`) like CPU.
 
 Limits and memory are checked, not assumed: a dispatch past
 `maxComputeWorkGroupCount`, a tensor larger than `maxStorageBufferRange`, or a
-misaligned bind offset is an error (lower `--batch`). Out of VRAM (or the
+misaligned bind offset is an error (lower `--batch`). Shaders index with 32-bit
+`uint`/`int` and take sizes as 32-bit push constants, so every op first checks
+each tensor it binds, and each output before allocating it, against
+`maxStorageBufferRange` and the int32 element limit (`src/gyre/vk/limits.hpp`);
+only then are sizes narrowed (every pushed size is such a count or a factor of
+one), so nothing is silently truncated. Zero-size tensors return without a
+dispatch. Out of VRAM (or the
 driver's allocation-count cap) frees the buffer pool and retries once, then
 errors; it never falls back to host-visible memory (that would move a discrete
 GPU's training to system RAM over PCIe). Host-visible memory is used only on a

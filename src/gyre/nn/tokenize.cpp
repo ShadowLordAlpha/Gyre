@@ -204,7 +204,8 @@ static PieceTable table_from_vocab_object(const nlohmann::json& obj, bool gyre_t
 static Result<std::unique_ptr<Tokenizer>> bytelevel_bpe_tokenizer(
     const nlohmann::json& vocab, const std::vector<std::pair<std::string, std::string>>& merge_text,
     std::unique_ptr<Pretokenizer> pretok = nullptr,
-    std::vector<std::pair<std::string, std::int32_t>> added = {}) {
+    std::vector<std::pair<std::string, std::int32_t>> added = {}, std::int32_t unk_id = -1,
+    bool fuse_unk = false) {
   if (!vocab.is_object() || vocab.empty())
     return std::unexpected(make_error(Errc::invalid_shape, "byte-level BPE: vocab must be an object"));
   const bool gpt2_pretok = !pretok || std::string(pretok->name()) == "bytelevel";
@@ -264,6 +265,7 @@ static Result<std::unique_ptr<Tokenizer>> bytelevel_bpe_tokenizer(
     }
     auto bm = BpeModel::from_merges(std::move(merges), t.size());
     if (!bm) return std::unexpected(bm.error());
+    if (unk_id >= 0) (*bm)->set_unk(unk_id, fuse_unk, /*per_byte=*/true);
     return std::make_unique<Tokenizer>(std::move(pretok), std::move(*bm), std::move(t));
   }
   std::vector<std::int32_t> merge_ids;
@@ -285,6 +287,7 @@ static Result<std::unique_ptr<Tokenizer>> bytelevel_bpe_tokenizer(
   auto bm = BpeModel::from_merges(std::move(merges), t.size());
   if (!bm) return std::unexpected(bm.error());
   (*bm)->set_merge_ids(std::move(merge_ids));
+  if (unk_id >= 0) (*bm)->set_unk(unk_id, fuse_unk, /*per_byte=*/true);  // a ByteLevel character is one byte
   auto tok = std::make_unique<Tokenizer>(std::move(pretok), std::move(*bm), std::move(t));
   tok->set_specials(std::move(added));
   return tok;
@@ -377,6 +380,12 @@ static Result<std::unique_ptr<Tokenizer>> from_nested_json(const nlohmann::json&
   auto bm = BpeModel::from_merges(std::move(*merges), table->size());
   if (!bm) return std::unexpected(bm.error());
   if (!merge_ids.empty()) (*bm)->set_merge_ids(std::move(merge_ids));
+  if (obj.contains("unk_id") && !obj["unk_id"].is_null()) {
+    const auto unk = obj["unk_id"].get<std::int32_t>();
+    if (unk < 0 || unk >= table->size())
+      return std::unexpected(make_error(Errc::ckpt_corrupt, "tokenizer: unk_id out of range"));
+    (*bm)->set_unk(unk, obj.value("fuse_unk", false), obj.value("unk_per_byte", false));
+  }
   auto tok = std::make_unique<Tokenizer>(std::move(*pt), std::move(*bm), std::move(*table));
   if (obj.contains("special") && obj["special"].is_array()) {
     std::vector<std::pair<std::string, std::int32_t>> sp;
@@ -469,6 +478,16 @@ Result<std::unique_ptr<Tokenizer>> Tokenizer::load(const std::filesystem::path& 
   return from_json(s);
 }
 
+// null, or a Sequence whose members are all no-ops (an empty Sequence changes nothing).
+static bool normalizer_is_noop(const nlohmann::json& n) {
+  if (n.is_null()) return true;
+  if (!n.is_object() || n.value("type", std::string{}) != "Sequence") return false;
+  if (!n.contains("normalizers") || !n["normalizers"].is_array()) return false;
+  for (auto& m : n["normalizers"])
+    if (!normalizer_is_noop(m)) return false;
+  return true;
+}
+
 static Result<std::unique_ptr<Tokenizer>> load_huggingface_impl(const std::filesystem::path& dir) {
   auto tokj = dir;
   if (std::filesystem::is_directory(dir)) tokj = dir / "tokenizer.json";
@@ -479,6 +498,8 @@ static Result<std::unique_ptr<Tokenizer>> load_huggingface_impl(const std::files
     auto& j = *parsed;
     nlohmann::json model = j.contains("model") ? j["model"] : j;
     std::string type = model.value("type", std::string{});
+    if (!type.empty() && type != "BPE" && type != "Unigram")  // WordPiece, WordLevel, ...
+      return std::unexpected(make_error(Errc::unsupported, "tokenizer.json: model type \"" + type + "\" is not supported"));
     std::string ptype;
     if (j.contains("pre_tokenizer") && j["pre_tokenizer"].is_object())
       ptype = j["pre_tokenizer"].value("type", std::string{});
@@ -490,15 +511,43 @@ static Result<std::unique_ptr<Tokenizer>> load_huggingface_impl(const std::files
                          ((ptype == "Sequence" && !j["pre_tokenizer"].contains("pretokenizers")) ||
                           (!ptype.empty() && ptype[0] >= 'a' && ptype[0] <= 'z'));
     auto piece_bytes = [&](const std::string& text) { return gyre_hf ? json_text_to_bytes(text) : text; };
+    auto unsupported = [](const std::string& what) {
+      return std::unexpected(make_error(Errc::unsupported, "tokenizer.json: " + what));
+    };
+    // Gyre encodes the raw text: a normalizer (NFC, Lowercase, BertNormalizer, Precompiled, ...)
+    // would change what Hugging Face encodes, so refuse it instead of silently skipping it.
+    if (j.contains("normalizer") && !normalizer_is_noop(j["normalizer"]))
+      return unsupported("normalizer " + j["normalizer"].dump().substr(0, 200) + " is not supported");
+    const bool pre_null = !j.contains("pre_tokenizer") || j["pre_tokenizer"].is_null();
+    if (!pre_null && !j["pre_tokenizer"].is_object()) return unsupported("pre_tokenizer must be an object or null");
     std::unique_ptr<Pretokenizer> pt;
     bool explicit_ids = false;  // non-GPT-2 byte-level layout: added tokens are honoured
+    bool metaspace_first = false;  // prepend_scheme "first": only the first section gets the prefix
     if (gyre_hf && ptype != "Sequence") {
       auto named = pretok_from_name(ptype);
       if (!named) return std::unexpected(named.error());
       pt = std::move(*named);
-    } else if (ptype == "ByteLevel") pt = make_gpt2_pretok();
-    else if (ptype == "Metaspace") pt = make_metaspace_pretok(true);
-    else if (ptype == "Sequence" && j["pre_tokenizer"].value("pretokenizers", nlohmann::json::array()).empty()) {
+    } else if (ptype == "ByteLevel") {
+      // GPT-2: add_prefix_space false, use_regex true. Older Gyre exports wrote only the type, so a
+      // missing add_prefix_space reads as false here (Hugging Face itself would default it to true).
+      const auto& p = j["pre_tokenizer"];
+      if (p.value("add_prefix_space", false) || !p.value("use_regex", true))
+        return unsupported("ByteLevel pre_tokenizer with add_prefix_space=true or use_regex=false is not supported");
+      pt = make_gpt2_pretok();
+    } else if (ptype == "Metaspace") {
+      const auto& p = j["pre_tokenizer"];
+      if (p.contains("replacement") && p["replacement"] != "\xe2\x96\x81")
+        return unsupported("Metaspace replacement other than U+2581 is not supported");
+      bool dummy = p.value("add_prefix_space", true);  // tokenizers < 0.19
+      if (p.contains("prepend_scheme")) {
+        const auto scheme = p["prepend_scheme"].get<std::string>();
+        if (scheme != "always" && scheme != "first" && scheme != "never")
+          return unsupported("Metaspace prepend_scheme \"" + scheme + "\" is not supported");
+        dummy = scheme != "never";
+        metaspace_first = scheme == "first";
+      }
+      pt = make_metaspace_pretok(dummy, p.value("split", true));
+    } else if (ptype == "Sequence" && j["pre_tokenizer"].value("pretokenizers", nlohmann::json::array()).empty()) {
       pt = make_identity_pretok();  // what save_huggingface writes for Gyre's identity pretokenizer
     } else if (ptype == "Sequence") {
       // Only Digits(individual_digits) followed by ByteLevel(use_regex, no prefix space) is known.
@@ -513,13 +562,41 @@ static Result<std::unique_ptr<Tokenizer>> load_huggingface_impl(const std::files
       pt = make_digits_bytelevel_pretok();
       ptype = "ByteLevel";  // same byte-level vocab handling below
       explicit_ids = true;
-    } else pt = make_identity_pretok();
+    } else if (pre_null) {
+      pt = make_identity_pretok();  // no pre_tokenizer: the whole text is one word
+    } else {
+      // Whitespace, WhitespaceSplit, BertPreTokenizer, Punctuation, Split, CharDelimiterSplit, ...
+      // Encoding with the identity pretokenizer instead would give different ids.
+      return unsupported("pre_tokenizer type \"" + ptype + "\" is not supported");
+    }
     // Plain (not byte-level) BPE from another tool: pieces are checked against BpeModel's layout below.
     const bool foreign_bpe = type == "BPE" && ptype != "ByteLevel" && !gyre_hf;
+    // BPE model options Gyre does not implement change the ids; refuse them. (GPT-2 writes "" for
+    // the prefix/suffix, SmolLM2 null.)
+    const bool bpe_model = type == "BPE" || (type.empty() && ptype == "ByteLevel");
+    if (bpe_model) {
+      auto set_str = [&](const char* k) {
+        return model.contains(k) && model[k].is_string() && !model[k].get<std::string>().empty();
+      };
+      if (set_str("continuing_subword_prefix") || set_str("end_of_word_suffix"))
+        return unsupported("BPE continuing_subword_prefix / end_of_word_suffix is not supported");
+      if (model.value("byte_fallback", false)) return unsupported("BPE byte_fallback is not supported");
+      if (model.value("ignore_merges", false)) return unsupported("BPE ignore_merges is not supported");
+      if (model.contains("dropout") && model["dropout"].is_number() && model["dropout"].get<double>() > 0.0)
+        return unsupported("BPE dropout is not supported");
+    }
+    // unk_token: id of the token an unencodable character becomes (null = dropped, as Hugging Face).
+    std::int32_t unk_id = -1;
+    if (bpe_model && model.contains("unk_token") && model["unk_token"].is_string()) {
+      const auto u = model["unk_token"].get<std::string>();
+      if (!model.contains("vocab") || !model["vocab"].is_object() || !model["vocab"].contains(u) ||
+          !model["vocab"][u].is_number_integer())
+        return unsupported("BPE unk_token \"" + u + "\" is not in the vocab");
+      unk_id = model["vocab"][u].get<std::int32_t>();
+    }
+    const bool fuse_unk = model.value("fuse_unk", false);
     std::vector<std::pair<std::string, std::int32_t>> added;
     if (explicit_ids || foreign_bpe) {
-      if (explicit_ids && j.contains("normalizer") && !j["normalizer"].is_null())
-        return std::unexpected(make_error(Errc::unsupported, "tokenizer.json: normalizer is not supported"));
       if (j.contains("added_tokens") && j["added_tokens"].is_array()) {
         for (auto& a : j["added_tokens"]) {
           if (!a.is_object() || !a.contains("id") || !a.contains("content")) continue;
@@ -530,6 +607,10 @@ static Result<std::unique_ptr<Tokenizer>> load_huggingface_impl(const std::files
         }
       }
     }
+    // Gyre encodes the text between added tokens section by section, each with the dummy prefix
+    // ("always"); "first" differs as soon as an added token splits the text.
+    if (metaspace_first && !added.empty())
+      return unsupported("Metaspace prepend_scheme \"first\" together with added tokens is not supported");
     if (type == "Unigram") {
       PieceTable table;
       std::vector<float> scores;
@@ -589,8 +670,8 @@ static Result<std::unique_ptr<Tokenizer>> load_huggingface_impl(const std::files
           }
         }
       }
-      if (std::string(pt->name()) == "bytelevel") return bytelevel_bpe_tokenizer(model["vocab"], mt);
-      return bytelevel_bpe_tokenizer(model["vocab"], mt, std::move(pt), std::move(added));
+      if (std::string(pt->name()) == "bytelevel") return bytelevel_bpe_tokenizer(model["vocab"], mt, nullptr, {}, unk_id, fuse_unk);
+      return bytelevel_bpe_tokenizer(model["vocab"], mt, std::move(pt), std::move(added), unk_id, fuse_unk);
     }
     auto merges = BpeModel::parse_merges(model.dump());
     if (!merges) return std::unexpected(merges.error());
@@ -620,23 +701,45 @@ static Result<std::unique_ptr<Tokenizer>> load_huggingface_impl(const std::files
       for (auto& m : model["merges"]) {
         std::int32_t ia = -1, ib = -1;
         if (m.is_string()) {
-          // "a b". A piece may itself hold spaces (Gyre's identity-pretok BPE), so try every space;
-          // prefer the split whose result sits where the implicit layout puts it.
+          // "a b". A piece may itself hold spaces (old Gyre exports of identity-pretok BPE), so every
+          // space is a candidate split. Keep the splits whose parts are both in the vocab, then
+          // narrow down: (1) the result sits where the implicit layout puts it (alphabet + rank,
+          // parts before it), else (2) the result a+b is in the vocab at all. More than one
+          // survivor is truly ambiguous (e.g. "a  b" = "a"+" b" = "a "+"b") and an error: picking
+          // one would silently change the merge ranks. New exports write [a, b] pairs instead.
           const auto text = piece_bytes(m.get<std::string>());
           const auto at = nid + merges->size();
+          struct Cand {
+            std::int32_t a, b;
+            bool fits, result_in_vocab;
+          };
+          std::vector<Cand> cands;
           for (auto sp = text.find(' '); sp != std::string::npos; sp = text.find(' ', sp + 1)) {
             auto a = inv.find(text.substr(0, sp));
             auto b = inv.find(text.substr(sp + 1));
             if (a == inv.end() || b == inv.end()) continue;
-            const bool fits = at < table.pieces.size() && table.pieces[at] == a->first + b->first &&
+            const auto joined = a->first + b->first;
+            const bool fits = at < table.pieces.size() && table.pieces[at] == joined &&
                               static_cast<std::size_t>(a->second) < at && static_cast<std::size_t>(b->second) < at;
-            if (ia < 0 || fits) {
-              ia = a->second;
-              ib = b->second;
-            }
-            if (fits) break;
+            cands.push_back({a->second, b->second, fits, inv.contains(joined)});
           }
-          if (ia < 0) return bad("merge parts not in vocab: " + m.get<std::string>());
+          if (cands.empty()) return bad("merge parts not in vocab: " + m.get<std::string>());
+          auto pick = [&](auto keep) -> int {  // index of the single candidate kept, -1 none, -2 several
+            int found = -1;
+            for (int c = 0; c < static_cast<int>(cands.size()); ++c) {
+              if (!keep(cands[static_cast<std::size_t>(c)])) continue;
+              if (found >= 0) return -2;
+              found = c;
+            }
+            return found;
+          };
+          int c = pick([](const Cand& x) { return x.fits; });
+          if (c == -1) c = pick([](const Cand& x) { return x.result_in_vocab; });
+          if (c == -1) c = cands.size() == 1 ? 0 : -2;  // result missing: reported below
+          if (c == -2) return bad("ambiguous merge \"" + m.get<std::string>() +
+                                  "\": more than one split of its spaces matches the vocab");
+          ia = cands[static_cast<std::size_t>(c)].a;
+          ib = cands[static_cast<std::size_t>(c)].b;
         } else if (m.is_array() && m.size() == 2 && m[0].is_string() && m[1].is_string()) {
           auto a = inv.find(piece_bytes(m[0].get<std::string>()));
           auto b = inv.find(piece_bytes(m[1].get<std::string>()));
@@ -670,8 +773,7 @@ static Result<std::unique_ptr<Tokenizer>> load_huggingface_impl(const std::files
     for (std::size_t r = 0; r < merges->size(); ++r) reachable[implicit ? nid + r : static_cast<std::size_t>(merge_ids[r])] = true;
     for (auto& [content, id] : added)
       if (id >= 0 && id < table.size()) reachable[static_cast<std::size_t>(id)] = true;
-    if (model.contains("unk_token") && model["unk_token"].is_string())
-      if (auto u = inv.find(model["unk_token"].get<std::string>()); u != inv.end()) reachable[static_cast<std::size_t>(u->second)] = true;
+    if (unk_id >= 0 && unk_id < table.size()) reachable[static_cast<std::size_t>(unk_id)] = true;
     for (std::size_t i = 0; i < table.pieces.size(); ++i)
       if (!table.pieces[i].empty() && !reachable[i])
         return bad("vocab entry " + std::to_string(i) + " \"" + table.pieces[i] +
@@ -679,6 +781,10 @@ static Result<std::unique_ptr<Tokenizer>> load_huggingface_impl(const std::files
     auto bm = BpeModel::from_merges(std::move(*merges), table.size());
     if (!bm) return std::unexpected(bm.error());
     if (!implicit) (*bm)->set_merge_ids(std::move(merge_ids));
+    if (unk_id >= 0) {
+      if (unk_id >= table.size()) return bad("unk_token id out of range");
+      (*bm)->set_unk(unk_id, fuse_unk, /*per_byte=*/false);  // plain BPE: unknown = one UTF-8 character
+    }
     auto tok = std::make_unique<Tokenizer>(std::move(pt), std::move(*bm), std::move(table));
     if (!added.empty()) tok->set_specials(std::move(added));
     return tok;

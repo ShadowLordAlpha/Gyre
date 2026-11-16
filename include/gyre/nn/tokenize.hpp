@@ -113,7 +113,9 @@ std::unique_ptr<Pretokenizer> make_identity_pretok();
 std::unique_ptr<Pretokenizer> make_gpt2_pretok();
 // Hugging Face Sequence[Digits(individual_digits), ByteLevel(use_regex)] (SmolLM2 / StarCoder).
 std::unique_ptr<Pretokenizer> make_digits_bytelevel_pretok();
-std::unique_ptr<Pretokenizer> make_metaspace_pretok(bool dummy_prefix = true);
+// Hugging Face Metaspace (replacement U+2581): dummy_prefix = prepend_scheme "always"/"first";
+// split = split=true (each U+2581 starts a new span). Name: metaspace[_noprefix][_split].
+std::unique_ptr<Pretokenizer> make_metaspace_pretok(bool dummy_prefix = true, bool split = false);
 
 Result<std::unique_ptr<Pretokenizer>> pretok_from_name(std::string_view name);
 

@@ -66,10 +66,11 @@ Versioned nested document (not a flat `"tokenizer":"bpe"` string):
 | --- | --- |
 | `gyre` | Must be `"tokenizer"` |
 | `version` | Document version (`1`) |
-| `tokenizer.pretoken` | `identity` \| `bytelevel` \| `digits_bytelevel` \| `metaspace`. Omitted → `identity` |
+| `tokenizer.pretoken` | `identity` \| `bytelevel` \| `digits_bytelevel` \| `metaspace` \| `metaspace_split` \| `metaspace_noprefix` \| `metaspace_noprefix_split`. Omitted → `identity`. `metaspace` = dummy prefix, one span (as before); `_noprefix` = Hugging Face `prepend_scheme: "never"`; `_split` = `split: true` (every `▁` starts a span) |
 | `tokenizer.model` | `bpe` \| `unigram` |
 | `tokenizer.merges` | BPE only: `[left_id, right_id]` in rank order |
 | `tokenizer.merge_ids` | BPE, optional: token id each merge produces (Hugging Face vocabularies not numbered `alphabet + rank`, e.g. SmolLM2). Absent → `alphabet size + rank` |
+| `tokenizer.unk_id` (BPE) | Optional: Hugging Face `unk_token` id. An input character with no vocab entry becomes this id (one per UTF-8 character; one per byte with `unk_per_byte`, byte-level BPE); `fuse_unk: true` collapses a run into one. Absent → unknown characters are dropped (explicit-id vocab, as Hugging Face) or an encode error (Gyre's own vocabularies) |
 | `tokenizer.special` | Optional `[{"id":0,"content":"<\|endoftext\|>"}, ...]`: matched literally (leftmost, then longest) before pretokenizing |
 | `tokenizer.vocab` | Piece strings (id = index). Restricted alphabets (chars) always write this. Identity-256 BPE may omit it and rebuild 0..255 + merges |
 | `tokenizer.scores` | Unigram log scores, parallel to `vocab` |
@@ -107,7 +108,18 @@ Grok-2 goldens: `"hello world"` → `21517 1749`; chat prefix with `<|separator|
 
 - `tokenizer.json` BPE / Unigram
 - GPT-2 layout `vocab.json` + `merges.txt`, or `tokenizer.json` with a `ByteLevel` pre-tokenizer → `bytelevel` + `bpe`. Vocab/merges are decoded from GPT-2's byte→unicode alphabet into raw-byte pieces. When ids are `256 + merge rank` (GPT-2 layout) the tokenizer is built exactly as before: implicit ids, and `<|endoftext|>` stays plain text. Verified against the real `openai-community/gpt2` files (`docs/gpt2.md`).
-- Any other byte-level layout (SmolLM2: 17 added tokens at ids 0..16, only 235 single bytes, merge results numbered by the vocab): explicit byte → id and per-merge result ids (`merge_ids`) read from the vocab; `added_tokens` are matched literally before pretokenizing (`lstrip`/`rstrip`/`single_word` are rejected); bytes missing from the vocab are **dropped**, as Hugging Face BPE does without an `unk_token`. A merge whose parts or result are missing from the vocab is an error. `pre_tokenizer` `Sequence` is accepted only as `[Digits(individual_digits=true), ByteLevel(use_regex=true, add_prefix_space=false)]` (→ `digits_bytelevel`); a `normalizer` is rejected. Ids match the Hugging Face `tokenizers` library on digits, contractions, spaces/newlines, non-ASCII, `\p{N}` beyond ASCII and specials (`tests/hf_bpe_test.cpp`, [smollm2.md](smollm2.md)). Export of this layout (`save_huggingface`) is not implemented and returns an error.
+- Any other byte-level layout (SmolLM2: 17 added tokens at ids 0..16, only 235 single bytes, merge results numbered by the vocab): explicit byte → id and per-merge result ids (`merge_ids`) read from the vocab; `added_tokens` are matched literally before pretokenizing (`lstrip`/`rstrip`/`single_word` are rejected); bytes missing from the vocab are **dropped**, as Hugging Face BPE does without an `unk_token`. A merge whose parts or result are missing from the vocab is an error. `pre_tokenizer` `Sequence` is accepted only as `[Digits(individual_digits=true), ByteLevel(use_regex=true, add_prefix_space=false)]` (→ `digits_bytelevel`); a `normalizer` is rejected (as for every `tokenizer.json`, see below). Ids match the Hugging Face `tokenizers` library on digits, contractions, spaces/newlines, non-ASCII, `\p{N}` beyond ASCII and specials (`tests/hf_bpe_test.cpp`, [smollm2.md](smollm2.md)). Export of this layout (`save_huggingface`) is not implemented and returns an error.
+
+- Plain (not byte-level) BPE from another tool: pieces must be single bytes or merge results. With `unk_token` set, a character missing from the vocab becomes the unk id (`fuse_unk` honoured) instead of being dropped, as Hugging Face does; the frozen `.gyre.json` keeps `unk_id`.
+- Merges written as `"a b"` strings where pieces contain spaces (old Gyre exports of identity-pretokenizer BPE) are split at the one space whose parts and result fit the vocab (result at `alphabet + rank`, else result present in the vocab). If more than one split fits (e.g. `"a  b"` = `a`+` b` = `a `+`b`) the file is **ambiguous** and refused; re-export it (new exports write `[a, b]` pairs).
+
+**Refused** (clear `unsupported` error instead of a silent identity fallback that would give different ids):
+
+- any `normalizer` other than `null` (or an empty `Sequence`): NFC/NFKC, Lowercase, BertNormalizer, Precompiled, Replace, ...
+- `pre_tokenizer` types other than `null`, `ByteLevel` (`add_prefix_space: false`, `use_regex: true`; a bare `{"type":"ByteLevel"}` from older Gyre exports reads as no prefix space), `Metaspace` (replacement `▁`; `prepend_scheme` always/first/never, `split`; `first` together with added tokens is refused), `Sequence[Digits, ByteLevel]` and Gyre's own markers. So Whitespace, WhitespaceSplit, BertPreTokenizer, Punctuation, Split, CharDelimiterSplit, ... fail loudly.
+- model types other than BPE / Unigram (WordPiece, WordLevel), and BPE `continuing_subword_prefix` / `end_of_word_suffix` (non-empty), `byte_fallback`, `ignore_merges`, `dropout > 0`, or an `unk_token` missing from the vocab.
+
+GPT-2 (`openai-community/gpt2`), SmolLM2 and Gyre's own exports load unchanged and keep identical ids.
 
 The `bytelevel` pre-tokenizer splits raw text with the GPT-2 pattern using the generated Unicode category tables (`\p{L}`, `\p{N}`, `\s`); `save_huggingface` writes byte-level tokenizers back in the GPT-2 alphabet.
 
@@ -159,6 +171,6 @@ Report **nats/char or BPC**, never nats/token across different tokenizers. Holdo
 ## Limits
 
 - No WordPiece in this pass (`VocabModel` is the hook).
-- No GPT-2 / T5 **weight** import.
+- No T5 **weight** import (GPT-2: [gpt2.md](gpt2.md); Llama/SmolLM2: [smollm2.md](smollm2.md)).
 - Native unigram train: frequent substrings + log-count scores, then Viterbi. Every byte of the training text is always kept; with `--vocab-size` ≥ 512 all 256 bytes are, so any text round-trips. With a smaller vocab a byte unseen in training is an encode error, never a silent id 0.
 - Unigram encode is O(n × max_piece_len) per span.

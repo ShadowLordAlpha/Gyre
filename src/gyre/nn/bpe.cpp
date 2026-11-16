@@ -48,6 +48,16 @@ void rebuild_pieces_from_merges(PieceTable& t, const std::vector<std::pair<std::
   }
 }
 
+// Bytes in the UTF-8 sequence starting at span[i]; 1 for a stray or truncated byte.
+std::size_t utf8_char_len(std::string_view span, std::size_t i) {
+  const auto c = static_cast<unsigned char>(span[i]);
+  const std::size_t n = c >= 0xF0 && c <= 0xF4 ? 4 : c >= 0xE0 ? (c <= 0xEF ? 3 : 1) : c >= 0xC2 ? 2 : 1;
+  if (i + n > span.size()) return 1;
+  for (std::size_t k = 1; k < n; ++k)
+    if ((static_cast<unsigned char>(span[i + k]) & 0xC0) != 0x80) return 1;
+  return n;
+}
+
 }  // namespace
 
 BpeModel::BpeModel(std::vector<std::pair<std::int32_t, std::int32_t>> merges) : merges_(std::move(merges)) {
@@ -69,13 +79,29 @@ Result<void> BpeModel::encode_span(std::string_view span, const PieceTable& piec
   if (pieces.identity256 && pieces.byte_to_id.empty()) {
     for (unsigned char c : span) seq.push_back(static_cast<std::int32_t>(c));
   } else if (!pieces.byte_to_id.empty()) {
-    for (unsigned char c : span) {
+    bool prev_unk = false;
+    for (std::size_t i = 0; i < span.size();) {
+      const auto c = static_cast<unsigned char>(span[i]);
       auto it = pieces.byte_to_id.find(c);
-      if (it == pieces.byte_to_id.end()) {
-        if (!merge_ids_.empty()) continue;  // Hugging Face BPE without unk_token skips it
-        return std::unexpected(make_error(Errc::unsupported, "unknown byte"));
+      if (it != pieces.byte_to_id.end()) {
+        seq.push_back(it->second);
+        prev_unk = false;
+        ++i;
+        continue;
       }
-      seq.push_back(it->second);
+      if (unk_id_ >= 0) {
+        // Hugging Face BPE with unk_token: the whole unknown character becomes one unk (and a run
+        // of them one unk with fuse_unk). The unk takes part in merges like any other id.
+        i += unk_per_byte_ ? 1 : utf8_char_len(span, i);
+        if (!(fuse_unk_ && prev_unk)) seq.push_back(unk_id_);
+        prev_unk = true;
+        continue;
+      }
+      if (!merge_ids_.empty()) {  // Hugging Face BPE without unk_token skips it
+        ++i;
+        continue;
+      }
+      return std::unexpected(make_error(Errc::unsupported, "unknown byte"));
     }
   } else {
     for (unsigned char c : span) seq.push_back(static_cast<std::int32_t>(c));
@@ -109,6 +135,11 @@ std::string BpeModel::to_json() const {
   j["merges"] = nlohmann::json::array();
   for (auto [a, b] : merges_) j["merges"].push_back({a, b});
   if (!merge_ids_.empty()) j["merge_ids"] = merge_ids_;
+  if (unk_id_ >= 0) {
+    j["unk_id"] = unk_id_;
+    if (fuse_unk_) j["fuse_unk"] = true;
+    if (unk_per_byte_) j["unk_per_byte"] = true;
+  }
   return j.dump();
 }
 
@@ -152,11 +183,22 @@ Result<void> BpeModel::write_huggingface(const std::filesystem::path& dir, const
   tok["padding"] = nullptr;
   tok["added_tokens"] = nlohmann::json::array();
   tok["normalizer"] = nullptr;
-  tok["pre_tokenizer"] = {{"type", std::string(pretok.name()) == "bytelevel" ? "ByteLevel" : "Sequence"}};
+  // ByteLevel options spelled out: Hugging Face defaults a missing add_prefix_space to true, which
+  // is not what Gyre's GPT-2 pretokenizer does. (Older Gyre exports wrote only the type; the loader
+  // still reads those as add_prefix_space = false.)
+  if (byte_level)
+    tok["pre_tokenizer"] = {{"type", "ByteLevel"}, {"add_prefix_space", false}, {"trim_offsets", true}, {"use_regex", true}};
+  else
+    tok["pre_tokenizer"] = {{"type", "Sequence"}};  // no "pretokenizers": marks Gyre's identity export
   nlohmann::json model;
   model["type"] = "BPE";
   model["dropout"] = nullptr;
   model["unk_token"] = nullptr;
+  if (unk_id_ >= 0 && static_cast<std::size_t>(unk_id_) < pieces.pieces.size()) {
+    const auto& u = pieces.pieces[static_cast<std::size_t>(unk_id_)];
+    model["unk_token"] = byte_level ? bytelevel::to_mapped(u) : bytes_to_json_text(u);
+    model["fuse_unk"] = fuse_unk_;
+  }
   model["vocab"] = vocab;
   model["merges"] = nlohmann::json::array();
   for (auto [a, b] : merges_) {

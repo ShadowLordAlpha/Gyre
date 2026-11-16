@@ -376,12 +376,14 @@ Result<Tensor> GrokLM::forward(const Tensor& idx, ForwardCtx& ctx) {
       ex[static_cast<std::size_t>(e)] = SwiGLUWeights{&p[off].value, &p[off + 1].value, &p[off + 2].value};
       off += 3;
     }
-    // residual_moe: dense SwiGLU + routed experts. Otherwise a plain sparse MoE (experts only): an
-    // empty dense slot tells residual_moe to skip the dense branch. Either way one call, so a shape
-    // error from the router or experts is returned, not computed and thrown away.
+    // residual_moe (Grok-2): (dense GeGLU + routed experts) / sqrt(2). Otherwise a plain sparse MoE
+    // (experts only, as Grok-1 and SGLang with residual_moe=false): an empty dense slot tells
+    // residual_moe to skip the dense branch. Routing is Grok's: softcap -> softmax over all experts
+    // -> top-k probabilities, not renormalized. Either way one call, so a shape error from the
+    // router or experts is returned, not computed and thrown away.
     const SwiGLUWeights dense_or_none = cfg_.residual_moe ? dense : SwiGLUWeights{};
     auto ffn = residual_moe(*n2, dense_or_none, p[10].value, ex,
-                            static_cast<int>(cfg_.n_experts_per_tok), cfg_.router_softcap);
+                            static_cast<int>(cfg_.n_experts_per_tok), cfg_.router_softcap, kGrokMoe);
     if (!ffn) return ffn;
     auto post_m = rms_norm(*ffn, p[off].value, cfg_.rms_eps);
     if (!post_m) return post_m;

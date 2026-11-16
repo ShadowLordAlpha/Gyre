@@ -71,7 +71,10 @@ everything cached; `forward_full(ids)` is the reference full recompute with a fr
 CPU kernels live in `src/gyre/nn/llama.cpp`: a tiled GEMM (64-row x 256-col tiles, 4x16 micro-kernel) with an
 AVX2+FMA path chosen at **run time** (the library is still built for the baseline ISA), OpenMP over tiles,
 per-(query, head) causal attention with an AVX2 dot / weighted-sum. Each output element is a single k-ordered
-chain whatever the tiling, so cached decode reproduces the full recompute bit for bit on the same machine.
+chain whatever the tiling, so cached decode reproduces the full recompute bit for bit on the same machine. The
+residual adds (`x += attn·Wo`, `x += mlp·Wdown`) run that chain from zero and add `x` once at the end; starting
+the chain at `x` rounded every FMA at ulp(|x|), which cost 2e-2 in the logits on SmolLM2-1.7B's ~25,000-sized
+first-token activations (below).
 
 ## Tokenizer
 
@@ -106,7 +109,8 @@ trip.
   `rotate_half`, `repeat_kv`), 32-token prompt *"In 1603, Shakespeare's company became the King's Men; ..."*:
   **max |dlogit| = 1.13e-3** (mean 3.8e-5; the largest error is at position 0, the rest <= 2.3e-4),
   **same top-1 at all 32 positions**, mean next-token NLL 1.993748 (ref) vs 1.993743 (Gyre). Token ids equal the
-  `tokenizers` library's.
+  `tokenizers` library's. After the residual-add fix (above), on the 64-token prompt used for 1.7B: max |dlogit|
+  **2.6e-4**, same top-1 everywhere, NLL 1.262457 both; the Shakespeare eval below is unchanged at 3 decimals.
 
 ## Results (Shakespeare, last 10% = 111,540 chars)
 
@@ -146,6 +150,53 @@ Arise, fair sun, and kill the envious moon,
 Who is already sick and pale with grief,
 That thou her maid art far more fair than she:
 Be not her maid,
+```
+
+## SmolLM2-1.7B
+
+`HuggingFaceTB/SmolLM2-1.7B` (base model) goes through the same path with no code changes beyond the residual-add
+fix: hidden 2048, 24 layers, 32 query / 32 KV heads (no GQA, head_dim 64), d_ff 8192, RoPE theta 130000, tied,
+vocab 49152; **1,711,376,384 parameters**.
+
+```
+gyre-cli lm import-llama --hf-dir data/smollm2-1.7b --ckpt data/smollm2-1.7b/smollm2-1.7b.gyre
+```
+
+* **Import:** 3.4 GB bf16 -> 6.85 GB f32 `.gyre` (+ 3.6 MB `.gyre.json`) in 80 s. Peak RAM 13.5 GB: the importer
+  reads one tensor at a time, but `save_gyre` packs every payload in memory before writing, so the peak is ~2x
+  the f32 model. Loading maps the file (only the 0.4 GB `embed^T` head is a copy).
+* **Parity** (numpy float64 reference as above, 64-token prompt *"The Great Barrier Reef, off the coast of
+  Queensland, ..."*): **max |dlogit| = 8.9e-4** (position 0; positions 1-63 <= 1.5e-4, mean 1.8e-5), **same top-1
+  at all 64 positions**, mean next-token NLL 1.138238 (ref) vs 1.138238 (Gyre). Position 0 carries the "massive
+  activation": the residual reaches ~25,000 in one channel from layer 7 to 21 and is cancelled again in layers
+  22-23, so f32 rounding there shows up in the logits. A numpy f32 forward with one sequential k-chain per output
+  gives 8.0e-4 at position 0, i.e. this is the f32 floor of the kernel design.
+* **Shakespeare** (`lm eval --split 0.1`, same 35 windows as 360M): **0.4938 nats/char, 0.7124 BPC**
+  (1.531 nats/token), **599 s**. Same caveat as above: much of this is recall of a famous public text.
+* **Speed** (7950X, 32 threads, f32, greedy):
+
+| prompt | KV cache | no KV cache (full recompute) |
+| --- | --- | --- |
+| 5 tokens, 16 new | prefill 0.22 s, **0.174 s/token** | 0.258 s/token |
+| 839 tokens, 32 new | prefill 4.98 s, **0.170 s/token** | **5.85 s/token** |
+
+Decode reads all 6.85 GB of weights per token (~40 GB/s, memory-bound, ~4.7x the 360M time for 4.7x the
+parameters). Greedy "The capital of France is" -> " Paris." (`Llama.RealSmolLM2_1_7BKnowsTheCapitalOfFrance`,
+skipped unless the converted checkpoint exists; ~50 s, mostly paging in the file). Sample (`--temp 0.5`, 110
+tokens, 0.19 s/token):
+
+```
+# Python 3: return the n-th Fibonacci number iteratively.
+def fibonacci(n):
+    if n < 0:
+        return None
+    elif n == 0 or n == 1:
+        return n
+    else:
+        a, b = 0, 1
+        for i in range(2, n+1):
+            a, b = b, a+b
+        return b
 ```
 
 ## Limits

@@ -5,7 +5,7 @@ Copied from the session scratch file (that path is not in either git tree):
 
 Mode: local (Gyre Vulkan stack). Helix is context only (Sovereign: d=192, L=6, nHead=6, dFf=768, train T=256, B=32, V=2000, ALiBi). Live Helix `act` stays CPU.
 
-Issue 1 (GELU ±8 vs CPU ±40) was patched in `src/gyre/vk/shaders/elem.comp` after this review; rebuild Gyre so SPIR-V is regenerated. Other issues below are still open.
+Issue 1 (GELU ±8 vs CPU ±40) was patched in `src/gyre/vk/shaders/elem.comp` after this review; rebuild Gyre so SPIR-V is regenerated. Issues 2–4 have since been patched too; issue 5 (GEMM speed) is partial. See each issue's Status line.
 
 ## Summary
 

@@ -29,6 +29,16 @@ class BpeModel final : public VocabModel {
   // instead of failing.
   void set_merge_ids(std::vector<std::int32_t> ids) { merge_ids_ = std::move(ids); }
   const std::vector<std::int32_t>& merge_ids() const { return merge_ids_; }
+  // Hugging Face BPE unk_token: an input character with no vocab entry becomes `id` instead of
+  // being dropped. A "character" is one UTF-8 sequence (a plain BPE splits words into Unicode
+  // characters) or one byte when `per_byte` (byte-level BPE, where every byte is a character).
+  // `fuse` (fuse_unk) collapses a run of unknown characters into one unk. id < 0 = no unk token.
+  void set_unk(std::int32_t id, bool fuse, bool per_byte) {
+    unk_id_ = id;
+    fuse_unk_ = fuse;
+    unk_per_byte_ = per_byte;
+  }
+  std::int32_t unk_id() const { return unk_id_; }
 
   static Result<std::unique_ptr<BpeModel>> from_merges(
       std::vector<std::pair<std::int32_t, std::int32_t>> merges, std::int64_t vocab);
@@ -46,6 +56,9 @@ class BpeModel final : public VocabModel {
   std::unordered_map<std::uint64_t, std::int32_t> rank_;  // (a,b) -> index of the first merge with that pair
   std::vector<std::int32_t> merge_ids_;
   std::int64_t vocab_size_{256};
+  std::int32_t unk_id_{-1};
+  bool fuse_unk_{false};
+  bool unk_per_byte_{false};
 };
 
 }  // namespace gyre

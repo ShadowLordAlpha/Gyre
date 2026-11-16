@@ -7,6 +7,8 @@
 #include "gyre/optim.hpp"
 #include "gyre/train/loop.hpp"
 
+#include "../src/gyre/vk/limits.hpp"  // pure helpers, no vulkan.h
+
 #if defined(GYRE_VULKAN)
 #include "../src/gyre/vk/runtime.hpp"
 #endif
@@ -735,7 +737,102 @@ TEST(Vulkan, DispatchChecksDeviceLimits) {
   EXPECT_TRUE(dev->dispatch(gyre::vkrt::Pipe::elem, b, 1, 1, 1, pc));
   dev->synchronize();
 }
+
+// Ops check every bound tensor (and every output before allocating it) against the shader index
+// limit and maxStorageBufferRange before narrowing sizes to u32. A real 4 GiB tensor is too big
+// for CI, so lower the device's reported range for the duration of the test.
+TEST(Vulkan, OpsRejectTensorsPastStorageRange) {
+  std::string err;
+  auto vk = try_vk(&err);
+  if (!vk) GTEST_SKIP() << err;
+  auto vkd = *vk;
+  auto* dev = gyre::vkrt::VulkanDevice::from(vkd.get());
+  ASSERT_NE(dev, nullptr);
+  struct Restore {
+    gyre::vkrt::VulkanDevice* d;
+    std::uint32_t v;
+    ~Restore() { d->limits.maxStorageBufferRange = v; }
+  } restore{dev, dev->limits.maxStorageBufferRange};
+
+  auto cpu = gyre::Device::cpu();
+  std::vector<float> ones(512, 1.f);
+  std::int64_t big_sh[] = {512};      // 2048 bytes
+  std::int64_t col_sh[] = {64, 1};    // 256 bytes
+  std::int64_t row_sh[] = {1, 64};    // 256 bytes
+  auto big = gyre::Tensor::from_host(std::as_bytes(std::span(ones)), big_sh, gyre::DType::f32, *cpu)->to(vkd);
+  auto col = gyre::Tensor::from_host(std::as_bytes(std::span(ones.data(), 64)), col_sh, gyre::DType::f32, *cpu)->to(vkd);
+  auto row = gyre::Tensor::from_host(std::as_bytes(std::span(ones.data(), 64)), row_sh, gyre::DType::f32, *cpu)->to(vkd);
+  ASSERT_TRUE(big && col && row);
+
+  dev->limits.maxStorageBufferRange = 1024;
+  auto s = gyre::add(*big, *big);  // inputs too big to bind
+  ASSERT_FALSE(s);
+  EXPECT_EQ(s.error().code, gyre::Errc::unsupported);
+  EXPECT_NE(s.error().message.find("maxStorageBufferRange"), std::string::npos) << s.error().message;
+  auto m = gyre::matmul(*col, *row);  // inputs fit, the [64,64] output (16 KiB) does not
+  ASSERT_FALSE(m);
+  EXPECT_NE(m.error().message.find("matmul out"), std::string::npos) << m.error().message;
+  auto g = gyre::gelu(*col);  // within the limit: still runs
+  ASSERT_TRUE(g) << g.error().message;
+
+  dev->limits.maxStorageBufferRange = restore.v;
+  ASSERT_TRUE(gyre::add(*big, *big));
+  ASSERT_TRUE(gyre::matmul(*col, *row));
+  dev->synchronize();
+}
+
+// Zero-size tensors return early instead of dispatching; [3, 0] used to divide by its 0 columns.
+TEST(Vulkan, EmptyRowsOpsDoNotDispatch) {
+  std::string err;
+  auto vk = try_vk(&err);
+  if (!vk) GTEST_SKIP() << err;
+  auto vkd = *vk;
+  std::int64_t sh[] = {3, 0};
+  auto a = gyre::Tensor::zeros(sh, gyre::DType::f32, vkd);
+  ASSERT_TRUE(a) << a.error().message;
+  auto sm = gyre::softmax_last(*a);
+  ASSERT_TRUE(sm) << sm.error().message;
+  EXPECT_EQ(sm->numel(), 0);
+  std::int64_t ash[] = {0, 5};
+  std::int64_t bsh[] = {5, 4};
+  auto ea = gyre::Tensor::zeros(ash, gyre::DType::f32, vkd);
+  auto eb = gyre::Tensor::zeros(bsh, gyre::DType::f32, vkd);
+  ASSERT_TRUE(ea && eb);
+  auto mm = gyre::matmul(*ea, *eb);
+  ASSERT_TRUE(mm) << mm.error().message;
+  EXPECT_EQ(mm->numel(), 0);
+}
 #endif
+
+// Pure limit helpers (no device needed): 32-bit shader indices and the storage-range check.
+TEST(VulkanLimits, CheckExtentAndNarrowing) {
+  using gyre::vkops::check_extent;
+  using gyre::vkops::kMaxShaderElems;
+  constexpr std::uint64_t kAny = UINT64_MAX;
+  constexpr std::uint64_t k4G = 0xFFFFFFFFull;  // the largest maxStorageBufferRange a u32 can hold
+  EXPECT_TRUE(check_extent(0, 4, kAny, "t"));
+  EXPECT_TRUE(check_extent(kMaxShaderElems, 1, kAny, "t"));
+  auto over = check_extent(kMaxShaderElems + 1, 1, kAny, "t");
+  ASSERT_FALSE(over);
+  EXPECT_EQ(over.error().code, gyre::Errc::unsupported);
+  EXPECT_NE(over.error().message.find("shader index limit"), std::string::npos);
+  EXPECT_TRUE(check_extent((std::int64_t{1} << 30) - 1, 4, k4G, "t"));  // 4 GiB - 4 bytes
+  auto bytes = check_extent(std::int64_t{1} << 30, 4, k4G, "t");      // exactly 4 GiB
+  ASSERT_FALSE(bytes);
+  EXPECT_NE(bytes.error().message.find("maxStorageBufferRange"), std::string::npos);
+  EXPECT_FALSE(check_extent(-1, 4, kAny, "t"));
+  // A product past int64 saturates and is still rejected, rather than wrapping small.
+  const auto huge = gyre::vkops::sat_mul(std::int64_t{1} << 40, std::int64_t{1} << 40);
+  EXPECT_EQ(huge, std::numeric_limits<std::int64_t>::max());
+  EXPECT_FALSE(check_extent(huge, 4, kAny, "t"));
+  EXPECT_EQ(gyre::vkops::sat_mul(0, std::int64_t{1} << 62), 0);
+  // u32 narrowing: in-range passes through, anything else is an error (never truncated).
+  ASSERT_TRUE(gyre::vkops::to_u32(5, "x"));
+  EXPECT_EQ(*gyre::vkops::to_u32(5, "x"), 5u);
+  EXPECT_EQ(*gyre::vkops::to_u32(UINT32_MAX, "x"), UINT32_MAX);
+  EXPECT_FALSE(gyre::vkops::to_u32(std::int64_t{1} << 32, "x"));
+  EXPECT_FALSE(gyre::vkops::to_u32(-1, "x"));
+}
 
 TEST(Vulkan, CharLMHiddenMatchesCpuSovereignWidth) {
   std::string err;

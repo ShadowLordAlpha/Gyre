@@ -251,6 +251,177 @@ TEST(HfImport, MetaspaceDecodeRestoresSpaces) {
   std::filesystem::remove_all(dir);
 }
 
+// unk_token: a character missing from the vocab becomes the unk id (Hugging Face BPE.merge_word),
+// one per UTF-8 character, and fuse_unk collapses a run. Without unk_token it is dropped.
+TEST(HfImport, PlainBpeUnkTokenEmitsUnk) {
+  auto load = [](const std::string& name, const std::string& unk, bool fuse) {
+    const auto dir = write_hf_dir(name, R"({"version":"1.0","added_tokens":[{"id":0,"content":"[UNK]",
+      "single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],
+      "normalizer":null,"pre_tokenizer":null,
+      "model":{"type":"BPE","dropout":null,"unk_token":)" + unk + R"(,"continuing_subword_prefix":null,
+        "end_of_word_suffix":null,"fuse_unk":)" + (fuse ? "true" : "false") + R"(,"byte_fallback":false,
+        "vocab":{"[UNK]":0,"a":1,"b":2,"c":3,"bc":4,"ab":5,"abc":6},
+        "merges":[["b","c"],["a","b"],["a","bc"]]}})");
+    auto tok = Tokenizer::load_huggingface(dir);
+    std::filesystem::remove_all(dir);
+    return tok;
+  };
+  auto tok = load("gyre_hf_bpe_unk", R"("[UNK]")", false);
+  ASSERT_TRUE(tok) << tok.error().message;
+  const std::string e_acute = "\xC3\xA9";  // one character, two bytes: one unk
+  const std::vector<std::pair<std::string, Ids>> cases{
+      {"axb", {1, 0, 2}}, {"a" + e_acute + "b", {1, 0, 2}}, {"axyb", {1, 0, 0, 2}}, {"abc", {6}}, {"x", {0}}};
+  for (auto& [text, want] : cases) EXPECT_EQ((*tok)->encode(text).value(), want) << text;
+  auto again = Tokenizer::from_json((*tok)->to_json());  // the frozen document keeps the unk id
+  ASSERT_TRUE(again) << again.error().message;
+  for (auto& [text, want] : cases) EXPECT_EQ((*again)->encode(text).value(), want) << text;
+
+  auto fused = load("gyre_hf_bpe_unk_fuse", R"("[UNK]")", true);
+  ASSERT_TRUE(fused) << fused.error().message;
+  EXPECT_EQ((*fused)->encode("axy" + e_acute + "b").value(), (Ids{1, 0, 2}));
+  EXPECT_EQ((*fused)->encode("xay").value(), (Ids{0, 1, 0}));
+
+  auto none = load("gyre_hf_bpe_nounk", "null", false);  // dropped, as before
+  ASSERT_TRUE(none) << none.error().message;
+  EXPECT_EQ((*none)->encode("axb").value(), (Ids{5}));
+  // an unk_token that is not in the vocab is refused
+  auto missing = load("gyre_hf_bpe_badunk", R"("<unk>")", false);
+  ASSERT_FALSE(missing);
+  EXPECT_NE(missing.error().message.find("unk_token"), std::string::npos) << missing.error().message;
+}
+
+// Same with an alphabet + rank layout (no explicit merge ids): an unknown byte used to be an
+// "unknown byte" encode error even though the file names an unk_token.
+TEST(HfImport, ImplicitLayoutBpeUnkToken) {
+  const auto dir = write_hf_dir("gyre_hf_bpe_unk_implicit", R"({"version":"1.0","added_tokens":[],
+    "normalizer":null,"pre_tokenizer":null,"model":{"type":"BPE","unk_token":"<unk>",
+    "vocab":{"a":0,"b":1,"ab":2,"<unk>":3},"merges":["a b"]}})");
+  auto tok = Tokenizer::load_huggingface(dir);
+  std::filesystem::remove_all(dir);
+  ASSERT_TRUE(tok) << tok.error().message;
+  EXPECT_EQ((*tok)->encode("ab?ab").value(), (Ids{2, 3, 2}));
+  EXPECT_EQ((*tok)->encode("a\xE6\x97\xA5" "b").value(), (Ids{0, 3, 1}));
+}
+
+// Hugging Face pipeline stages Gyre does not implement fail loudly instead of silently encoding
+// with the identity pretokenizer / un-normalized text.
+TEST(HfImport, UnsupportedPipelineStagesFail) {
+  auto try_load = [](const std::string& name, const std::string& normalizer, const std::string& pre,
+                     const std::string& model) {
+    const auto dir = write_hf_dir(name, R"({"version":"1.0","added_tokens":[],"normalizer":)" + normalizer +
+                                            R"(,"pre_tokenizer":)" + pre + R"(,"model":)" + model + "}");
+    auto tok = Tokenizer::load_huggingface(dir);
+    std::filesystem::remove_all(dir);
+    return tok;
+  };
+  const std::string bpe = R"({"type":"BPE","unk_token":null,"vocab":{"a":0,"b":1,"ab":2},"merges":["a b"]})";
+  const std::string uni = R"({"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],["a",-1.0],["b",-1.0]]})";
+  auto expect_refused = [&](const std::string& normalizer, const std::string& pre, const std::string& model,
+                            const char* what) {
+    auto r = try_load("gyre_hf_refused", normalizer, pre, model);
+    ASSERT_FALSE(r) << "loaded: " << normalizer << " " << pre << " " << model;
+    EXPECT_EQ(r.error().code, Errc::unsupported) << r.error().message;
+    EXPECT_NE(r.error().message.find(what), std::string::npos) << r.error().message;
+  };
+  for (const char* pre : {R"({"type":"Whitespace"})", R"({"type":"WhitespaceSplit"})", R"({"type":"BertPreTokenizer"})",
+                          R"({"type":"Punctuation","behavior":"Isolated"})",
+                          R"({"type":"Split","pattern":{"Regex":"\\s+"},"behavior":"Removed","invert":false})",
+                          R"({"type":"CharDelimiterSplit","delimiter":" "})"}) {
+    expect_refused("null", pre, bpe, "pre_tokenizer");
+    expect_refused("null", pre, uni, "pre_tokenizer");
+  }
+  expect_refused("null", R"({"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true})",
+                 R"({"type":"BPE","vocab":{"a":0},"merges":[]})", "add_prefix_space");
+  expect_refused("null", R"({"type":"Metaspace","replacement":"_","prepend_scheme":"always","split":true})", uni,
+                 "replacement");
+  for (const char* norm : {R"({"type":"NFC"})", R"({"type":"Lowercase"})",
+                           R"({"type":"BertNormalizer","clean_text":true,"handle_chinese_chars":true,"strip_accents":null,"lowercase":true})",
+                           R"({"type":"Sequence","normalizers":[{"type":"NFKC"}]})"}) {
+    expect_refused(norm, "null", bpe, "normalizer");
+    expect_refused(norm, "null", uni, "normalizer");
+  }
+  expect_refused("null", "null", R"({"type":"WordPiece","unk_token":"[UNK]","vocab":{"[UNK]":0,"a":1}})", "WordPiece");
+  expect_refused("null", "null",
+                 R"({"type":"BPE","continuing_subword_prefix":"##","vocab":{"a":0,"b":1,"ab":2},"merges":["a b"]})",
+                 "continuing_subword_prefix");
+  expect_refused("null", "null", R"({"type":"BPE","byte_fallback":true,"vocab":{"a":0,"b":1,"ab":2},"merges":["a b"]})",
+                 "byte_fallback");
+
+  // What is supported still loads: null stages, an empty normalizer Sequence, GPT-2 style
+  // ByteLevel options and the bare {"type":"ByteLevel"} older Gyre exports wrote.
+  EXPECT_TRUE(try_load("gyre_hf_ok1", "null", "null", bpe));
+  EXPECT_TRUE(try_load("gyre_hf_ok2", R"({"type":"Sequence","normalizers":[]})", "null", uni));
+  const std::string bl = R"({"vocab":{"a":0},"merges":[]})";
+  EXPECT_TRUE(try_load("gyre_hf_ok3", "null", R"({"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true})", bl));
+  EXPECT_TRUE(try_load("gyre_hf_ok4", "null", R"({"type":"ByteLevel"})", bl));
+}
+
+// Metaspace options are honoured (and survive the Gyre document): split=true cuts before every
+// U+2581, prepend_scheme "never" drops the dummy prefix.
+TEST(HfImport, MetaspaceSplitAndPrependScheme) {
+  auto load = [](const std::string& name, const std::string& pre) {
+    const auto dir = write_hf_dir(name, R"({"version":"1.0","added_tokens":[],"normalizer":null,"pre_tokenizer":)" + pre +
+                                            R"(,"model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],
+      ["▁a▁b",-0.5],["▁a",-2.0],["▁b",-2.0],["▁",-3.0],["a",-4.0],["b",-4.0]]}})");
+    auto tok = Tokenizer::load_huggingface(dir);
+    std::filesystem::remove_all(dir);
+    return tok;
+  };
+  auto whole = load("gyre_hf_ms_whole", R"({"type":"Metaspace","replacement":"▁","prepend_scheme":"always","split":false})");
+  auto split = load("gyre_hf_ms_split", R"({"type":"Metaspace","replacement":"▁","prepend_scheme":"always","split":true})");
+  auto never = load("gyre_hf_ms_never", R"({"type":"Metaspace","replacement":"▁","prepend_scheme":"never","split":true})");
+  ASSERT_TRUE(whole && split && never);
+  EXPECT_EQ((*whole)->encode("a b").value(), (Ids{1}));     // "▁a▁b" spans the space
+  EXPECT_EQ((*split)->encode("a b").value(), (Ids{2, 3}));  // "▁a" | "▁b"
+  EXPECT_EQ((*never)->encode("a b").value(), (Ids{5, 3}));  // "a" | "▁b"
+  EXPECT_STREQ((*split)->pretok_name(), "metaspace_split");
+  EXPECT_STREQ((*never)->pretok_name(), "metaspace_noprefix_split");
+  for (auto* t : {whole->get(), split->get(), never->get()}) {
+    auto re = Tokenizer::from_json(t->to_json());
+    ASSERT_TRUE(re) << re.error().message;
+    EXPECT_EQ((*re)->encode("a b").value(), t->encode("a b").value()) << t->pretok_name();
+    EXPECT_EQ(t->decode(t->encode("a b").value()), "a b") << t->pretok_name();
+  }
+}
+
+// Old Gyre exports wrote merges as "a b" strings although pieces may contain spaces.
+TEST(HfImport, StringMergesWithSpacesResolveOrFail) {
+  // (1) Truly ambiguous: "a  b" is both "a"+" b" and "a "+"b", each with its result "a b" at
+  // alphabet + rank. Picking one silently changes merge ranks, so the file is refused.
+  const std::string vocab = R"({"a":0," ":1,"b":2,"a ":3," b":4,"a b":5})";
+  auto load = [](const std::string& name, const std::string& pre, const std::string& model) {
+    const auto dir = write_hf_dir(name, R"({"version":"1.0","added_tokens":[],"normalizer":null,"pre_tokenizer":)" +
+                                            pre + R"(,"model":)" + model + "}");
+    auto tok = Tokenizer::load_huggingface(dir);
+    std::filesystem::remove_all(dir);
+    return tok;
+  };
+  const std::string gyre_pre = R"({"type":"Sequence"})";  // Gyre's identity-export marker
+  auto amb = load("gyre_hf_amb", gyre_pre,
+                  R"({"type":"BPE","unk_token":null,"vocab":)" + vocab + R"(,"merges":["a  ","  b","a  b"]})");
+  ASSERT_FALSE(amb);
+  EXPECT_NE(amb.error().message.find("ambiguous"), std::string::npos) << amb.error().message;
+  // The same merges as [a, b] pairs are unambiguous.
+  auto pairs = load("gyre_hf_amb_pairs", gyre_pre,
+                    R"({"type":"BPE","unk_token":null,"vocab":)" + vocab +
+                        R"(,"merges":[["a"," "],[" ","b"],["a ","b"]]})");
+  ASSERT_TRUE(pairs) << pairs.error().message;
+  EXPECT_EQ((*pairs)->encode("a b").value(), (Ids{5}));
+
+  // (2) Resolvable: "a b c" splits as "a"+"b c" or "a b"+"c", but only "a bc" is in the vocab.
+  // With [UNK] first the layout is not alphabet + rank, so the old loader took the first split
+  // and then failed with "merge result not in vocab".
+  auto ok = load("gyre_hf_amb_ok", "null", R"({"type":"BPE","unk_token":"[UNK]",
+    "vocab":{"[UNK]":0,"a":1," ":2,"b":3,"c":4,"a ":5,"a b":6," c":7,"b c":8,"a bc":9},
+    "merges":["a  ","a  b","  c","b  c","a b c"]})");
+  ASSERT_TRUE(ok) << ok.error().message;
+  const auto& bm = dynamic_cast<const BpeModel&>((*ok)->model());
+  ASSERT_EQ(bm.merges().size(), 5u);
+  EXPECT_EQ(bm.merges()[4], (std::pair<std::int32_t, std::int32_t>{6, 4}));
+  EXPECT_EQ(bm.merges()[1], (std::pair<std::int32_t, std::int32_t>{5, 3}));
+  EXPECT_EQ((*ok)->decode((*ok)->encode("a b c a bc").value()), "a b c a bc");
+}
+
 namespace {
 
 void pb_varint(std::string& o, std::uint64_t v) {

@@ -1,5 +1,6 @@
 #include "gyre/nn/moe.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <span>
 #include <vector>
@@ -259,4 +260,138 @@ TEST(GrokMoe, NarrowOutputWidthIsError) {
   auto r2 = gyre::residual_moe(x, good, rw, bad_ex, 1, 0.f);
   ASSERT_FALSE(r2);
   EXPECT_EQ(r2.error().code, gyre::Errc::invalid_shape);
+}
+
+// Grok routing (xai-org/grok-1 MoELayer, SGLang fused_moe_router with renormalize=False):
+// softmax over ALL experts, then the top-k probabilities as-is (they do not sum to 1).
+TEST(GrokMoe, TopKWithoutRenormalizeKeepsSoftmaxProbs) {
+  auto d = gyre::Device::cpu();
+  std::int64_t sh[] = {1, 4};
+  float z[] = {1.f, 3.f, 0.f, 2.f};
+  auto t = gyre::Tensor::from_host(std::as_bytes(std::span(z)), sh, gyre::DType::f32, *d);
+  auto top = gyre::moe_topk(*t, 2, 0.f, /*renormalize=*/false);
+  ASSERT_TRUE(top) << top.error().message;
+  double se = 0;
+  for (float v : z) se += std::exp(static_cast<double>(v));
+  auto pi = top->indices.host_span<std::int32_t>();
+  auto pw = top->weights.host_span<float>();
+  EXPECT_EQ((*pi)[0], 1);
+  EXPECT_EQ((*pi)[1], 3);
+  EXPECT_NEAR((*pw)[0], std::exp(3.0) / se, 1e-6);
+  EXPECT_NEAR((*pw)[1], std::exp(2.0) / se, 1e-6);
+  EXPECT_LT((*pw)[0] + (*pw)[1], 0.95f);
+}
+
+namespace {
+
+float gelu_tanh_ref(float x) {
+  const double u = 0.7978845608028654 * (x + 0.044715 * double(x) * x * x);
+  return static_cast<float>(0.5 * x * (1.0 + std::tanh(u)));
+}
+
+// act(x@w1) * (x@w3) @ w2 for one row, gelu-tanh gate (Grok GeGLU).
+std::vector<double> geglu_row(const float* x, const gyre::SwiGLUWeights& w, std::int64_t D, std::int64_t I) {
+  auto p1 = w.w1->host_span<float>(), p3 = w.w3->host_span<float>(), p2 = w.w2->host_span<float>();
+  std::vector<double> h(static_cast<std::size_t>(I)), y(static_cast<std::size_t>(D), 0.0);
+  for (std::int64_t i = 0; i < I; ++i) {
+    double g = 0, u = 0;
+    for (std::int64_t c = 0; c < D; ++c) {
+      g += double(x[c]) * (*p1)[static_cast<std::size_t>(c * I + i)];
+      u += double(x[c]) * (*p3)[static_cast<std::size_t>(c * I + i)];
+    }
+    h[static_cast<std::size_t>(i)] = gelu_tanh_ref(static_cast<float>(g)) * u;
+  }
+  for (std::int64_t c = 0; c < D; ++c)
+    for (std::int64_t i = 0; i < I; ++i)
+      y[static_cast<std::size_t>(c)] += h[static_cast<std::size_t>(i)] * (*p2)[static_cast<std::size_t>(i * D + c)];
+  return y;
+}
+
+}  // namespace
+
+// kGrokMoe against a scalar transcription of the reference Grok-2 layer FFN (SGLang
+// Grok1DecoderLayer.moe_with_rmoe): (GeGLU_dense(x) + sum_j p_j GeGLU_{e_j}(x)) / sqrt(2), with
+// p = top_k(softmax(30*tanh(logits/30))) not renormalized; and the sparse (residual_moe=false)
+// form without the dense branch or the 1/sqrt(2).
+TEST(GrokMoe, GrokSpecMatchesReferenceLayer) {
+  auto d = gyre::Device::cpu();
+  const std::int64_t N = 5, Dim = 6, I = 4, E = 4;
+  const int k = 2;
+  const float cap = 30.f;
+  auto x = randn2(N, Dim, 11, *d);
+  std::vector<gyre::Tensor> w;
+  for (std::uint64_t s = 0; s < 3 * (E + 1); ++s) {
+    const bool down = (s % 3) == 2;
+    w.push_back(randn2(down ? I : Dim, down ? Dim : I, 300 + s, *d));
+  }
+  gyre::SwiGLUWeights dense{&w[0], &w[1], &w[2]};
+  std::vector<gyre::SwiGLUWeights> ex;
+  for (std::int64_t e = 0; e < E; ++e) ex.push_back({&w[3 + 3 * e], &w[4 + 3 * e], &w[5 + 3 * e]});
+  auto rw = randn2(Dim, E, 77, *d);
+  auto y = gyre::residual_moe(x, dense, rw, ex, k, cap, gyre::kGrokMoe);
+  auto ys = gyre::residual_moe(x, gyre::SwiGLUWeights{}, rw, ex, k, cap, gyre::kGrokMoe);
+  ASSERT_TRUE(y) << y.error().message;
+  ASSERT_TRUE(ys) << ys.error().message;
+  auto px = x.host_span<float>();
+  auto pr = rw.host_span<float>();
+  auto py = y->host_span<float>();
+  auto ps = ys->host_span<float>();
+  for (std::int64_t n = 0; n < N; ++n) {
+    const float* xr = px->data() + n * Dim;
+    std::vector<double> prob(static_cast<std::size_t>(E));
+    double mx = -1e30, se = 0;
+    for (std::int64_t e = 0; e < E; ++e) {
+      double l = 0;
+      for (std::int64_t c = 0; c < Dim; ++c) l += double(xr[c]) * (*pr)[static_cast<std::size_t>(c * E + e)];
+      l = cap * std::tanh(l / cap);
+      prob[static_cast<std::size_t>(e)] = l;
+      mx = std::max(mx, l);
+    }
+    for (auto& p : prob) se += (p = std::exp(p - mx));
+    for (auto& p : prob) p /= se;
+    std::vector<int> order(static_cast<std::size_t>(E));
+    for (int e = 0; e < E; ++e) order[static_cast<std::size_t>(e)] = e;
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+      return prob[static_cast<std::size_t>(a)] > prob[static_cast<std::size_t>(b)];
+    });
+    std::vector<double> moe(static_cast<std::size_t>(Dim), 0.0);
+    for (int j = 0; j < k; ++j) {
+      const int e = order[static_cast<std::size_t>(j)];
+      auto ye = geglu_row(xr, ex[static_cast<std::size_t>(e)], Dim, I);
+      for (std::int64_t c = 0; c < Dim; ++c)
+        moe[static_cast<std::size_t>(c)] += prob[static_cast<std::size_t>(e)] * ye[static_cast<std::size_t>(c)];
+    }
+    auto yd = geglu_row(xr, dense, Dim, I);
+    for (std::int64_t c = 0; c < Dim; ++c) {
+      const auto i = static_cast<std::size_t>(n * Dim + c);
+      const double ref = (yd[static_cast<std::size_t>(c)] + moe[static_cast<std::size_t>(c)]) / std::sqrt(2.0);
+      EXPECT_NEAR((*py)[i], ref, 1e-4) << "n=" << n << " c=" << c;
+      EXPECT_NEAR((*ps)[i], moe[static_cast<std::size_t>(c)], 1e-4) << "sparse n=" << n << " c=" << c;
+    }
+  }
+}
+
+// The default spec stays the generic SwiGLU MoE (silu gate, renormalized, no scaling).
+TEST(GrokMoe, DefaultSpecIsUnscaledSwiGLU) {
+  auto d = gyre::Device::cpu();
+  const std::int64_t N = 3, Dim = 4, I = 3, E = 2;
+  auto x = randn2(N, Dim, 21, *d);
+  auto w1 = randn2(Dim, I, 22, *d), w3 = randn2(Dim, I, 23, *d), w2 = randn2(I, Dim, 24, *d);
+  auto rw = randn2(Dim, E, 25, *d);
+  gyre::SwiGLUWeights dense{&w1, &w3, &w2};
+  gyre::SwiGLUWeights ex[] = {dense, dense};
+  // Both experts identical and k = E: renormalized weights sum to 1, so y = 2 * swiglu(x).
+  auto y = gyre::residual_moe(x, dense, rw, ex, 2, 0.f);
+  auto s = gyre::swiglu_ffn(x, dense);
+  auto g = gyre::swiglu_ffn(x, dense, gyre::GateAct::gelu_tanh);
+  ASSERT_TRUE(y && s && g);
+  auto py = y->host_span<float>();
+  auto ps = s->host_span<float>();
+  auto pg = g->host_span<float>();
+  bool differs = false;
+  for (std::size_t i = 0; i < py->size(); ++i) {
+    EXPECT_NEAR((*py)[i], 2.f * (*ps)[i], 1e-5f);
+    differs |= std::fabs((*pg)[i] - (*ps)[i]) > 1e-4f;
+  }
+  EXPECT_TRUE(differs);  // gelu gate is a different activation
 }
