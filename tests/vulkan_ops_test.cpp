@@ -515,6 +515,144 @@ TEST(Vulkan, BackwardKernelsMatchCpu) {
   }
 }
 
+namespace {
+
+std::vector<std::byte> host_bytes_of(const gyre::Tensor& t) {
+  auto h = t.to_host_vec();
+  if (!h) std::abort();
+  return std::move(*h);
+}
+
+}  // namespace
+
+// Regression: LayerNorm gamma/beta grads and embedding grads used float
+// atomics, so the summation order followed GPU scheduling and two identical
+// training runs drifted apart. Every backward reduction now has a fixed order:
+// repeating the same work must give byte-identical results.
+TEST(Vulkan, BackwardIsBitReproducible) {
+  std::string err;
+  auto vk = try_vk(&err);
+  if (!vk) GTEST_SKIP() << err;
+  auto vkd = *vk;
+  constexpr int kRuns = 6;
+
+  {  // layer_norm_backward, many rows (several reduction chunks) and C > 256
+    gyre::Rng rng(5);
+    auto x = rand_cpu({4, 130, 300}, rng, -2.f, 2.f);
+    auto dy = rand_cpu({4, 130, 300}, rng);
+    auto w = rand_cpu({300}, rng, 0.5f, 1.5f);
+    auto gw = rand_cpu({300}, rng), gb = rand_cpu({300}, rng);
+    auto gwc = *gw.clone(), gbc = *gb.clone();
+    auto dxc = gyre::layer_norm_backward(x, dy, w, gwc, gbc, 1e-5f);
+    ASSERT_TRUE(dxc);
+    auto xv = to_dev(x, vkd), dyv = to_dev(dy, vkd), wv = to_dev(w, vkd);
+    std::vector<std::byte> dx0, gw0, gb0;
+    for (int run = 0; run < kRuns; ++run) {
+      auto gwv = to_dev(gw, vkd), gbv = to_dev(gb, vkd);
+      auto dxv = gyre::layer_norm_backward(xv, dyv, wv, gwv, gbv, 1e-5f);
+      ASSERT_TRUE(dxv) << dxv.error().message;
+      if (run == 0) {
+        expect_close(*dxc, to_cpu(*dxv), 1e-4f);
+        expect_close(gwc, to_cpu(gwv), 2e-3f);
+        expect_close(gbc, to_cpu(gbv), 2e-3f);
+        dx0 = host_bytes_of(*dxv);
+        gw0 = host_bytes_of(gwv);
+        gb0 = host_bytes_of(gbv);
+        continue;
+      }
+      EXPECT_TRUE(host_bytes_of(*dxv) == dx0) << "ln dx differs on run " << run;
+      EXPECT_TRUE(host_bytes_of(gwv) == gw0) << "ln gw differs on run " << run;
+      EXPECT_TRUE(host_bytes_of(gbv) == gb0) << "ln gb differs on run " << run;
+    }
+  }
+  {  // embedding_backward: 4096 tokens over few ids (heavy collisions), C > 256
+    gyre::Rng rng(6);
+    const std::int64_t V = 40, C = 300, N = 4096;
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(N));
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      // Mostly ids 0..3, a few others, and some ids never appear.
+      const auto r = rng.u64();
+      ids[i] = static_cast<std::int32_t>((r % 8) < 6 ? (r >> 8) % 4 : (r >> 8) % 30);
+    }
+    std::int64_t ish[] = {N};
+    auto ic = gyre::Tensor::from_host(std::as_bytes(std::span(ids)), ish, gyre::DType::i32, *gyre::Device::cpu());
+    ASSERT_TRUE(ic);
+    auto gW = rand_cpu({V, C}, rng);
+    auto dout = rand_cpu({N, C}, rng);
+    auto gWc = *gW.clone();
+    ASSERT_TRUE(gyre::embedding_backward(gWc, *ic, dout));
+    auto iv = to_dev(*ic, vkd), dv = to_dev(dout, vkd);
+    std::vector<std::byte> g0;
+    for (int run = 0; run < kRuns; ++run) {
+      auto gWv = to_dev(gW, vkd);
+      auto ev = gyre::embedding_backward(gWv, iv, dv);
+      ASSERT_TRUE(ev) << ev.error().message;
+      if (run == 0) {
+        // Same per-id summation order as the CPU loop: identical up to fp contraction.
+        expect_close(gWc, to_cpu(gWv), 1e-4f);
+        g0 = host_bytes_of(gWv);
+        continue;
+      }
+      EXPECT_TRUE(host_bytes_of(gWv) == g0) << "embedding grad differs on run " << run;
+    }
+    // Out-of-range ids error like CPU instead of being skipped.
+    std::vector<std::int32_t> bad = {0, static_cast<std::int32_t>(V)};
+    std::int64_t bsh[] = {2};
+    auto bt = gyre::Tensor::from_host(std::as_bytes(std::span(bad)), bsh, gyre::DType::i32, vkd);
+    ASSERT_TRUE(bt);
+    auto gWv = to_dev(gW, vkd);
+    EXPECT_FALSE(gyre::embedding_backward(gWv, *bt, to_dev(rand_cpu({2, C}, rng), vkd)));
+  }
+  {  // a few CharLM train steps with dropout, AdamW and grad clipping
+    const std::string text =
+        "to be or not to be that is the question whether tis nobler in the mind to suffer ";
+    auto tok = gyre::Tokenizer::chars_from_text(text);
+    ASSERT_TRUE(tok);
+    auto ids = (*tok)->encode(text);
+    ASSERT_TRUE(ids);
+    auto data = gyre::CharDataset::from_ids(*ids, vkd);
+    ASSERT_TRUE(data);
+    gyre::CharLMConfig c;
+    c.vocab = (*tok)->vocab_size();
+    c.block_size = 32;
+    c.n_layer = 2;
+    c.n_head = 2;
+    c.d_model = 32;
+    c.d_ff = 64;
+    c.dropout = 0.1f;
+    std::vector<std::vector<std::byte>> first;
+    for (int run = 0; run < kRuns; ++run) {
+      gyre::Rng rng(11);
+      auto m = gyre::CharLM::create(c, vkd, rng);
+      ASSERT_TRUE(m) << m.error().message;
+      gyre::TrainConfig tc;
+      tc.steps = 3;
+      tc.batch = 4;
+      tc.block = 32;
+      tc.lr = 3e-3f;
+      tc.weight_decay = 0.1f;
+      tc.grad_clip = 0.5f;
+      tc.log_every = 0;
+      tc.seed = 9;
+      gyre::TrainLoop loop;
+      auto r = loop.run(*m, *data, tc, vkd, {}, {});
+      ASSERT_TRUE(r) << r.error().message;
+      std::size_t k = 0;
+      for (auto& p : m->parameters()) {
+        auto b = host_bytes_of(p.value);
+        if (run == 0) {
+          first.push_back(std::move(b));
+        } else {
+          ASSERT_LT(k, first.size());
+          EXPECT_TRUE(b == first[k]) << "param " << k << " differs on run " << run;
+        }
+        ++k;
+      }
+      EXPECT_EQ(k, first.size());
+    }
+  }
+}
+
 // Regression: softcap's tanh had no clamp (GELU's did). Large |x/cap| must
 // saturate to +/-cap like CPU std::tanh, never NaN.
 TEST(Vulkan, SoftcapSaturatesLikeCpu) {

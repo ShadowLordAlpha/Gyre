@@ -69,6 +69,7 @@ gyre-cli lm train --data data/shakespeare.txt --preset nanogpt --tok data/nanogp
 - Implementation: `src/gyre/vk/` (raw `vulkan.h`, device-local buffers + staging, GLSL compute → SPIR-V at build). Same `ops.hpp` names; `host_span` stays CPU-only.
 - Train/eval/generate CharLM on GPU. Tokenizer, ONNX export, GA, Helix `act`, Grok RoPE/MoE stay CPU.
 - Tests: `tests/vulkan_ops_test.cpp` (skip if no device). Write-up: `docs/vulkan.md`.
+- Bit-reproducible run to run (same GPU/driver/binary; not bit-equal to CPU). Never add float atomics or other scheduling-ordered reductions to shaders: reduce in a fixed order (see LN gamma/beta chunk passes, host-sorted embedding backward). `Vulkan.BackwardIsBitReproducible` guards it.
 - Vulkan nanogpt can raise `--batch` vs CPU 2 if VRAM allows.
 
 ```

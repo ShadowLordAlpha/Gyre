@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstring>
 #include <initializer_list>
+#include <optional>
+#include <span>
 #include <vector>
 
 namespace gyre::vkops {
@@ -553,8 +555,21 @@ Result<Tensor> layer_norm_backward(const Tensor& x, const Tensor& d_out, const T
   if (!d) return std::unexpected(make_error(Errc::unsupported, "vulkan device"));
   auto dx = Tensor::empty(x.shape(), DType::f32, x.device());
   if (!dx) return dx;
+  if (x.numel() == 0) return dx;
   const auto C = x.shape()[x.rank() - 1];
   const auto rows = x.numel() / C;
+  // gamma/beta grads are reduced without atomics so a run is bit-reproducible:
+  //   pass 1 (op 3): dx per row, and each row's (mean, inv) into `stats`;
+  //   pass 2 (op 7): one invocation per (column, chunk of kChunk rows) sums the
+  //     chunk's rows in order;
+  //   pass 3 (op 8): gw/gb += the chunk partials in chunk order.
+  // With a single chunk, pass 2 accumulates straight into gw/gb (CPU order).
+  // kChunk is a constant, so the summation tree is fixed for a given shape.
+  constexpr std::int64_t kChunk = 32;
+  const std::int64_t chunks = (rows + kChunk - 1) / kChunk;
+  std::int64_t ssh[1] = {rows * 2};
+  auto stats = Tensor::uninit(ssh, DType::f32, x.device());  // every row writes its pair
+  if (!stats) return std::unexpected(stats.error());
   vkrt::Push pc;
   pc.u[0] = static_cast<std::uint32_t>(rows);
   pc.u[1] = static_cast<std::uint32_t>(C);
@@ -565,10 +580,46 @@ Result<Tensor> layer_norm_backward(const Tensor& x, const Tensor& d_out, const T
   b[1].t = &d_out;
   b[2].t = &w;
   b[3].t = &*dx;
-  b[4].t = &gw;
-  b[5].t = &gb;
+  b[4].t = &*stats;
   auto r = d->dispatch(vkrt::Pipe::row, b, static_cast<std::uint32_t>(rows), 1, 1, pc);
   if (!r) return std::unexpected(r.error());
+
+  std::optional<Tensor> pw, pb;
+  if (chunks > 1) {
+    std::int64_t psh[1] = {chunks * C};
+    auto a = Tensor::uninit(psh, DType::f32, x.device());  // pass 2 writes all of it
+    auto c = Tensor::uninit(psh, DType::f32, x.device());
+    if (!a || !c) return std::unexpected(a ? c.error() : a.error());
+    pw = std::move(*a);
+    pb = std::move(*c);
+  }
+  vkrt::Push p2;
+  p2.u[0] = static_cast<std::uint32_t>(rows);
+  p2.u[1] = static_cast<std::uint32_t>(C);
+  p2.u[2] = 7;
+  p2.u[3] = static_cast<std::uint32_t>(kChunk);
+  p2.u[4] = chunks > 1 ? 0u : 1u;
+  std::array<vkrt::Bind, 7> b2{};
+  b2[0].t = &x;
+  b2[1].t = &d_out;
+  b2[2].t = pw ? &*pw : &gw;
+  b2[3].t = pb ? &*pb : &gb;
+  b2[4].t = &*stats;
+  r = d->dispatch(vkrt::Pipe::row, b2, groups(C), static_cast<std::uint32_t>(chunks), 1, p2);
+  if (!r) return std::unexpected(r.error());
+  if (chunks > 1) {
+    vkrt::Push p3;
+    p3.u[0] = static_cast<std::uint32_t>(chunks);
+    p3.u[1] = static_cast<std::uint32_t>(C);
+    p3.u[2] = 8;
+    std::array<vkrt::Bind, 7> b3{};
+    b3[2].t = &*pw;
+    b3[3].t = &*pb;
+    b3[4].t = &gw;
+    b3[5].t = &gb;
+    r = d->dispatch(vkrt::Pipe::row, b3, groups(C), 1, 1, p3);
+    if (!r) return std::unexpected(r.error());
+  }
   return dx;
 }
 
@@ -577,16 +628,58 @@ Result<void> embedding_backward(Tensor& grad_W, const Tensor& idx, const Tensor&
   if (!d) return std::unexpected(make_error(Errc::unsupported, "vulkan device"));
   const auto dim = grad_W.shape()[1];
   const auto V = grad_W.shape()[0];
+  const auto n = idx.numel();
+  if (n == 0 || dim == 0) return {};
+  // Deterministic scatter-add: stable counting sort of token positions by id on
+  // the host (ids are small ints), then one invocation per (unique id, column)
+  // sums that id's rows in ascending token order. Float atomics would make the
+  // order follow GPU scheduling and runs would not be bit-reproducible.
+  auto bytes = idx.to_host_vec();
+  if (!bytes) return std::unexpected(bytes.error());
+  const auto* ids = reinterpret_cast<const std::int32_t*>(bytes->data());
+  std::vector<std::int32_t> next(static_cast<std::size_t>(V), 0);  // count, then write cursor
+  for (std::int64_t i = 0; i < n; ++i) {
+    const auto id = ids[i];
+    if (id < 0 || id >= V) return std::unexpected(make_error(Errc::invalid_shape, "emb idx"));
+    ++next[static_cast<std::size_t>(id)];
+  }
+  std::vector<std::int32_t> meta;  // [U unique ids | U+1 segment starts]
+  std::vector<std::int32_t> starts;
+  std::int32_t run = 0;
+  for (std::size_t v = 0; v < next.size(); ++v) {
+    const auto c = next[v];
+    next[v] = run;
+    if (c == 0) continue;
+    meta.push_back(static_cast<std::int32_t>(v));
+    starts.push_back(run);
+    run += c;
+  }
+  const auto U = static_cast<std::int64_t>(meta.size());
+  starts.push_back(run);
+  meta.insert(meta.end(), starts.begin(), starts.end());
+  std::vector<std::int32_t> order(static_cast<std::size_t>(n));
+  for (std::int64_t i = 0; i < n; ++i) {
+    order[static_cast<std::size_t>(next[static_cast<std::size_t>(ids[i])]++)] = static_cast<std::int32_t>(i);
+  }
+  std::int64_t osh[1] = {n};
+  std::int64_t msh[1] = {static_cast<std::int64_t>(meta.size())};
+  auto ot = Tensor::from_host(std::as_bytes(std::span<const std::int32_t>(order)), osh, DType::i32,
+                              grad_W.device());
+  if (!ot) return std::unexpected(ot.error());
+  auto mt = Tensor::from_host(std::as_bytes(std::span<const std::int32_t>(meta)), msh, DType::i32,
+                              grad_W.device());
+  if (!mt) return std::unexpected(mt.error());
   vkrt::Push pc;
-  pc.u[0] = static_cast<std::uint32_t>(idx.numel());
+  pc.u[0] = static_cast<std::uint32_t>(U * dim);
   pc.u[1] = 1;
   pc.u[2] = static_cast<std::uint32_t>(dim);
-  pc.u[3] = static_cast<std::uint32_t>(V);
+  pc.u[3] = static_cast<std::uint32_t>(U);
   std::array<vkrt::Bind, 7> b{};
   b[1].t = &d_out;
-  b[3].t = &idx;
+  b[3].t = &*ot;
   b[4].t = &grad_W;
-  return d->dispatch(vkrt::Pipe::idx, b, groups(idx.numel()), 1, 1, pc);
+  b[5].t = &*mt;
+  return d->dispatch(vkrt::Pipe::idx, b, groups(U * dim), 1, 1, pc);
 }
 
 Result<void> bias_add_(Tensor& y, const Tensor& b) {

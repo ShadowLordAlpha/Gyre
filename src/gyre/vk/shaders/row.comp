@@ -62,32 +62,56 @@ bool bit_nan(float x) {
 
 bool bit_pinf(float x) { return floatBitsToUint(x) == 0x7f800000u; }
 
-void atomicAddU(uint i, float v) {
-  uint old = s4u[i];
-  for (;;) {
-    uint n = floatBitsToUint(uintBitsToFloat(old) + v);
-    uint r = atomicCompSwap(s4u[i], old, n);
-    if (r == old) return;
-    old = r;
-  }
-}
-
-void atomicAddU5(uint i, float v) {
-  uint old = s5u[i];
-  for (;;) {
-    uint n = floatBitsToUint(uintBitsToFloat(old) + v);
-    uint r = atomicCompSwap(s5u[i], old, n);
-    if (r == old) return;
-    old = r;
-  }
-}
-
 void main() {
   uint row = gl_WorkGroupID.x;
   uint lid = gl_LocalInvocationID.x;
   uint cols = pc.u1;
   uint op = pc.u2;
   uint rows = pc.u0;
+
+  // LayerNorm gamma/beta grads, pass 2 of 3 (pass 1 is op 3). No atomics: one
+  // invocation per (column, chunk of u3 rows) sums its rows in ascending order,
+  // so the result never depends on GPU scheduling. Row stats (mean, inv) come
+  // from op 3 in s4u. u4 != 0: there is a single chunk, and s2/s3 ARE gw/gb, so
+  // start from their current value (accumulate, same order as the CPU loop).
+  // Otherwise s2/s3 are [chunks, cols] partials that op 8 folds in.
+  if (op == 7u) {
+    uint col = gl_WorkGroupID.x * 256u + lid;
+    if (col >= cols) return;
+    uint chunk = gl_WorkGroupID.y;
+    uint r0 = chunk * pc.u3;
+    uint r1 = min(rows, r0 + pc.u3);
+    uint o = chunk * cols + col;
+    float dw = pc.u4 != 0u ? s2[o] : 0.0;
+    float db = pc.u4 != 0u ? s3[o] : 0.0;
+    for (uint r = r0; r < r1; ++r) {
+      float mean = uintBitsToFloat(s4u[2u * r]);
+      float inv = uintBitsToFloat(s4u[2u * r + 1u]);
+      float g = s1[r * cols + col];
+      float xhat = (s0[r * cols + col] - mean) * inv;
+      dw += g * xhat;
+      db += g;
+    }
+    s2[o] = dw;
+    s3[o] = db;
+    return;
+  }
+
+  // Pass 3: gw/gb (s4u/s5u as float bits) += chunk partials s2/s3 [u0 chunks,
+  // cols], folded in ascending chunk order.
+  if (op == 8u) {
+    uint col = gl_WorkGroupID.x * 256u + lid;
+    if (col >= cols) return;
+    float dw = uintBitsToFloat(s4u[col]);
+    float db = uintBitsToFloat(s5u[col]);
+    for (uint k = 0u; k < rows; ++k) {
+      dw += s2[k * cols + col];
+      db += s3[k * cols + col];
+    }
+    s4u[col] = floatBitsToUint(dw);
+    s5u[col] = floatBitsToUint(db);
+    return;
+  }
 
   if (op == 6u) {
     float sm = 0.0;
@@ -175,8 +199,6 @@ void main() {
     for (uint i = lid; i < cols; i += 256u) {
       float xhat = (s0[base + i] - mean) * inv;
       float dxhat = s1[base + i] * s2[i];
-      atomicAddU(i, s1[base + i] * xhat);
-      atomicAddU5(i, s1[base + i]);
       sdx += dxhat;
       sdxh += dxhat * xhat;
     }
@@ -187,6 +209,11 @@ void main() {
       float xhat = (s0[base + i] - mean) * inv;
       float dxhat = s1[base + i] * s2[i];
       s3[base + i] = invC * (float(cols) * dxhat - sdx - xhat * sdxh);
+    }
+    // Row stats for the gamma/beta pass (op 7), which reuses this exact xhat.
+    if (lid == 0u) {
+      s4u[2u * row] = floatBitsToUint(mean);
+      s4u[2u * row + 1u] = floatBitsToUint(inv);
     }
     return;
   }

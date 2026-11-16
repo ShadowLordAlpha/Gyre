@@ -26,16 +26,6 @@ layout(push_constant) uniform PC {
 float af(uint i) { return uintBitsToFloat(au[i]); }
 float bf(uint i) { return uintBitsToFloat(bu[i]); }
 
-void atomicAddU(uint i, float v) {
-  uint old = u[i];
-  for (;;) {
-    uint nv = floatBitsToUint(uintBitsToFloat(old) + v);
-    uint r = atomicCompSwap(u[i], old, nv);
-    if (r == old) return;
-    old = r;
-  }
-}
-
 void main() {
   uint i = gl_GlobalInvocationID.x;
   if (i >= pc.u0) return;
@@ -52,11 +42,22 @@ void main() {
     return;
   }
 
+  // Embedding backward without atomics. The host stable-sorts token positions by
+  // id: ia = positions in (id, position) order, ib = [U unique ids | U+1 segment
+  // starts into ia]. One invocation per (unique id, column) adds that id's rows
+  // in ascending token order onto the existing grad (u), the same order as the
+  // CPU loop, so the result is independent of GPU scheduling.
   if (op == 1u) {
-    int id = ia[i];
     uint d = pc.u2;
-    if (id < 0 || uint(id) >= pc.u3) return;
-    for (uint c = 0u; c < d; ++c) atomicAddU(uint(id) * d + c, bf(i * d + c));
+    uint U = pc.u3;
+    uint k = i / d;
+    uint c = i % d;
+    uint row = uint(ib[k]) * d + c;
+    int s = ib[U + k];
+    int e = ib[U + k + 1u];
+    float acc = uintBitsToFloat(u[row]);
+    for (int j = s; j < e; ++j) acc += bf(uint(ia[j]) * d + c);
+    u[row] = floatBitsToUint(acc);
     return;
   }
 

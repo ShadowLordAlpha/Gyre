@@ -60,10 +60,31 @@ errors; it never falls back to host-visible memory (that would move a discrete
 GPU's training to system RAM over PCIe). Host-visible memory is used only on a
 device with no device-local storage memory type.
 
-Vulkan runs are **not bit-reproducible**: LayerNorm gamma/beta grads and
-embedding grads accumulate with float atomics whose order follows GPU
-scheduling, so two runs with the same seed differ in the low bits and slowly
-drift apart. Use CPU with `set_deterministic(true)` when bit-exact replay matters.
+### Reproducibility
+
+Vulkan CharLM training is **bit-reproducible run to run**: the same seed,
+data, flags, binary, GPU and driver give a byte-identical `.gyre` (dropout,
+AdamW and grad clipping included). No kernel uses float atomics or any other
+reduction whose order follows GPU scheduling:
+
+- In-workgroup reductions (softmax, LN stats, CE, `sum`) use a fixed shared-memory
+  tree; GEMM sums K in tile order; `sum_dim` / batch-to-time sums loop in order.
+- LayerNorm gamma/beta grads: the row pass stores each row's mean and 1/std,
+  then one invocation per (column, 32-row chunk) sums its rows in order, and a
+  last pass adds the chunk partials into the grad in chunk order (with one chunk
+  it accumulates straight into the grad, in the CPU loop's order).
+- Embedding grads: the token ids are read back and stable-sorted by id on the
+  host (counting sort), then one invocation per (used id, column) adds that id's
+  rows in ascending token order, the same order as the CPU loop. Out-of-range ids
+  error (`emb idx`) like CPU.
+
+Limits: results are reproducible only on the same GPU model, driver version and
+`gyre` build (the shader compiler may contract or reorder float math
+differently on another driver), and they are **not** bit-equal to CPU (GEMM and
+reduction trees differ; parity is within the tolerances in
+`tests/vulkan_ops_test.cpp`). They do not depend on CPU thread count or OpenMP
+settings. `Vulkan.BackwardIsBitReproducible` repeats LN/embedding backward and a
+few CharLM train steps and requires identical bytes.
 
 Grok RoPE / MoE / GQA kernels are not implemented on Vulkan. OpenCL and CUDA are not in tree.
 
