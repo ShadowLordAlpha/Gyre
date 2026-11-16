@@ -57,3 +57,5 @@ Desktop.ini
 /data/gpt2/
 /data/smollm2-360m/
 /data/smollm2-1.7b/
+/.claude/worktrees/
+/data/wire/
