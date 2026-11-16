@@ -28,6 +28,7 @@ To add a kind, implement **either** a `Pretokenizer` **or** a `VocabModel` (some
 | --- | --- |
 | `identity` | Whole UTF-8 as one span (Gyre BPE, chars, bytes) |
 | `bytelevel` | GPT-2 regex + bytes-to-unicode (Hugging Face GPT-2) |
+| `digits_bytelevel` | HF `Sequence[Digits(individual_digits), ByteLevel]`: every `\p{N}` code point alone, GPT-2 regex on the runs between (SmolLM2 / StarCoder) |
 | `metaspace` | SentencePiece dummy prefix; space → `▁` |
 | `tiktoken_v1` | Grok-2 `word_split=V1` (GPT-4-style `PAT_STR_B` + Unicode `\p{L}`/`\p{N}`) |
 
@@ -65,9 +66,11 @@ Versioned nested document (not a flat `"tokenizer":"bpe"` string):
 | --- | --- |
 | `gyre` | Must be `"tokenizer"` |
 | `version` | Document version (`1`) |
-| `tokenizer.pretoken` | `identity` \| `bytelevel` \| `metaspace`. Omitted → `identity` |
+| `tokenizer.pretoken` | `identity` \| `bytelevel` \| `digits_bytelevel` \| `metaspace`. Omitted → `identity` |
 | `tokenizer.model` | `bpe` \| `unigram` |
 | `tokenizer.merges` | BPE only: `[left_id, right_id]` in rank order |
+| `tokenizer.merge_ids` | BPE, optional: token id each merge produces (Hugging Face vocabularies not numbered `alphabet + rank`, e.g. SmolLM2). Absent → `alphabet size + rank` |
+| `tokenizer.special` | Optional `[{"id":0,"content":"<\|endoftext\|>"}, ...]`: matched literally (leftmost, then longest) before pretokenizing |
 | `tokenizer.vocab` | Piece strings (id = index). Restricted alphabets (chars) always write this. Identity-256 BPE may omit it and rebuild 0..255 + merges |
 | `tokenizer.scores` | Unigram log scores, parallel to `vocab` |
 | `tokenizer.byte_fallback` | Unigram: if true, 1-byte fallback when Viterbi fails |
@@ -101,7 +104,8 @@ Grok-2 goldens: `"hello world"` → `21517 1749`; chat prefix with `<|separator|
 **Import** (`load_huggingface` / `tok import --hf-dir`):
 
 - `tokenizer.json` BPE / Unigram
-- GPT-2 layout `vocab.json` + `merges.txt`, or `tokenizer.json` with a `ByteLevel` pre-tokenizer → `bytelevel` + `bpe`. Vocab/merges are decoded from GPT-2's byte→unicode alphabet into raw-byte pieces; token ids must be `256 + merge rank` (GPT-2 layout) or import fails. Verified against the real `openai-community/gpt2` files (`docs/gpt2.md`).
+- GPT-2 layout `vocab.json` + `merges.txt`, or `tokenizer.json` with a `ByteLevel` pre-tokenizer → `bytelevel` + `bpe`. Vocab/merges are decoded from GPT-2's byte→unicode alphabet into raw-byte pieces. When ids are `256 + merge rank` (GPT-2 layout) the tokenizer is built exactly as before: implicit ids, and `<|endoftext|>` stays plain text. Verified against the real `openai-community/gpt2` files (`docs/gpt2.md`).
+- Any other byte-level layout (SmolLM2: 17 added tokens at ids 0..16, only 235 single bytes, merge results numbered by the vocab): explicit byte → id and per-merge result ids (`merge_ids`) read from the vocab; `added_tokens` are matched literally before pretokenizing (`lstrip`/`rstrip`/`single_word` are rejected); bytes missing from the vocab are **dropped**, as Hugging Face BPE does without an `unk_token`. A merge whose parts or result are missing from the vocab is an error. `pre_tokenizer` `Sequence` is accepted only as `[Digits(individual_digits=true), ByteLevel(use_regex=true, add_prefix_space=false)]` (→ `digits_bytelevel`); a `normalizer` is rejected. Ids match the Hugging Face `tokenizers` library on digits, contractions, spaces/newlines, non-ASCII, `\p{N}` beyond ASCII and specials (`tests/hf_bpe_test.cpp`, [smollm2.md](smollm2.md)). Export of this layout (`save_huggingface`) is not implemented and returns an error.
 
 The `bytelevel` pre-tokenizer splits raw text with the GPT-2 pattern using the generated Unicode category tables (`\p{L}`, `\p{N}`, `\s`); `save_huggingface` writes byte-level tokenizers back in the GPT-2 alphabet.
 

@@ -22,9 +22,13 @@ class TiktokenModel final : public VocabModel {
     ranks_ = std::move(ranks);
   }
   const std::unordered_map<std::string, std::int32_t>& ranks() const { return ranks_; }
+  // Ids of the special tokens (<|eos|>, ...). Their pieces sit in the PieceTable but not in ranks.
+  void set_special_ids(std::vector<std::int32_t> ids) { special_ids_ = std::move(ids); }
+  const std::vector<std::int32_t>& special_ids() const { return special_ids_; }
 
  private:
   std::unordered_map<std::string, std::int32_t> ranks_;
+  std::vector<std::int32_t> special_ids_;
   std::int64_t vocab_size_{0};
 };
 

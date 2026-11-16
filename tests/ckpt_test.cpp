@@ -3,9 +3,14 @@
 
 #include <gtest/gtest.h>
 
+#include "gyre/io/codec.hpp"
+
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <span>
+#include <string>
 #include <vector>
 
 TEST(Ckpt, RoundTrip) {
@@ -113,4 +118,228 @@ TEST(Ckpt, PeekDoesNotNeedFullRead) {
   ASSERT_TRUE(peek) << peek.error().message;
   EXPECT_EQ(peek->train_step, 99u);
   EXPECT_EQ(peek->arch, "linear");
+}
+
+// ---- Malformed-file regression tests -------------------------------------
+// Each of these used to read or write out of bounds (or silently return
+// garbage). They must now fail cleanly with an error.
+
+namespace {
+
+std::uint32_t test_crc32c(const std::byte* p, std::size_t n) {
+  std::uint32_t crc = ~0u;
+  for (std::size_t k = 0; k < n; ++k) {
+    crc ^= static_cast<std::uint8_t>(p[k]);
+    for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ (0x82F63B78u & (0u - (crc & 1u)));
+  }
+  return ~crc;
+}
+
+void put_le(std::vector<std::byte>& b, std::size_t off, std::uint64_t v, int n) {
+  if (b.size() < off + static_cast<std::size_t>(n)) b.resize(off + static_cast<std::size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    b[off + static_cast<std::size_t>(i)] = static_cast<std::byte>((v >> (8 * i)) & 0xff);
+  }
+}
+
+void seal_header(std::vector<std::byte>& b) { put_le(b, 60, test_crc32c(b.data(), 60), 4); }
+
+std::filesystem::path write_file(const char* name, const std::vector<std::byte>& b) {
+  auto path = std::filesystem::temp_directory_path() / name;
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+  return path;
+}
+
+constexpr std::uint64_t kKeep = ~0ull;
+
+/// Hand-built v2 file: header, JSON at 64, payload at align64(64 + json).
+std::vector<std::byte> make_v2(const std::string& json, const std::vector<std::byte>& payload,
+                               std::uint64_t json_off = 64, std::uint64_t json_len = kKeep,
+                               std::uint64_t payload_off = kKeep, std::uint32_t flags = 0) {
+  std::vector<std::byte> b(64);
+  std::memcpy(b.data(), "GYRE1\0\0\0", 8);
+  const std::uint64_t real_poff = (64 + json.size() + 63) & ~std::uint64_t{63};
+  b.resize(static_cast<std::size_t>(real_poff), std::byte{0});
+  std::memcpy(b.data() + 64, json.data(), json.size());
+  b.insert(b.end(), payload.begin(), payload.end());
+  put_le(b, 8, 2, 4);
+  put_le(b, 12, flags, 4);
+  put_le(b, 16, 1, 8);
+  put_le(b, 24, json_len == kKeep ? json.size() : json_len, 8);
+  put_le(b, 32, json_off, 8);
+  put_le(b, 40, payload_off == kKeep ? real_poff : payload_off, 8);
+  put_le(b, 48, payload.size(), 8);
+  put_le(b, 58, 1, 2);
+  seal_header(b);
+  return b;
+}
+
+std::string one_tensor_json(const std::string& shape, std::uint64_t offset, std::uint64_t nbytes,
+                            std::uint64_t packed, const char* codec = "identity") {
+  return std::string("{\"gyre\":\"model\",\"version\":1,\"arch\":\"t\",\"config\":{},\"tensors\":[{") +
+         "\"name\":\"w\",\"dtype\":\"f32\",\"shape\":" + shape + ",\"role\":\"weight\",\"codec\":\"" +
+         codec + "\",\"offset\":" + std::to_string(offset) + ",\"nbytes\":" + std::to_string(nbytes) +
+         ",\"packed_bytes\":" + std::to_string(packed) + "}]}";
+}
+
+std::vector<std::byte> alp_blob(const std::vector<float>& v) {
+  std::int64_t sh[] = {static_cast<std::int64_t>(v.size())};
+  auto enc = gyre::gyre_compress(gyre::GyreCodec::alp,
+                                 std::as_bytes(std::span<const float>(v.data(), v.size())),
+                                 gyre::DType::f32, sh);
+  EXPECT_TRUE(enc);
+  return enc ? *enc : std::vector<std::byte>{};
+}
+
+/// Hand-built v1 file: header, name heap "w", one 80-byte descriptor, payload, trailer.
+std::vector<std::byte> make_v1(std::uint8_t ndim, std::uint64_t trailer_off_override = kKeep,
+                               std::uint32_t flags = 0, std::uint64_t payload_off_override = kKeep) {
+  std::vector<std::byte> b(64);
+  std::memcpy(b.data(), "GYRE1\0\0\0", 8);
+  b.push_back(std::byte{'w'});
+  b.resize(128, std::byte{0});  // desc_off = align64(64 + 1)
+  std::vector<std::byte> d(80, std::byte{0});
+  put_le(d, 4, 1, 2);           // name_off 0, name_len 1
+  d[6] = std::byte{1};          // f32
+  d[7] = std::byte{ndim};
+  put_le(d, 8, 4, 8);           // dim0 = 4
+  b.insert(b.end(), d.begin(), d.end());
+  const std::uint64_t payload_off = 256;
+  b.resize(256 + 64, std::byte{0});
+  const std::uint64_t trailer_off = b.size();
+  std::vector<std::byte> tr(24, std::byte{0});
+  put_le(tr, 0, test_crc32c(b.data() + payload_off, b.size() - payload_off), 4);
+  b.insert(b.end(), tr.begin(), tr.end());  // json length 0
+  put_le(b, 8, 1, 4);
+  put_le(b, 12, flags, 4);
+  put_le(b, 16, 1, 8);
+  put_le(b, 24, 1, 8);
+  put_le(b, 32, payload_off_override == kKeep ? payload_off : payload_off_override, 8);
+  put_le(b, 40, trailer_off_override == kKeep ? trailer_off : trailer_off_override, 8);
+  put_le(b, 52, 1, 4);
+  seal_header(b);
+  return b;
+}
+
+}  // namespace
+
+TEST(CkptMalformed, AlpRejectsBadFieldsAndTruncation) {
+  std::vector<float> v(300);
+  for (std::size_t i = 0; i < v.size(); ++i) v[i] = static_cast<float>(i % 17) * 0.25f;
+  v[5] = std::numeric_limits<float>::infinity();  // force an exception record
+  auto blob = alp_blob(v);
+  ASSERT_GT(blob.size(), 40u);
+  std::int64_t sh[] = {300};
+  const auto raw = v.size() * 4;
+  ASSERT_TRUE(gyre::gyre_decompress(gyre::GyreCodec::alp, blob, gyre::DType::f32, sh, raw));
+  auto bad = [&](const std::vector<std::byte>& b) {
+    return !gyre::gyre_decompress(gyre::GyreCodec::alp, b, gyre::DType::f32, sh, raw);
+  };
+  // First chunk header starts at byte 12: e f cn(u16) nexc(u16) min(u64) bits(u8).
+  auto b = blob;
+  b[12] = std::byte{200};  // exponent past the pow10 table
+  EXPECT_TRUE(bad(b));
+  b = blob;
+  b[12] = std::byte{1};
+  b[13] = std::byte{9};  // f > e
+  EXPECT_TRUE(bad(b));
+  b = blob;
+  put_le(b, 14, 0xffff, 2);  // chunk longer than the remaining output (heap overflow before)
+  EXPECT_TRUE(bad(b));
+  b = blob;
+  put_le(b, 14, 0, 2);  // empty chunk would never advance
+  EXPECT_TRUE(bad(b));
+  b = blob;
+  b[26] = std::byte{200};  // bit width > 64
+  EXPECT_TRUE(bad(b));
+  b = blob;
+  put_le(b, 16, 0xffff, 2);  // more exceptions than the chunk holds
+  EXPECT_TRUE(bad(b));
+  for (std::size_t n = 0; n < blob.size(); ++n) {
+    std::vector<std::byte> t(blob.begin(), blob.begin() + static_cast<std::ptrdiff_t>(n));
+    EXPECT_TRUE(bad(t)) << "len " << n;
+  }
+  // Single-byte corruption may decode to other values but must never crash.
+  for (std::size_t k = 12; k < blob.size(); ++k) {
+    auto c = blob;
+    c[k] ^= std::byte{0x5a};
+    (void)gyre::gyre_decompress(gyre::GyreCodec::alp, c, gyre::DType::f32, sh, raw);
+  }
+}
+
+TEST(CkptMalformed, AlpBlobExactlyRawSizeIsDecoded) {
+  // An ALP blob that is exactly nbytes long used to be aliased as raw floats.
+  std::vector<float> v(16);
+  for (std::size_t i = 0; i < v.size(); ++i) v[i] = static_cast<float>(i) * 0.5f;
+  auto blob = alp_blob(v);
+  ASSERT_LT(blob.size(), 64u);
+  blob.resize(64, std::byte{0});
+  auto path =
+      write_file("gyre-alp-rawsize.gyre", make_v2(one_tensor_json("[16]", 0, 64, 64, "alp"), blob));
+  auto f = gyre::GyreFile::open(path);
+  ASSERT_TRUE(f) << f.error().message;
+  auto t = f->load_tensor("w", *gyre::Device::cpu());
+  ASSERT_TRUE(t) << t.error().message;
+  auto s = t->host_span<float>();
+  ASSERT_TRUE(s);
+  for (std::size_t i = 0; i < v.size(); ++i) EXPECT_EQ((*s)[i], v[i]) << i;
+}
+
+TEST(CkptMalformed, V2HeaderRangesDoNotWrap) {
+  std::vector<std::byte> payload(64, std::byte{0});
+  const auto js = one_tensor_json("[16]", 0, 64, 64);
+  ASSERT_TRUE(gyre::GyreFile::open(write_file("gyre-v2ok.gyre", make_v2(js, payload))));
+  // json_off + json_len wraps to a small number.
+  EXPECT_FALSE(gyre::GyreFile::open(write_file("gyre-v2b1.gyre", make_v2(js, payload, ~0ull - 9, 20))));
+  // Payload offset past the end of the file.
+  EXPECT_FALSE(
+      gyre::GyreFile::open(write_file("gyre-v2b2.gyre", make_v2(js, payload, 64, kKeep, 1ull << 40))));
+  // CRC range wraps (flags & 2).
+  auto b = make_v2(js, payload, 64, kKeep, kKeep, 2);
+  put_le(b, 48, ~0ull - 2, 8);
+  seal_header(b);
+  EXPECT_FALSE(gyre::GyreFile::open(write_file("gyre-v2b3.gyre", b)));
+}
+
+TEST(CkptMalformed, TensorDescriptorRangesAreChecked) {
+  std::vector<std::byte> payload(64, std::byte{0});
+  auto cpu = *gyre::Device::cpu();
+  // offset near 2^64: start + packed used to wrap past the size check.
+  auto f = gyre::GyreFile::open(
+      write_file("gyre-d-off.gyre", make_v2(one_tensor_json("[4]", ~0ull - 15, 16, 16), payload)));
+  ASSERT_TRUE(f) << f.error().message;
+  EXPECT_FALSE(f->load_tensor("w", cpu));
+  // nbytes disagrees with dtype*shape: a [1000] view over 16 bytes.
+  EXPECT_FALSE(gyre::GyreFile::open(
+      write_file("gyre-d-nb.gyre", make_v2(one_tensor_json("[1000]", 0, 16, 16), payload))));
+  // Shape product overflows int64.
+  EXPECT_FALSE(gyre::GyreFile::open(write_file(
+      "gyre-d-ovf.gyre", make_v2(one_tensor_json("[4294967296,4294967296,4]", 0, 0, 0), payload))));
+  // Rank > 8.
+  EXPECT_FALSE(gyre::GyreFile::open(write_file(
+      "gyre-d-rank.gyre", make_v2(one_tensor_json("[1,1,1,1,1,1,1,1,1]", 0, 4, 4), payload))));
+  // Identity codec with packed_bytes != nbytes.
+  EXPECT_FALSE(gyre::GyreFile::open(
+      write_file("gyre-d-pk.gyre", make_v2(one_tensor_json("[4]", 0, 16, 8), payload))));
+  // Payload slice past the end of the file.
+  auto g = gyre::GyreFile::open(
+      write_file("gyre-d-end.gyre", make_v2(one_tensor_json("[16]", 32, 64, 64), payload)));
+  ASSERT_TRUE(g) << g.error().message;
+  EXPECT_FALSE(g->load_tensor("w", cpu));
+}
+
+TEST(CkptMalformed, V1DescriptorAndTrailerChecks) {
+  auto ok = gyre::GyreFile::open(write_file("gyre-v1ok.gyre", make_v1(1)));
+  ASSERT_TRUE(ok) << ok.error().message;
+  auto t = ok->load_tensor("w", *gyre::Device::cpu());
+  ASSERT_TRUE(t) << t.error().message;
+  EXPECT_EQ(t->numel(), 4);
+  // ndim 255 used to read dims far past the 80-byte descriptor.
+  EXPECT_FALSE(gyre::GyreFile::open(write_file("gyre-v1nd.gyre", make_v1(255))));
+  EXPECT_FALSE(gyre::GyreFile::open(write_file("gyre-v1nd9.gyre", make_v1(9))));
+  // trailer_off + 24 wraps.
+  EXPECT_FALSE(gyre::GyreFile::open(write_file("gyre-v1tr.gyre", make_v1(1, ~0ull - 8))));
+  // Trailer before the payload with a payload CRC: rel used to underflow.
+  EXPECT_FALSE(gyre::GyreFile::open(write_file("gyre-v1rel.gyre", make_v1(1, kKeep, 2, 330))));
 }

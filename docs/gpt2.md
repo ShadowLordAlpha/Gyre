@@ -49,7 +49,8 @@ unicode alphabet and then failed ("unknown byte") on actual `vocab.json` / `toke
 * the pre-tokenizer splits the **raw** text with the GPT-2 pattern, Unicode-aware (`\p{L}`, `\p{N}`, `\s`);
 * Hugging Face files are decoded from the GPT-2 alphabet into raw-byte pieces on import, and written back in
   that alphabet on export (`save_huggingface`);
-* the importer requires GPT-2's id layout (merge *k* produces id `256 + k`) and refuses anything else;
+* GPT-2's id layout (merge *k* produces id `256 + k`) is detected and loaded exactly as before; other layouts
+  (SmolLM2) now load with explicit ids, see [smollm2.md](smollm2.md);
 * BPE encoding now applies the lowest-rank merge present in a span instead of walking every merge, which gives
   identical ids (tested against the old sequential algorithm) and is far faster for 50k merges.
 
@@ -75,8 +76,8 @@ possible.
 
 ## Limits
 
-* No KV cache: `lm generate` re-runs the whole prefix for every new token (hundreds of seconds for a few
-  hundred characters). Scoring (`lm eval`) is unaffected.
+* No KV cache for CharLM/GPT-2: `lm generate` re-runs the whole prefix for every new token (hundreds of seconds
+  for a few hundred characters). Scoring (`lm eval`) is unaffected. (The Llama path has one: [smollm2.md](smollm2.md).)
 * f32 compute and weights in RAM only; this path is for models up to roughly 1B parameters.
-* GPT-2 family only (small/medium/large/xl with the same tensor names). Llama/Qwen-style models (RMSNorm, RoPE,
-  GQA, SwiGLU) need a dense architecture that does not exist yet; `GrokLM` is MoE/softcap specific.
+* GPT-2 family only (small/medium/large/xl with the same tensor names). Llama-style models (RMSNorm, RoPE, GQA,
+  SwiGLU) use `LlamaLM` instead ([smollm2.md](smollm2.md)).

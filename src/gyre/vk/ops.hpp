@@ -27,6 +27,9 @@ Result<void> add_(Tensor& dst, const Tensor& src);
 Result<Tensor> gelu_backward(const Tensor& x, const Tensor& dy);
 Result<Tensor> softmax_last_backward(const Tensor& softmax, const Tensor& d_out);
 Result<Tensor> mul_scalar(const Tensor& a, float s);
+/// Scale `t` in place (same storage). Use this on Param value/grad, which
+/// several modules alias; rebinding the handle would break the aliasing.
+Result<void> mul_scalar_(Tensor& t, float s);
 Result<void> causal_alibi_(Tensor& scores, bool alibi);
 Result<Tensor> add_broadcast_time(const Tensor& tok, const Tensor& pe);
 Result<Tensor> sum_batch_to_time(const Tensor& dh);
@@ -37,6 +40,6 @@ Result<void> embedding_backward(Tensor& grad_W, const Tensor& idx, const Tensor&
 Result<void> bias_add_(Tensor& y, const Tensor& b);
 Result<LossPair> softmax_cross_entropy(const Tensor& logits, const Tensor& targets_i32);
 Result<void> adam_step(Tensor& w, const Tensor& g, Tensor& m, Tensor& v, float lr, float beta1,
-                       float beta2, float eps, float b1t, float b2t);
+                       float beta2, float eps, float b1t, float b2t, float decay = 1.f);
 
 }  // namespace gyre::vkops

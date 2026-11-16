@@ -46,7 +46,7 @@ One **document** describes a model. Two encodings:
 
 | Field | Meaning |
 | --- | --- |
-| `arch` | `char-lm`, `grok2`, `linear`, … |
+| `arch` | `char-lm`, `grok2`, `llama` ([smollm2.md](smollm2.md)), `linear`, … |
 | `config` | Architecture knobs (nested object, not mixed into the root). Optional `connectome` after `--prune`: `generation`, `prune`, `n_params`, `n_params_parent`, `dense_compact`. `d_model` / `d_ff` shrink with each generation. |
 | `train` | `step`, `rng_seed` — updated when training overwrites the same path |
 | `tokenizer` | Nested tokenizer object (same as `*.gyre.json` tokenizer files) |

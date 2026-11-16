@@ -23,6 +23,12 @@ class BpeModel final : public VocabModel {
 
   const std::vector<std::pair<std::int32_t, std::int32_t>>& merges() const { return merges_; }
   void set_vocab_size(std::int64_t n) { vocab_size_ = n; }
+  // Explicit token id produced by each merge (Hugging Face vocabularies that are not numbered
+  // 256 + rank, e.g. SmolLM2). Empty = Gyre/GPT-2 numbering (alphabet size + rank). With explicit
+  // ids, input bytes missing from the vocab are dropped (Hugging Face BPE with no unk_token)
+  // instead of failing.
+  void set_merge_ids(std::vector<std::int32_t> ids) { merge_ids_ = std::move(ids); }
+  const std::vector<std::int32_t>& merge_ids() const { return merge_ids_; }
 
   static Result<std::unique_ptr<BpeModel>> from_merges(
       std::vector<std::pair<std::int32_t, std::int32_t>> merges, std::int64_t vocab);
@@ -38,6 +44,7 @@ class BpeModel final : public VocabModel {
  private:
   std::vector<std::pair<std::int32_t, std::int32_t>> merges_;
   std::unordered_map<std::uint64_t, std::int32_t> rank_;  // (a,b) -> index of the first merge with that pair
+  std::vector<std::int32_t> merge_ids_;
   std::int64_t vocab_size_{256};
 };
 

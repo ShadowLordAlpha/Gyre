@@ -7,6 +7,7 @@
 #include <cstring>
 #include <functional>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -107,10 +108,45 @@ std::vector<std::int64_t> shape_from_json(const nlohmann::json& a) {
   return sh;
 }
 
-std::uint64_t nbytes_of(DType dt, std::span<const std::int64_t> sh) {
-  std::int64_t n = 1;
-  for (auto d : sh) n *= d;
-  return static_cast<std::uint64_t>(n) * dtype_size(dt);
+bool known_dtype(DType d) {
+  switch (d) {
+    case DType::f32:
+    case DType::f16:
+    case DType::bf16:
+    case DType::i32:
+    case DType::i8:
+    case DType::u8:
+      return true;
+  }
+  return false;
+}
+
+constexpr std::size_t kMaxRank = 8;  // Tensor stores at most 8 dims
+
+/// Byte size of a tensor from untrusted file metadata: rejects unknown dtypes,
+/// rank > 8, negative dims and any int64 / byte-count overflow.
+Result<std::uint64_t> checked_nbytes(DType dt, std::span<const std::int64_t> sh) {
+  if (!known_dtype(dt)) return std::unexpected(make_error(Errc::ckpt_corrupt, "tensor dtype"));
+  if (sh.size() > kMaxRank) return std::unexpected(make_error(Errc::ckpt_corrupt, "tensor rank"));
+  std::uint64_t n = 1;
+  for (auto d : sh) {
+    if (d < 0) return std::unexpected(make_error(Errc::ckpt_corrupt, "negative dim"));
+    const auto ud = static_cast<std::uint64_t>(d);
+    if (ud != 0 && n > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) / ud) {
+      return std::unexpected(make_error(Errc::ckpt_corrupt, "tensor size overflow"));
+    }
+    n *= ud;
+  }
+  const auto es = dtype_size(dt);
+  if (n > std::numeric_limits<std::uint64_t>::max() / es) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "tensor size overflow"));
+  }
+  return n * es;
+}
+
+/// true when [off, off + len) lies inside [0, size), with no wraparound.
+bool in_range(std::uint64_t off, std::uint64_t len, std::uint64_t size) {
+  return off <= size && len <= size - off;
 }
 
 struct NamedRef {
@@ -263,8 +299,13 @@ Result<GyreFile> open_v1(const std::filesystem::path& path, std::span<const std:
   if (file[56] != std::byte{0}) return std::unexpected(make_error(Errc::unsupported, "mix_prec"));
   auto want = crc32c(sp.subspan(0, 60));
   if (rd_u32(sp, 60) != want) return std::unexpected(make_error(Errc::ckpt_corrupt, "header crc"));
-  if (tc > 1'000'000 || heap_b > file.size()) {
+  // The name heap starts at byte 64, so it must fit in the rest of the file.
+  if (tc > 1'000'000 || heap_b > file.size() - 64) {
     return std::unexpected(make_error(Errc::ckpt_corrupt, "limits"));
+  }
+  if (payload_off > file.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "payload offset"));
+  if (!in_range(trailer_off, 24, file.size())) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "trailer"));
   }
   const auto desc_off = align64(64 + static_cast<std::size_t>(heap_b));
 
@@ -285,23 +326,27 @@ Result<GyreFile> open_v1(const std::filesystem::path& path, std::span<const std:
     std::string name(reinterpret_cast<const char*>(file.data() + 64 + name_off), name_len);
     auto dt = static_cast<DType>(static_cast<std::uint8_t>(file[o + 6]));
     auto ndim = static_cast<std::uint8_t>(file[o + 7]);
+    // The 80-byte descriptor holds dims at [8, 72): at most 8 of them.
+    if (ndim > kMaxRank) return std::unexpected(make_error(Errc::ckpt_corrupt, "desc rank"));
     std::vector<std::int64_t> sh(ndim);
-    for (int k = 0; k < ndim; ++k) sh[k] = static_cast<std::int64_t>(rd_u64(sp, o + 8 + k * 8));
+    for (std::size_t k = 0; k < ndim; ++k) sh[k] = static_cast<std::int64_t>(rd_u64(sp, o + 8 + k * 8));
     auto prel = rd_u64(sp, o + 72);
+    auto nb = checked_nbytes(dt, sh);
+    if (!nb) return std::unexpected(nb.error());
     GyreTensorDesc d;
     d.name = std::move(name);
     d.dtype = dt;
     d.shape = std::move(sh);
     d.offset = prel;
-    d.nbytes = nbytes_of(dt, d.shape);
+    d.nbytes = *nb;
     if (d.name.rfind("m:", 0) == 0) d.role = TensorRole::adam_m;
     else if (d.name.rfind("v:", 0) == 0) d.role = TensorRole::adam_v;
     else d.role = TensorRole::weight;
     gf.doc().tensors.push_back(std::move(d));
   }
 
-  if (trailer_off + 24 > file.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "trailer"));
   if (flags & 2) {
+    if (payload_off > trailer_off) return std::unexpected(make_error(Errc::ckpt_corrupt, "trailer"));
     auto pcrc = rd_u32(sp, static_cast<std::size_t>(trailer_off));
     auto rel = static_cast<std::size_t>(trailer_off - payload_off);
     auto got = crc32c(sp.subspan(static_cast<std::size_t>(payload_off), rel));
@@ -310,7 +355,7 @@ Result<GyreFile> open_v1(const std::filesystem::path& path, std::span<const std:
   gf.doc().rng_seed = rd_u64(sp, static_cast<std::size_t>(trailer_off + 4));
   gf.doc().train_step = rd_u64(sp, static_cast<std::size_t>(trailer_off + 12));
   auto jl = rd_u32(sp, static_cast<std::size_t>(trailer_off + 20));
-  if (jl > (16u << 20) || trailer_off + 24 + jl > file.size()) {
+  if (jl > (16u << 20) || !in_range(trailer_off + 24, jl, file.size())) {
     return std::unexpected(make_error(Errc::ckpt_corrupt, "json"));
   }
   std::string js(reinterpret_cast<const char*>(file.data() + trailer_off + 24), jl);
@@ -347,14 +392,16 @@ Result<GyreFile> open_v2_mapped(const std::filesystem::path& path, std::shared_p
   if (shard_count != 1) return std::unexpected(make_error(Errc::unsupported, "shard"));
   auto want = crc32c(sp.subspan(0, 60));
   if (rd_u32(sp, 60) != want) return std::unexpected(make_error(Errc::ckpt_corrupt, "header crc"));
-  if (json_off + json_len > st->size() || json_len > (64ull << 20)) {
+  const std::uint64_t fsz = st->size();
+  if (json_len > (64ull << 20) || !in_range(json_off, json_len, fsz)) {
     return std::unexpected(make_error(Errc::ckpt_corrupt, "json range"));
   }
+  if (payload_off > fsz) return std::unexpected(make_error(Errc::ckpt_corrupt, "payload offset"));
   std::string js(reinterpret_cast<const char*>(st->data() + json_off), static_cast<std::size_t>(json_len));
   auto doc = GyreDoc::from_json(js);
   if (!doc) return std::unexpected(doc.error());
   if (flags & 2) {
-    if (payload_off + payload_bytes + 4 > st->size()) {
+    if (!in_range(payload_off, payload_bytes, fsz) || fsz - payload_off - payload_bytes < 4) {
       return std::unexpected(make_error(Errc::ckpt_corrupt, "crc range"));
     }
     auto pcrc = rd_u32(sp, static_cast<std::size_t>(payload_off + payload_bytes));
@@ -458,8 +505,20 @@ Result<GyreDoc> GyreDoc::from_json(std::string_view json) {
       td.role = role_from_name(t.value("role", std::string{"weight"}));
       td.codec = gyre_codec_from_name(t.value("codec", std::string{"identity"}));
       td.offset = t.value("offset", std::uint64_t{0});
-      td.nbytes = t.value("nbytes", nbytes_of(td.dtype, td.shape));
+      // nbytes is redundant with dtype*shape; a disagreeing value would make a
+      // tensor view larger or smaller than its payload, so reject it.
+      auto want = checked_nbytes(td.dtype, td.shape);
+      if (!want) {
+        return std::unexpected(make_error(Errc::ckpt_corrupt, td.name + ": " + want.error().message));
+      }
+      td.nbytes = t.value("nbytes", *want);
+      if (td.nbytes != *want) {
+        return std::unexpected(make_error(Errc::ckpt_corrupt, td.name + ": nbytes != dtype*shape"));
+      }
       td.packed_bytes = t.value("packed_bytes", td.nbytes);
+      if (td.codec == GyreCodec::identity && td.packed_bytes != td.nbytes) {
+        return std::unexpected(make_error(Errc::ckpt_corrupt, td.name + ": identity packed_bytes"));
+      }
       d.tensors.push_back(std::move(td));
     }
   }
@@ -629,13 +688,24 @@ Result<Tensor> GyreFile::load_tensor(std::string_view name, std::shared_ptr<Devi
   }
   if (!desc) return std::unexpected(make_error(Errc::ckpt_corrupt, "missing " + std::string(name)));
   if (!storage_) return std::unexpected(make_error(Errc::io, "no storage"));
+  // Descriptors come from the file: re-derive the size and do every range
+  // check without wraparound before touching the mapping.
+  auto want = checked_nbytes(desc->dtype, desc->shape);
+  if (!want) return std::unexpected(want.error());
+  if (*want != desc->nbytes) return std::unexpected(make_error(Errc::ckpt_corrupt, "nbytes " + desc->name));
   const auto packed = desc->packed_bytes ? desc->packed_bytes : desc->nbytes;
-  auto start = static_cast<std::size_t>(payload_offset_ + desc->offset);
-  if (start + packed > storage_->size()) {
+  const std::uint64_t size = storage_->size();
+  if (!in_range(payload_offset_, desc->offset, size) ||
+      !in_range(payload_offset_ + desc->offset, packed, size)) {
     return std::unexpected(make_error(Errc::ckpt_corrupt, "payload"));
   }
+  auto start = static_cast<std::size_t>(payload_offset_ + desc->offset);
   auto slice = std::span<const std::byte>(storage_->data() + start, static_cast<std::size_t>(packed));
-  if (desc->codec == GyreCodec::identity || packed == desc->nbytes) {
+  // Key on the codec only: an ALP/ZFP blob can happen to be exactly nbytes long.
+  if (desc->codec == GyreCodec::identity) {
+    if (packed != desc->nbytes) {
+      return std::unexpected(make_error(Errc::ckpt_corrupt, "identity size " + desc->name));
+    }
     if (device && device->kind() != DeviceKind::cpu) {
       return Tensor::from_host(slice, desc->shape, desc->dtype, std::move(device));
     }
@@ -710,6 +780,9 @@ Result<GyreDoc> peek_gyre(const std::filesystem::path& path) {
     if (jl > (16u << 20)) return std::unexpected(make_error(Errc::ckpt_corrupt, "json"));
     std::string js(jl, '\0');
     in.read(js.data(), static_cast<std::streamsize>(jl));
+    if (static_cast<std::uint64_t>(in.gcount()) != jl) {
+      return std::unexpected(make_error(Errc::ckpt_corrupt, "json short"));
+    }
     auto d = GyreDoc::from_json(js);
     if (!d) return d;
     d->rng_seed = rd_u64(tsp, 4);

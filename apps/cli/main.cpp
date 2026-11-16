@@ -23,6 +23,10 @@ static void usage() {
       "  gyre-cli lm export --ckpt data/charlm.gyre --onnx data/charlm.onnx [--preset medium]\n"
       "                    [--data data/shakespeare.txt]\n"
       "  gyre-cli lm import-gpt2 --hf-dir data/gpt2 --ckpt data/gpt2.gyre\n"
+      "  gyre-cli lm import-llama --hf-dir data/smollm2-360m --ckpt data/smollm2-360m/smollm2-360m.gyre\n"
+      "      (arch llama: lm eval adds [--window 2048] [--stride 1024]; lm generate adds\n"
+      "       [--no-kv-cache] and --chars counts new tokens)\n"
+      "  gyre-cli lm logits --ckpt LLAMA.gyre --prompt \"text\" --out logits.f32   (raw f32 [T, vocab])\n"
       "  gyre-cli lm eval --ckpt data/charlm.gyre --data data/shakespeare.txt [--preset tinygpt]\n"
       "                  [--split 0.1] [--device cpu|vulkan]\n"
       "  gyre-cli tok train --data data/shakespeare.txt [--tokenizer bpe|chars|bytes|unigram]\n"
@@ -263,6 +267,7 @@ int main(int argc, char** argv) {
     std::string prompt = "To be";
     int chars = 200;
     std::filesystem::path onnx_path = "data/charlm.onnx";
+    std::filesystem::path out_path = "data/logits.f32";
     double split = -1.0;
     bool split_set = false, holdout_set = false;
     bool block_set = false, d_model_set = false, n_layer_set = false, n_head_set = false, d_ff_set = false;
@@ -290,6 +295,7 @@ int main(int argc, char** argv) {
         o.lr_decay_steps = static_cast<std::uint32_t>(std::stoul(argv[++i]));
       else if (a == "--grad-clip" && i + 1 < argc) o.grad_clip = std::stof(argv[++i]);
       else if (a == "--onnx" && i + 1 < argc) onnx_path = argv[++i];
+      else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
       else if (a == "--tokenizer" && i + 1 < argc) o.tokenizer = argv[++i];
       else if (a == "--tok" && i + 1 < argc) o.tok = argv[++i];
       else if (a == "--hf-dir" && i + 1 < argc) o.hf_dir = argv[++i];
@@ -332,6 +338,9 @@ int main(int argc, char** argv) {
       else if (a == "--shuffle-wire") o.shuffle_wire = true;
       else if (a == "--dropout" && i + 1 < argc) o.dropout = std::stof(argv[++i]);
       else if (a == "--decay" && i + 1 < argc) o.decay = std::stof(argv[++i]);
+      else if (a == "--window" && i + 1 < argc) o.eval_window = std::stoll(argv[++i]);
+      else if (a == "--stride" && i + 1 < argc) o.eval_stride = std::stoll(argv[++i]);
+      else if (a == "--no-kv-cache") o.kv_cache = false;
     }
     apply_charlm_preset(o);
     if (block_set) o.block = block_ov;
@@ -378,6 +387,22 @@ int main(int argc, char** argv) {
     }
     if (sub == "import-gpt2") {
       auto r = run_gpt2_import(o.hf_dir, o.ckpt, log);
+      if (!r) {
+        std::cerr << r.error().message << '\n';
+        return 1;
+      }
+      return 0;
+    }
+    if (sub == "logits") {
+      auto r = run_llama_logits(o, prompt, out_path, log);
+      if (!r) {
+        std::cerr << r.error().message << '\n';
+        return 1;
+      }
+      return 0;
+    }
+    if (sub == "import-llama") {
+      auto r = run_llama_import(o.hf_dir, o.ckpt, log);
       if (!r) {
         std::cerr << r.error().message << '\n';
         return 1;

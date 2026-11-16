@@ -46,6 +46,10 @@ struct CharLMOpts {
   std::filesystem::path wire;  // init from this checkpoint (parent / previous gen)
   float dropout{0.f};          // 0 = off; nanoGPT shakespeare-char uses 0.2
   float decay{0.f};            // AdamW on rank>=2 weights; 0 = off; nanoGPT uses 0.1
+  // arch "llama" checkpoints (imported Hugging Face models)
+  std::int64_t eval_window{2048};  // sliding-window eval context (tokens)
+  std::int64_t eval_stride{1024};  // new tokens scored per window after the first
+  bool kv_cache{true};             // generate with the KV cache (false = full recompute per token)
 };
 
 void apply_charlm_preset(CharLMOpts& o);
@@ -91,6 +95,17 @@ Result<EvalReport> run_charlm_eval(const CharLMOpts& opts, double split, LogFn l
 
 // Hugging Face GPT-2 directory (config.json + model.safetensors + tokenizer.json) -> CharLM `.gyre`.
 Result<void> run_gpt2_import(const std::filesystem::path& hf_dir, const std::filesystem::path& out, LogFn log);
+
+// Hugging Face Llama directory (SmolLM2 etc.: config.json + model.safetensors + tokenizer.json) ->
+// arch "llama" `.gyre` with the tokenizer frozen inside.
+Result<void> run_llama_import(const std::filesystem::path& hf_dir, const std::filesystem::path& out, LogFn log);
+// `lm eval` / `lm generate` for arch "llama" (run_charlm_eval / run_charlm_generate dispatch here).
+Result<EvalReport> run_llama_eval(const CharLMOpts& opts, double split, LogFn log);
+Result<std::string> run_llama_generate(const CharLMOpts& opts, std::string prompt, int max_new, LogFn log);
+// Debug/parity: encode `prompt`, run one full forward and write logits [T, vocab] as raw
+// little-endian f32 to `out` (token ids are logged).
+Result<void> run_llama_logits(const CharLMOpts& opts, const std::string& prompt, const std::filesystem::path& out,
+                              LogFn log);
 
 Result<void> run_tok_train(const CharLMOpts& opts, const std::filesystem::path& out, LogFn log);
 Result<void> run_tok_export_hf(const std::filesystem::path& tok, const std::filesystem::path& hf_dir,

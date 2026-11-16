@@ -5,6 +5,7 @@
 #include <ftxui/dom/elements.hpp>
 
 #include <atomic>
+#include <cstdio>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -52,16 +53,20 @@ int main() {
     screen.Post(Event::Custom);
   };
 
+  // One worker at a time, joined (never detached): job lambdas capture the
+  // locals above by reference, so the thread must finish before main returns.
+  std::thread worker;
   auto start_job = [&](auto fn) {
     if (busy.exchange(true)) {
       push("already running");
       return;
     }
-    std::thread([&, fn = std::move(fn)]() mutable {
+    if (worker.joinable()) worker.join();  // previous job already cleared busy
+    worker = std::thread([&, fn = std::move(fn)]() mutable {
       fn();
       busy = false;
       screen.Post(Event::Custom);
-    }).detach();
+    });
   };
 
   auto train_sh = [&] {
@@ -112,9 +117,10 @@ int main() {
       n = std::stoi(chars_s);
     } catch (...) {
     }
-    start_job([&, o, n] {
+    // Copy the prompt: the UI thread keeps editing `prompt` while the job runs.
+    start_job([&, o, n, p = prompt] {
       push("generate…");
-      auto r = gyre::app::run_charlm_generate(o, prompt, n, [&](std::string s) { push(std::move(s)); });
+      auto r = gyre::app::run_charlm_generate(o, p, n, [&](std::string s) { push(std::move(s)); });
       if (!r) push("error: " + r.error().message);
     });
   };
@@ -244,5 +250,11 @@ int main() {
   });
 
   screen.Loop(renderer);
+  if (worker.joinable()) {
+    // Jobs cannot be cancelled mid-step; wait so the worker never touches
+    // destroyed state (Ctrl+C still aborts the process).
+    if (busy) std::fprintf(stderr, "gyre-tui: waiting for the running job to finish...\n");
+    worker.join();
+  }
   return 0;
 }

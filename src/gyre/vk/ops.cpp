@@ -3,6 +3,7 @@
 #include "vk/runtime.hpp"
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <initializer_list>
@@ -454,6 +455,19 @@ Result<Tensor> mul_scalar(const Tensor& a, float s) {
   return out;
 }
 
+Result<void> mul_scalar_(Tensor& t, float s) {
+  auto* d = dev_of(t);
+  if (!d) return std::unexpected(make_error(Errc::unsupported, "vulkan device"));
+  if (t.dtype() != DType::f32) return std::unexpected(make_error(Errc::dtype_mismatch, "mul_scalar_ f32"));
+  vkrt::Push pc;
+  pc.u[0] = static_cast<std::uint32_t>(t.numel());
+  pc.u[1] = 11;
+  pc.f[0] = s;
+  std::array<vkrt::Bind, 7> b{};
+  b[2].t = &t;
+  return d->dispatch(vkrt::Pipe::elem, b, groups(t.numel()), 1, 1, pc);
+}
+
 Result<void> causal_alibi_(Tensor& scores, bool alibi) {
   auto* d = dev_of(scores);
   if (!d) return std::unexpected(make_error(Errc::unsupported, "vulkan device"));
@@ -637,11 +651,13 @@ Result<LossPair> softmax_cross_entropy(const Tensor& logits, const Tensor& targe
 }
 
 Result<void> adam_step(Tensor& w, const Tensor& g, Tensor& m, Tensor& v, float lr, float beta1,
-                       float beta2, float eps, float b1t, float b2t) {
+                       float beta2, float eps, float b1t, float b2t, float decay) {
   auto* d = dev_of(w);
   if (!d) return std::unexpected(make_error(Errc::unsupported, "vulkan device"));
   vkrt::Push pc;
   pc.u[0] = static_cast<std::uint32_t>(w.numel());
+  pc.u[1] = decay != 1.f ? 1u : 0u;
+  pc.u[2] = std::bit_cast<std::uint32_t>(decay);
   pc.f[0] = lr;
   pc.f[1] = beta1;
   pc.f[2] = beta2;

@@ -512,6 +512,9 @@ Result<GrokLM> GrokLM::load_weights(const std::filesystem::path& dir, std::share
       if (!f) return std::unexpected(f.error());
       t = std::move(f);
     }
+    if (!std::ranges::equal(t->shape(), m->params_[i].value.shape())) {
+      return std::unexpected(make_error(Errc::invalid_shape, "load shape mismatch: " + names[i]));
+    }
     auto p = make_param(std::move(*t));
     if (!p) return std::unexpected(p.error());
     m->params_[i] = std::move(*p);
@@ -566,11 +569,27 @@ Result<void> import_safetensors_to_gyre(const std::filesystem::path& dir, const 
         if (!f) return std::unexpected(f.error());
         t = std::move(f);
       }
+      auto& slot = m->parameters()[static_cast<std::size_t>(it->second)];
+      if (!std::ranges::equal(t->shape(), slot.value.shape())) {
+        return std::unexpected(make_error(Errc::invalid_shape, "import shape mismatch: " + info.name));
+      }
       auto p = make_param(std::move(*t));
       if (!p) return std::unexpected(p.error());
-      m->parameters()[static_cast<std::size_t>(it->second)] = std::move(*p);
+      slot = std::move(*p);
       need.erase(it);
     }
+  }
+  // Anything still in `need` would keep its random init and be saved as if it
+  // were imported. Refuse instead of writing a silently broken checkpoint.
+  if (!need.empty()) {
+    std::vector<std::string> missing;
+    for (auto& [name, idx] : need) missing.push_back(name);
+    std::ranges::sort(missing);
+    std::string msg = "import: " + std::to_string(missing.size()) + " of " + std::to_string(names.size()) +
+                      " tensors missing from " + dir.string() + " (e.g.";
+    for (std::size_t i = 0; i < missing.size() && i < 3; ++i) msg += " " + missing[i];
+    msg += ")";
+    return std::unexpected(make_error(Errc::ckpt_corrupt, msg));
   }
   return m->save_gyre(out, codec);
 }

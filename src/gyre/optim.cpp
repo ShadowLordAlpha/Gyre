@@ -32,15 +32,13 @@ Result<void> Adam::step(std::span<Param> params) {
 #if defined(GYRE_VULKAN)
   if (!params.empty() && params[0].value.device() &&
       params[0].value.device()->kind() == DeviceKind::vulkan) {
+    // Param value/grad handles are shared with the modules (CharLM::params_
+    // holds copies). Everything here must write the existing storage in place;
+    // reassigning params[i].value would detach the copy from the model.
     for (std::size_t i = 0; i < params.size(); ++i) {
       const float wd = (weight_decay > 0.f && params[i].value.rank() >= 2) ? weight_decay : 0.f;
-      if (wd > 0.f) {
-        auto scaled = vkops::mul_scalar(params[i].value, 1.f - lr * wd);
-        if (!scaled) return std::unexpected(scaled.error());
-        params[i].value = std::move(*scaled);
-      }
       auto r = vkops::adam_step(params[i].value, params[i].grad, m[i], v[i], lr, beta1, beta2, eps, b1t,
-                                b2t);
+                                b2t, 1.f - lr * wd);
       if (!r) return r;
     }
     return {};
@@ -89,9 +87,8 @@ Result<float> clip_grad_norm(std::span<Param> params, float max_norm) {
     if (n <= max_norm) return n;
     const float scale = max_norm / (n + 1e-6f);
     for (auto& p : params) {
-      auto g = vkops::mul_scalar(p.grad, scale);
-      if (!g) return std::unexpected(g.error());
-      p.grad = std::move(*g);
+      // In place: the modules' backward accumulates into this same storage.
+      if (auto g = vkops::mul_scalar_(p.grad, scale); !g) return std::unexpected(g.error());
     }
     return n;
   }

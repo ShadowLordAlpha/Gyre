@@ -36,6 +36,8 @@ add_library(gyre STATIC
   src/gyre/nn/gqa.cpp
   src/gyre/nn/moe.cpp
   src/gyre/nn/grok.cpp
+  src/gyre/nn/llama.cpp
+  src/gyre/nn/llama_import.cpp
   src/gyre/optim.cpp
   src/gyre/rl/ops.cpp
   src/gyre/rl/set_encoder.cpp
@@ -243,9 +245,13 @@ if(GYRE_BUILD_TESTS)
     tests/kernels_test.cpp
     tests/gpt2_import_test.cpp
     tests/bytelevel_test.cpp
+    tests/hf_bpe_test.cpp
+    tests/llama_test.cpp
     tests/vulkan_ops_test.cpp
+    tests/onnx_export_test.cpp
+    tests/jobs_test.cpp
   )
-  target_link_libraries(gyre-tests PRIVATE gyre gyre-infer GTest::gtest_main)
+  target_link_libraries(gyre-tests PRIVATE gyre gyre-infer gyre-app-jobs GTest::gtest_main)
   target_compile_definitions(gyre-tests PRIVATE GYRE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   if(GYRE_ENABLE_ASAN AND NOT MSVC)
     target_compile_options(gyre-tests PRIVATE -fsanitize=address)

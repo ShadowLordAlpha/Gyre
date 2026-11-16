@@ -85,6 +85,7 @@ gyre-cli lm generate --ckpt data/charlm.gyre --data data/shakespeare.txt
 gyre-cli lm eval --ckpt data/charlm.gyre --data data/shakespeare.txt [--split 0.1] [--device cpu|vulkan]
 
 gyre-cli lm import-gpt2 --hf-dir data/gpt2 --ckpt data/gpt2/gpt2.gyre   # Hugging Face GPT-2 small, see docs/gpt2.md
+gyre-cli lm import-llama --hf-dir data/smollm2-360m --ckpt data/smollm2-360m/smollm2-360m.gyre   # SmolLM2, docs/smollm2.md
 
 gyre-cli lm export --ckpt data/charlm.gyre --onnx data/charlm.onnx
 
@@ -140,6 +141,7 @@ Index: [docs/README.md](docs/README.md).
 - [docs/connectome.md](docs/connectome.md) — optional prune → smaller dense CharLM
 - [docs/wire-evals.md](docs/wire-evals.md) — local prune evals and /10 ratings
 - [docs/gpt2.md](docs/gpt2.md) — run Hugging Face GPT-2 as a CharLM checkpoint; pretrained baseline
+- [docs/smollm2.md](docs/smollm2.md) — run Hugging Face SmolLM2-360M (dense Llama) on CPU with a KV cache
 - [docs/rl.md](docs/rl.md) — game-agnostic policy/value nets, PPO, GRU, imitation, standalone CPU inference
 - [docs/interesting.md](docs/interesting.md) — research notes (fly / model connectomes)
 

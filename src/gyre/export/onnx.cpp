@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <span>
 #include <string>
@@ -130,8 +131,9 @@ Result<void> export_charlm_onnx(const CharLM& model, const std::filesystem::path
 
   std::vector<Buf> inits;
   std::vector<Buf> nodes;
-  std::vector<std::string> pool;
-  pool.reserve(4096);
+  // deque: string_views into the pool stay valid as it grows (a vector could
+  // reallocate and move short strings stored inline).
+  std::deque<std::string> pool;
   auto S = [&](std::string s) -> std::string_view {
     pool.push_back(std::move(s));
     return pool.back();
@@ -158,24 +160,50 @@ Result<void> export_charlm_onnx(const CharLM& model, const std::filesystem::path
   std::int64_t pos_dims[] = {T};
   inits.push_back(tensor_i64("pos_ids", pos_dims, pos));
 
-  std::vector<float> mask_data(static_cast<std::size_t>(T * T), 0.f);
-  for (std::int64_t i = 0; i < T; ++i)
-    for (std::int64_t j = 0; j < T; ++j)
-      if (j > i) mask_data[static_cast<std::size_t>(i * T + j)] = -1e9f;
-  std::int64_t md[] = {1, 1, T, T};
+  // Additive score bias, matching causal_alibi_ in ops.cpp: -1e9 above the
+  // diagonal and, with ALiBi recency, -slope_h * (t - j) on and below it.
+  // Without ALiBi one [1,1,T,T] mask broadcasts over heads.
+  const bool alibi = cfg.recency_alibi;
+  const std::int64_t mh = alibi ? H : 1;
+  std::vector<float> mask_data(static_cast<std::size_t>(mh * T * T), 0.f);
+  for (std::int64_t hh = 0; hh < mh; ++hh) {
+    const float slope =
+        alibi ? std::pow(2.f, -8.f * static_cast<float>(hh + 1) / static_cast<float>(H)) : 0.f;
+    float* m = mask_data.data() + hh * T * T;
+    for (std::int64_t i = 0; i < T; ++i) {
+      for (std::int64_t j = 0; j < T; ++j) {
+        if (j > i) m[i * T + j] = -1e9f;
+        else if (alibi) m[i * T + j] = -slope * static_cast<float>(i - j);
+      }
+    }
+  }
+  std::int64_t md[] = {1, mh, T, T};
   inits.push_back(tensor_f32("causal_mask", md, mask_data));
+
+  // tanh-GELU constants (ops.cpp gelu): 0.5 * x * (1 + tanh(s * (x + c * x^3))),
+  // with x clamped to [-40, 40] first.
+  std::int64_t one_d[] = {1};
+  float gc[] = {0.044715f}, gs[] = {0.7978845608028654f}, ghalf[] = {0.5f}, gone[] = {1.f};
+  inits.push_back(tensor_f32("gelu_c", one_d, gc));
+  inits.push_back(tensor_f32("gelu_s", one_d, gs));
+  inits.push_back(tensor_f32("gelu_half", one_d, ghalf));
+  inits.push_back(tensor_f32("gelu_one", one_d, gone));
+  float glo[] = {-40.f}, ghi[] = {40.f};
+  inits.push_back(tensor_f32("gelu_lo", std::span<const std::int64_t>(), glo));  // Clip wants scalars
+  inits.push_back(tensor_f32("gelu_hi", std::span<const std::int64_t>(), ghi));
 
   float scale = 1.f / std::sqrt(static_cast<float>(dk));
   float scv[] = {scale};
   std::int64_t scd[] = {1};
   inits.push_back(tensor_f32("attn_scale", scd, scv));
 
+  // Reshape targets are 1-D int64 tensors: dims {4} / {3}, not the target shape itself.
   std::int64_t qshape[] = {1, T, H, dk};
-  inits.push_back(tensor_i64("shape_bthd", std::span<const std::int64_t>(qshape, 4),
-                             std::span<const std::int64_t>(qshape, 4)));
+  std::int64_t qdims[] = {4};
+  inits.push_back(tensor_i64("shape_bthd", qdims, std::span<const std::int64_t>(qshape, 4)));
   std::int64_t oshape[] = {1, T, d};
-  inits.push_back(tensor_i64("shape_btc", std::span<const std::int64_t>(oshape, 3),
-                             std::span<const std::int64_t>(oshape, 3)));
+  std::int64_t odims[] = {3};
+  inits.push_back(tensor_i64("shape_btc", odims, std::span<const std::int64_t>(oshape, 3)));
 
   auto tokens = S("tokens");
   auto tok = S("tok");
@@ -235,11 +263,24 @@ Result<void> export_charlm_onnx(const CharLM& model, const std::filesystem::path
     auto ln2 = S("ln2_" + L);
     add_n("LayerNormalization", {h1, pname[pi + 10], pname[pi + 11]}, {ln2},
           {attr_i("axis", -1), attr_f("epsilon", 1e-5f)});
-    auto fc1m = S("fc1m_" + L), fc1 = S("fc1_" + L), gth = S("gth_" + L), ge = S("ge_" + L);
+    auto fc1m = S("fc1m_" + L), fc1 = S("fc1_" + L), ge = S("ge_" + L);
     add_n("MatMul", {ln2, pname[pi + 12]}, {fc1m}, std::vector<Buf>{});
     add_n("Add", {fc1m, pname[pi + 13]}, {fc1}, std::vector<Buf>{});
-    add_n("Tanh", {fc1}, {gth}, std::vector<Buf>{});
-    add_n("Mul", {fc1, gth}, {ge}, std::vector<Buf>{});
+    {
+      auto gx = S("gx_" + L), gx2 = S("gx2_" + L), gx3 = S("gx3_" + L), gcx3 = S("gcx3_" + L);
+      auto gin = S("gin_" + L), gu = S("gu_" + L), gth = S("gth_" + L), g1 = S("g1_" + L);
+      auto ghx = S("ghx_" + L);
+      add_n("Clip", {fc1, S("gelu_lo"), S("gelu_hi")}, {gx}, std::vector<Buf>{});
+      add_n("Mul", {gx, gx}, {gx2}, std::vector<Buf>{});
+      add_n("Mul", {gx2, gx}, {gx3}, std::vector<Buf>{});
+      add_n("Mul", {gx3, S("gelu_c")}, {gcx3}, std::vector<Buf>{});
+      add_n("Add", {gx, gcx3}, {gin}, std::vector<Buf>{});
+      add_n("Mul", {gin, S("gelu_s")}, {gu}, std::vector<Buf>{});
+      add_n("Tanh", {gu}, {gth}, std::vector<Buf>{});
+      add_n("Add", {gth, S("gelu_one")}, {g1}, std::vector<Buf>{});
+      add_n("Mul", {gx, S("gelu_half")}, {ghx}, std::vector<Buf>{});
+      add_n("Mul", {ghx, g1}, {ge}, std::vector<Buf>{});
+    }
     auto fc2m = S("fc2m_" + L), fc2 = S("fc2_" + L);
     add_n("MatMul", {ge, pname[pi + 14]}, {fc2m}, std::vector<Buf>{});
     add_n("Add", {fc2m, pname[pi + 15]}, {fc2}, std::vector<Buf>{});

@@ -97,3 +97,9 @@ Build: `vcvars64` then `cmake --build` the Ninja dir (`cmake-build-gyre` or `cma
 - `gyre-cli lm import-gpt2 --hf-dir data/gpt2 --ckpt data/gpt2/gpt2.gyre` converts `openai-community/gpt2` into a CharLM (`recency none`, tied head copied). Files live in git-ignored `data/gpt2/` like `data/grok2/`. Write-up and zero-shot Shakespeare score: `docs/gpt2.md`.
 - The `bytelevel` pretokenizer works on RAW text (real GPT-2 pattern); pieces are raw bytes; the GPT-2 byte→unicode alphabet is only for reading/writing Hugging Face files (`src/gyre/nn/bytelevel.hpp`). Don't map before splitting.
 - BPE encode is rank-based (lowest-rank pair first); keep it equal to sequential merges (`tests/bytelevel_test.cpp`). No KV cache yet, so generation from big models is very slow; scoring is fine.
+
+## Hugging Face Llama / SmolLM2
+
+- `gyre-cli lm import-llama --hf-dir data/smollm2-360m --ckpt data/smollm2-360m/smollm2-360m.gyre` -> arch `"llama"` `.gyre` (`LlamaLM`, `include/gyre/nn/llama.hpp`, CPU inference only, f32). `lm eval` / `lm generate` dispatch on arch; eval uses bos + 2048 window / 1024 stride (`--window/--stride`), generate uses the KV cache (`--no-kv-cache` for full recompute). Write-up and numbers: `docs/smollm2.md`.
+- Weights are Gyre `[in, out]`; q/k columns are permuted per head at import so interleaved `gyre::rope` equals HF `rotate_half` (`llama_rope_perm`). Don't apply rotate_half at runtime on imported weights.
+- HF tokenizers that are not GPT-2 layout load with explicit `merge_ids` + literal `special` tokens; GPT-2 layout must stay byte-identical (no specials). Only `Sequence[Digits(individual_digits), ByteLevel]` is accepted (`digits_bytelevel`); fail loudly on other Sequences.

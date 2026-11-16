@@ -7,6 +7,7 @@
 #include "gyre/optim.hpp"
 #include "gyre/train/loop.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <gtest/gtest.h>
@@ -214,6 +215,103 @@ TEST(Vulkan, ClipGradNormMatchesCpu) {
   auto back = pv.grad.to(*cpu);
   ASSERT_TRUE(back);
   expect_close(pc.grad, *back, 1e-4f);
+}
+
+// Regression: Vulkan AdamW decay and clip_grad_norm used to REPLACE the Param
+// handle (CharLM::params_ holds copies of the module tensors). The rank>=2
+// weights then froze and backward kept writing the old grad buffers. Train a
+// tiny CharLM on CPU and Vulkan from the same init with clipping and decay
+// forced on, and require the same weights, the same storages, and the same
+// logits afterwards.
+TEST(Vulkan, AdamDecayAndClipKeepModuleAliasing) {
+  std::string err;
+  auto vk = try_vk(&err);
+  if (!vk) GTEST_SKIP() << err;
+  auto vkd = *vk;
+  auto cpu = gyre::Device::cpu();
+  gyre::CharLMConfig cfg;
+  cfg.vocab = 16;
+  cfg.block_size = 8;
+  cfg.n_layer = 1;
+  cfg.n_head = 2;
+  cfg.d_model = 16;
+  cfg.d_ff = 32;
+  cfg.dropout = 0.f;
+  gyre::Rng r0(7);
+  gyre::Rng r1(7);
+  auto mc = gyre::CharLM::create(cfg, *cpu, r0);
+  auto mg = gyre::CharLM::create(cfg, vkd, r1);
+  ASSERT_TRUE(mc && mg);
+  auto oc = gyre::Adam::create(mc->parameters(), 5e-2f);
+  auto og = gyre::Adam::create(mg->parameters(), 5e-2f);
+  ASSERT_TRUE(oc && og);
+  oc->weight_decay = 0.5f;
+  og->weight_decay = 0.5f;
+
+  std::vector<const void*> before;
+  for (auto& p : mg->parameters()) {
+    before.push_back(p.value.storage().get());
+    before.push_back(p.grad.storage().get());
+  }
+
+  std::vector<std::int32_t> ids = {1, 2, 3, 4, 5, 6, 7, 8, 2, 4, 6, 8, 10, 12, 14, 15};
+  std::vector<std::int32_t> tgt = {2, 3, 4, 5, 6, 7, 8, 9, 3, 5, 7, 9, 11, 13, 15, 0};
+  std::int64_t sh[] = {2, 8};
+  auto mk = [&](const std::vector<std::int32_t>& v, std::shared_ptr<gyre::Device> d) {
+    return gyre::Tensor::from_host(std::as_bytes(std::span(v.data(), v.size())), sh,
+                                   gyre::DType::i32, std::move(d));
+  };
+  auto ic = mk(ids, *cpu), ig = mk(ids, vkd), tc = mk(tgt, *cpu), tg = mk(tgt, vkd);
+  ASSERT_TRUE(ic && ig && tc && tg);
+
+  auto step = [&](gyre::CharLM& m, gyre::Adam& opt, const gyre::Tensor& x, const gyre::Tensor& y,
+                  float* gnorm) {
+    ASSERT_TRUE(m.zero_grad());
+    gyre::Rng rng(3);
+    gyre::ForwardCtx ctx;
+    ctx.train = true;
+    ctx.rng = &rng;
+    auto logits = m.forward(x, ctx);
+    ASSERT_TRUE(logits) << logits.error().message;
+    auto loss = gyre::softmax_cross_entropy(*logits, y);
+    ASSERT_TRUE(loss) << loss.error().message;
+    ASSERT_TRUE(m.backward(loss->d_pred, ctx));
+    // A tiny max_norm forces the scaling branch on every step.
+    auto n = gyre::clip_grad_norm(m.parameters(), 1e-3f);
+    ASSERT_TRUE(n) << n.error().message;
+    *gnorm = *n;
+    ASSERT_TRUE(opt.step(m.parameters()));
+  };
+  for (int s = 0; s < 3; ++s) {
+    float nc = 0.f, ng = 0.f;
+    step(*mc, *oc, *ic, *tc, &nc);
+    step(*mg, *og, *ig, *tg, &ng);
+    ASSERT_GT(nc, 1e-3f);
+    // If the grads were not zeroed through the module, Vulkan norms grow.
+    EXPECT_NEAR(nc, ng, 1e-3f * std::max(1.f, nc)) << "step " << s;
+  }
+
+  std::size_t k = 0;
+  for (auto& p : mg->parameters()) {
+    EXPECT_EQ(before[k++], p.value.storage().get()) << "param value rebound";
+    EXPECT_EQ(before[k++], p.grad.storage().get()) << "param grad rebound";
+  }
+  auto pc = mc->parameters();
+  auto pg = mg->parameters();
+  ASSERT_EQ(pc.size(), pg.size());
+  for (std::size_t i = 0; i < pc.size(); ++i) {
+    auto back = pg[i].value.to(*cpu);
+    ASSERT_TRUE(back);
+    expect_close(pc[i].value, *back, 1e-4f);
+  }
+  gyre::ForwardCtx cctx;
+  cctx.train = false;
+  gyre::ForwardCtx gctx;
+  gctx.train = false;
+  auto yc = mc->forward(*ic, cctx);
+  auto yg = mg->forward(*ig, gctx);
+  ASSERT_TRUE(yc && yg);
+  expect_close(*yc, *yg->to(*cpu), 1e-3f);
 }
 
 TEST(Vulkan, CharLMHiddenEvalIsFinite) {

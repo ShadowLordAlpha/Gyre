@@ -24,6 +24,9 @@ layout(push_constant) uniform PC {
 void main() {
   uint i = gl_GlobalInvocationID.x;
   if (i >= pc.u0) return;
+  // Decoupled weight decay (AdamW), applied in place before the Adam update.
+  // u1 != 0 enables it; the factor (1 - lr * wd) is passed as float bits in u2.
+  if (pc.u1 != 0u) w[i] *= uintBitsToFloat(pc.u2);
   float gi = g[i];
   uint gbits = floatBitsToUint(gi) & 0x7fffffffu;
   if (gbits >= 0x7f800000u) return;

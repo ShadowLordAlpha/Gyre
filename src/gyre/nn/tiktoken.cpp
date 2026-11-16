@@ -193,30 +193,33 @@ std::size_t match_pat_v1(std::string_view s, std::size_t i,
     }
   }
 
-  // \s*[\r\n]+
+  // \s*[\r\n]+ : the greedy \s* backs off to the LAST newline of the whitespace run, so the match
+  // ends right after it ("\n  \n x" -> "\n  \n", " x").
   {
-    std::size_t j = i;
+    std::size_t j = i, after_nl = i;
     while (j < s.size()) {
       std::uint32_t c{};
       std::size_t n2{};
       if (!next_cp(s, j, c, n2) || !is_S(c)) break;
-      if (c == '\r' || c == '\n') break;
       j += n2;
+      if (c == '\r' || c == '\n') after_nl = j;
     }
-    std::size_t k = j;
-    while (k < s.size() && (s[k] == '\r' || s[k] == '\n')) ++k;
-    if (k > j) return k;
+    if (after_nl > i) return after_nl;
   }
 
-  // \s+(?!\S)  then \s+
+  // \s+(?!\S) then \s+ : a run followed by a non-space gives its last code point to the next piece
+  // ("   foo" -> "  ", " foo"); a single space, or a run that ends the text (or a segment cut by a
+  // special token), is taken whole.
   if (is_S(cp)) {
-    std::size_t j = i;
+    std::size_t j = i, last = i;
     while (j < s.size()) {
       std::uint32_t c{};
       std::size_t n2{};
       if (!next_cp(s, j, c, n2) || !is_S(c)) break;
+      last = j;
       j += n2;
     }
+    if (j < s.size() && last > i && special_len_at(s, j, specials) == 0) return last;
     if (j > i) return j;
   }
 
@@ -327,10 +330,53 @@ Result<void> TiktokenModel::encode_span(std::string_view span, const PieceTable&
   return {};
 }
 
+// Tokenizer::to_json also writes the full vocab array (pieces by id). The ranks are exactly the vocab
+// ids of the non-special pieces, so "ranks":"vocab" plus the special ids is enough to rebuild the
+// model; tiktoken_from_doc is the reader.
 std::string TiktokenModel::to_json() const {
   nlohmann::json j;
-  j["ranks"] = nullptr;
+  j["ranks"] = "vocab";
+  j["special_ids"] = special_ids_;
+  j["vocab_size"] = vocab_size_;
   return j.dump();
+}
+
+Result<std::unique_ptr<Tokenizer>> tiktoken_from_doc(const nlohmann::json& obj) {
+  if (!obj.contains("ranks") || !obj["ranks"].is_string() || obj["ranks"] != "vocab" || !obj.contains("vocab") ||
+      !obj["vocab"].is_array())
+    return std::unexpected(make_error(Errc::ckpt_corrupt,
+                                      "tiktoken tokenizer document has no ranks (written by an older Gyre); "
+                                      "re-import it from tokenizer.tok.json"));
+  PieceTable table;
+  std::vector<std::int32_t> special_ids;
+  try {
+    for (auto& x : obj["vocab"]) table.pieces.push_back(json_text_to_bytes(x.get<std::string>()));
+    if (obj.contains("special_ids")) special_ids = obj["special_ids"].get<std::vector<std::int32_t>>();
+  } catch (const nlohmann::json::exception& e) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, std::string("tiktoken tokenizer: ") + e.what()));
+  }
+  std::vector<bool> is_special(table.pieces.size(), false);
+  std::vector<std::string> specials;
+  for (auto id : special_ids) {
+    if (id < 0 || static_cast<std::size_t>(id) >= table.pieces.size())
+      return std::unexpected(make_error(Errc::ckpt_corrupt, "tiktoken tokenizer: special id out of range"));
+    is_special[static_cast<std::size_t>(id)] = true;
+    specials.push_back(table.pieces[static_cast<std::size_t>(id)]);
+  }
+  std::unordered_map<std::string, std::int32_t> ranks;
+  ranks.reserve(table.pieces.size());
+  for (std::size_t id = 0; id < table.pieces.size(); ++id) {
+    if (is_special[id] || table.pieces[id].empty()) continue;  // reserved slots have no bytes
+    ranks.emplace(table.pieces[id], static_cast<std::int32_t>(id));
+  }
+  auto model = std::make_unique<TiktokenModel>();
+  std::int64_t vocab = 0;
+  if (obj.contains("vocab_size") && obj["vocab_size"].is_number_integer()) vocab = obj["vocab_size"].get<std::int64_t>();
+  model->set_vocab_size(vocab > 0 ? vocab : static_cast<std::int64_t>(table.pieces.size()));
+  model->set_ranks(std::move(ranks));
+  model->set_special_ids(std::move(special_ids));
+  auto pretok = make_tiktoken_v1_pretok(std::move(specials));
+  return std::make_unique<Tokenizer>(std::move(pretok), std::move(model), std::move(table));
 }
 
 Result<void> TiktokenModel::write_huggingface(const std::filesystem::path&, const Pretokenizer&,
@@ -354,6 +400,7 @@ Result<std::unique_ptr<Tokenizer>> load_tiktoken_json(std::string_view json) {
   if (vocab > 0) table.pieces.assign(static_cast<std::size_t>(vocab), {});
   std::unordered_map<std::string, std::int32_t> ranks;
   std::vector<std::string> specials;
+  std::vector<std::int32_t> special_ids;
 
   auto parse_token_list = [&](const nlohmann::json& arr, bool special) -> Result<void> {
     if (!arr.is_array()) return std::unexpected(make_error(Errc::ckpt_corrupt, "token list"));
@@ -374,8 +421,12 @@ Result<std::unique_ptr<Tokenizer>> load_tiktoken_json(std::string_view json) {
         table.pieces.resize(static_cast<std::size_t>(id) + 1);
       }
       table.pieces[static_cast<std::size_t>(id)] = bytes;
-      if (special) specials.push_back(bytes);
-      else ranks.emplace(bytes, id);
+      if (special) {
+        specials.push_back(bytes);
+        special_ids.push_back(id);
+      } else {
+        ranks.emplace(bytes, id);
+      }
     }
     return {};
   };
@@ -389,6 +440,7 @@ Result<std::unique_ptr<Tokenizer>> load_tiktoken_json(std::string_view json) {
   auto model = std::make_unique<TiktokenModel>();
   model->set_vocab_size(vocab);
   model->set_ranks(std::move(ranks));
+  model->set_special_ids(std::move(special_ids));
   auto pretok = make_tiktoken_v1_pretok(std::move(specials));
   return std::make_unique<Tokenizer>(std::move(pretok), std::move(model), std::move(table));
 }

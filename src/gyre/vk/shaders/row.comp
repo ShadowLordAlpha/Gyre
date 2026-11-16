@@ -26,6 +26,9 @@ layout(push_constant) uniform PC {
 
 shared float red[256];
 
+// Every invocation reads red[0] into a local, then a barrier runs before
+// returning. Without it a fast thread could start the next reduce_* call and
+// overwrite red[0] while a slower one has not read the previous result yet.
 float reduce_max(float v) {
   red[gl_LocalInvocationID.x] = v;
   barrier();
@@ -34,7 +37,9 @@ float reduce_max(float v) {
       red[gl_LocalInvocationID.x] = max(red[gl_LocalInvocationID.x], red[gl_LocalInvocationID.x + s]);
     barrier();
   }
-  return red[0];
+  float r = red[0];
+  barrier();
+  return r;
 }
 
 float reduce_sum(float v) {
@@ -44,7 +49,9 @@ float reduce_sum(float v) {
     if (gl_LocalInvocationID.x < s) red[gl_LocalInvocationID.x] += red[gl_LocalInvocationID.x + s];
     barrier();
   }
-  return red[0];
+  float r = red[0];
+  barrier();
+  return r;
 }
 
 float qnan() { return uintBitsToFloat(0x7fc00000u); }

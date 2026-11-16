@@ -103,9 +103,12 @@ void pack_bits(std::vector<std::byte>& o, std::span<const std::uint64_t> v, int 
 Result<void> unpack_bits(std::span<const std::byte> s, std::size_t& i, std::vector<std::uint64_t>& v,
                          int nvals, int bits) {
   v.assign(static_cast<std::size_t>(nvals), 0);
-  if (bits <= 0 || nvals <= 0) return {};
+  if (bits > 64 || bits < 0) return std::unexpected(make_error(Errc::ckpt_corrupt, "alp bit width"));
+  if (bits == 0 || nvals <= 0) return {};
   const auto nbytes = (static_cast<std::size_t>(nvals) * static_cast<std::size_t>(bits) + 7) / 8;
-  if (i + nbytes > s.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "alp bitstream"));
+  if (i > s.size() || nbytes > s.size() - i) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "alp bitstream"));
+  }
   for (int k = 0; k < nvals; ++k) {
     std::uint64_t x = 0;
     const auto bitpos = static_cast<std::size_t>(k) * static_cast<std::size_t>(bits);
@@ -243,30 +246,41 @@ Result<std::vector<std::byte>> alp_decompress_f32(std::span<const std::byte> pac
   (void)vec;
   std::vector<float> out(nfloat);
   std::size_t off = 0;
+  // Every field below comes from the file: check it before it indexes anything.
+  constexpr std::size_t kChunkHdr = 1 + 1 + 2 + 2 + 8 + 1;  // e f cn nexc min bits
+  const auto corrupt = [](const char* what) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, what));
+  };
   while (off < nfloat) {
-    if (i + 6 > packed.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "alp chunk"));
+    if (packed.size() - i < kChunkHdr) return corrupt("alp chunk");
     int e = rd_u8(packed, i);
     int f = rd_u8(packed, i);
     int cn = rd_u16(packed, i);
     int nexc = rd_u16(packed, i);
-    auto mn = static_cast<std::int64_t>(rd_u64(packed, i));
-    if (i >= packed.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "alp bits"));
+    auto mn = rd_u64(packed, i);
     int bits = rd_u8(packed, i);
+    if (e > kAlpMaxE || f > e) return corrupt("alp exponent");
+    if (cn <= 0 || static_cast<std::size_t>(cn) > nfloat - off) return corrupt("alp chunk length");
+    if (nexc > cn) return corrupt("alp exceptions");
     std::vector<std::uint64_t> rel;
     auto up = unpack_bits(packed, i, rel, cn, bits);
     if (!up) return std::unexpected(up.error());
     const double inv = pow10_tbl[f] / pow10_tbl[e];
     for (int k = 0; k < cn; ++k) {
-      auto iv = mn + static_cast<std::int64_t>(rel[static_cast<std::size_t>(k)]);
+      // Unsigned add: wraps the same way the encoder's (enc - min) did, with no signed overflow UB.
+      auto iv = static_cast<std::int64_t>(mn + rel[static_cast<std::size_t>(k)]);
       out[off + static_cast<std::size_t>(k)] = static_cast<float>(static_cast<double>(iv) * inv);
     }
+    if ((packed.size() - i) / 6 < static_cast<std::size_t>(nexc)) return corrupt("alp exceptions");
     for (int k = 0; k < nexc; ++k) {
       auto pos = rd_u16(packed, i);
       auto val = rd_f32(packed, i);
-      if (pos < static_cast<std::uint16_t>(cn)) out[off + pos] = val;
+      if (pos >= static_cast<std::uint16_t>(cn)) return corrupt("alp exception position");
+      out[off + pos] = val;
     }
     off += static_cast<std::size_t>(cn);
   }
+  if (nfloat > std::numeric_limits<std::size_t>::max() / 4) return corrupt("alp size");
   std::vector<std::byte> raw(nfloat * 4);
   std::memcpy(raw.data(), out.data(), raw.size());
   return raw;
@@ -377,12 +391,14 @@ Result<std::vector<std::byte>> gyre_compress(GyreCodec codec, std::span<const st
 
 Result<std::vector<std::byte>> gyre_decompress(GyreCodec codec, std::span<const std::byte> packed, DType dt,
                                               std::span<const std::int64_t> shape, std::size_t raw_bytes) {
-  (void)dt;
-  if (codec == GyreCodec::identity || packed.size() == raw_bytes) {
-    if (packed.size() != raw_bytes && codec == GyreCodec::identity) {
-      return std::unexpected(make_error(Errc::invalid_shape, "identity size"));
-    }
-    if (codec == GyreCodec::identity) return std::vector<std::byte>(packed.begin(), packed.end());
+  // Dispatch on the codec only. A compressed blob may be exactly raw_bytes long
+  // (e.g. incompressible data), which must still be decoded.
+  if (codec == GyreCodec::identity) {
+    if (packed.size() != raw_bytes) return std::unexpected(make_error(Errc::invalid_shape, "identity size"));
+    return std::vector<std::byte>(packed.begin(), packed.end());
+  }
+  if (dt != DType::f32 || raw_bytes % 4 != 0) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "compressed tensor must be f32"));
   }
   if (codec == GyreCodec::alp) return alp_decompress_f32(packed, raw_bytes / 4);
   if (codec == GyreCodec::zfp) {

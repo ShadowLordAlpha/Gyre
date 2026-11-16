@@ -71,8 +71,10 @@ Result<void> BpeModel::encode_span(std::string_view span, const PieceTable& piec
   } else if (!pieces.byte_to_id.empty()) {
     for (unsigned char c : span) {
       auto it = pieces.byte_to_id.find(c);
-      if (it == pieces.byte_to_id.end())
+      if (it == pieces.byte_to_id.end()) {
+        if (!merge_ids_.empty()) continue;  // Hugging Face BPE without unk_token skips it
         return std::unexpected(make_error(Errc::unsupported, "unknown byte"));
+      }
       seq.push_back(it->second);
     }
   } else {
@@ -96,7 +98,7 @@ Result<void> BpeModel::encode_span(std::string_view span, const PieceTable& piec
     }
     if (best < 0) break;
     const auto [a, b] = merges_[static_cast<std::size_t>(best)];
-    apply_merge(seq, a, b, nid + best);
+    apply_merge(seq, a, b, merge_ids_.empty() ? nid + best : merge_ids_[static_cast<std::size_t>(best)]);
   }
   out.insert(out.end(), seq.begin(), seq.end());
   return {};
@@ -106,11 +108,15 @@ std::string BpeModel::to_json() const {
   nlohmann::json j;
   j["merges"] = nlohmann::json::array();
   for (auto [a, b] : merges_) j["merges"].push_back({a, b});
+  if (!merge_ids_.empty()) j["merge_ids"] = merge_ids_;
   return j.dump();
 }
 
 Result<void> BpeModel::write_huggingface(const std::filesystem::path& dir, const Pretokenizer& pretok,
                                          const PieceTable& pieces) const {
+  if (!merge_ids_.empty())
+    return std::unexpected(make_error(Errc::unsupported,
+                                      "Hugging Face export of an explicit-id BPE (e.g. SmolLM2) is not implemented"));
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   auto vocab_path = dir / "vocab.json";
@@ -154,11 +160,15 @@ Result<void> BpeModel::write_huggingface(const std::filesystem::path& dir, const
   model["vocab"] = vocab;
   model["merges"] = nlohmann::json::array();
   for (auto [a, b] : merges_) {
-    model["merges"].push_back(byte_level
-                                  ? bytelevel::to_mapped(pieces.pieces[static_cast<std::size_t>(a)]) + " " +
-                                        bytelevel::to_mapped(pieces.pieces[static_cast<std::size_t>(b)])
-                                  : bytes_to_json_text(pieces.pieces[static_cast<std::size_t>(a)] + " " +
-                                                       pieces.pieces[static_cast<std::size_t>(b)]));
+    if (a < 0 || b < 0 || static_cast<std::size_t>(a) >= pieces.pieces.size() ||
+        static_cast<std::size_t>(b) >= pieces.pieces.size())
+      return std::unexpected(make_error(Errc::invalid_shape, "BPE export: merge id outside the vocab"));
+    const auto& pa = pieces.pieces[static_cast<std::size_t>(a)];
+    const auto& pb = pieces.pieces[static_cast<std::size_t>(b)];
+    // Non-byte-level pieces may contain spaces ("o w"), so "a b" strings would be ambiguous: use the
+    // [a, b] pair form (tokenizers >= 0.20 reads it; load_huggingface reads both).
+    if (byte_level) model["merges"].push_back(bytelevel::to_mapped(pa) + " " + bytelevel::to_mapped(pb));
+    else model["merges"].push_back(nlohmann::json::array({bytes_to_json_text(pa), bytes_to_json_text(pb)}));
   }
   tok["model"] = std::move(model);
   t << tok.dump();

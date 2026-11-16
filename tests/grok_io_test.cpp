@@ -47,6 +47,34 @@ TEST(GrokIO, SaveLoadGenerateMatches) {
   EXPECT_EQ(*a, *b);
 }
 
+// Regression: import used to write a .gyre full of random init weights when
+// tensors (or whole shards) were missing from the directory.
+TEST(GrokIO, ImportSafetensorsRequiresEveryTensor) {
+  auto d = gyre::Device::cpu();
+  gyre::Rng rng(4);
+  auto m = gyre::GrokLM::create(gyre::GrokConfig::mini(), *d, rng);
+  ASSERT_TRUE(m);
+  auto dir = std::filesystem::temp_directory_path() / "gyre_grok_import";
+  std::filesystem::remove_all(dir);
+  ASSERT_TRUE(m->save_weights(dir));
+  auto out = dir / "imported.gyre";
+  auto ok = gyre::import_safetensors_to_gyre(dir, out, *d);
+  ASSERT_TRUE(ok) << ok.error().message;
+  auto back = gyre::GrokLM::load_gyre(out, *d);
+  ASSERT_TRUE(back) << back.error().message;
+  auto ga = m->generate({1, 2}, 4, *d, nullptr, 0.f);
+  auto gb = back->generate({1, 2}, 4, *d, nullptr, 0.f);
+  ASSERT_TRUE(ga && gb);
+  EXPECT_EQ(*ga, *gb);
+
+  // Same config, no shard: every tensor is missing.
+  std::filesystem::remove(dir / "model.safetensors");
+  std::filesystem::remove(out);
+  auto bad = gyre::import_safetensors_to_gyre(dir, out, *d);
+  EXPECT_FALSE(bad);
+  EXPECT_FALSE(std::filesystem::exists(out));
+}
+
 TEST(GrokIO, ShakespeareCharsPrompt) {
   auto d = gyre::Device::cpu();
   gyre::Rng rng(4);

@@ -57,6 +57,8 @@ class Tokenizer {
   Tokenizer(std::unique_ptr<Pretokenizer> pretok, std::unique_ptr<VocabModel> model,
             PieceTable pieces);
 
+  // Special (added) tokens are matched literally first (leftmost, then longest); the text between
+  // them goes through pretok + model. With no specials this is exactly pretok + model.
   Result<std::vector<std::int32_t>> encode(
       std::string_view text, std::function<void(int, int)> progress = {}) const;
   std::string decode(std::span<const std::int32_t> ids) const;
@@ -67,6 +69,10 @@ class Tokenizer {
   VocabModel& model() { return *model_; }
   const VocabModel& model() const { return *model_; }
   const Pretokenizer& pretok() const { return *pretok_; }
+  // Literal tokens (content, id) such as <|endoftext|>. Only Hugging Face files with an explicit-id
+  // vocab set these; the legacy GPT-2 layout keeps treating "<|endoftext|>" as plain text.
+  void set_specials(std::vector<std::pair<std::string, std::int32_t>> s) { specials_ = std::move(s); }
+  const std::vector<std::pair<std::string, std::int32_t>>& specials() const { return specials_; }
 
   // Nested Gyre tokenizer document (`*.gyre.json`).
   std::string to_json() const;
@@ -90,10 +96,16 @@ class Tokenizer {
   std::unique_ptr<Pretokenizer> pretok_;
   std::unique_ptr<VocabModel> model_;
   PieceTable pieces_;
+  std::vector<std::pair<std::string, std::int32_t>> specials_;
+
+  Result<void> encode_plain(std::string_view text, std::vector<std::int32_t>& out,
+                            std::function<void(int, int)>* progress) const;
 };
 
 std::unique_ptr<Pretokenizer> make_identity_pretok();
 std::unique_ptr<Pretokenizer> make_gpt2_pretok();
+// Hugging Face Sequence[Digits(individual_digits), ByteLevel(use_regex)] (SmolLM2 / StarCoder).
+std::unique_ptr<Pretokenizer> make_digits_bytelevel_pretok();
 std::unique_ptr<Pretokenizer> make_metaspace_pretok(bool dummy_prefix = true);
 
 Result<std::unique_ptr<Pretokenizer>> pretok_from_name(std::string_view name);

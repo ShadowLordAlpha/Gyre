@@ -8,10 +8,14 @@
 #include "gyre/io/safetensors.hpp"
 #include "gyre/io/wpack.hpp"
 #include "gyre/nn/gpt2_import.hpp"
+#include "gyre/nn/llama.hpp"
+#include "gyre/nn/llama_import.hpp"
 #include "gyre/nn/tokenize.hpp"
 #include "gyre/train/connectome.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -102,9 +106,16 @@ Result<void> run_onemax(const GaOpts& opts, LogFn log) {
   return {};
 }
 
+// `holdout` and model_cfg.dropout are the values training actually used (a
+// resumed/wired run inherits them from the parent and clamps bad input), not
+// the raw CLI options. eval reads them back, so they must be the effective ones.
+// Training passes its effective holdout; callers that never split (imports)
+// may omit it and get o.holdout.
 static GyreDoc make_charlm_doc(const CharLMOpts& o, const CharLMConfig& model_cfg, const Tokenizer& tok,
                                std::uint32_t generation, std::uint64_t n_params,
-                               std::uint64_t n_params_parent) {
+                               std::uint64_t n_params_parent,
+                               std::optional<double> effective_holdout = std::nullopt) {
+  const double holdout = effective_holdout.value_or(o.holdout);
   nlohmann::json cfg;
   cfg["preset"] = o.preset;
   cfg["n_layer"] = model_cfg.n_layer;
@@ -113,9 +124,9 @@ static GyreDoc make_charlm_doc(const CharLMOpts& o, const CharLMConfig& model_cf
   cfg["d_ff"] = model_cfg.d_ff;
   cfg["block_size"] = model_cfg.block_size;
   cfg["vocab_size"] = model_cfg.vocab;
-  cfg["holdout"] = o.holdout;
+  cfg["holdout"] = holdout;
   cfg["recency"] = model_cfg.recency_alibi ? "alibi" : "none";
-  cfg["dropout"] = o.dropout;
+  cfg["dropout"] = model_cfg.dropout;
   cfg["weight_decay"] = o.decay;
   if (generation > 0 || o.prune > 0.f) {
     cfg["connectome"] = {{"generation", generation},
@@ -176,6 +187,206 @@ Result<void> run_gpt2_import(const std::filesystem::path& hf_dir, const std::fil
   auto doc = make_charlm_doc(o, model->config(), **tok, 0, n, 0);
   if (log) log("converted " + std::to_string(n) + " parameters");
   return save_charlm_ckpt(*model, doc, 0, nullptr, out, log);
+}
+
+Result<void> run_llama_import(const std::filesystem::path& hf_dir, const std::filesystem::path& out, LogFn log) {
+  if (log) log("loading Llama from " + hf_dir.string() + " …");
+  auto tok = Tokenizer::load_huggingface(hf_dir);
+  if (!tok) return std::unexpected(tok.error());
+  auto model = import_llama_hf(hf_dir);
+  if (!model) return std::unexpected(model.error());
+  const auto& c = model->config();
+  if ((*tok)->vocab_size() != c.vocab) {
+    return std::unexpected(make_error(Errc::invalid_shape, "tokenizer vocab " + std::to_string((*tok)->vocab_size()) +
+                                                               " != model vocab " + std::to_string(c.vocab)));
+  }
+  std::string tok_json;
+  if (auto tj = parse_json((*tok)->to_json()); tj && tj->contains("tokenizer")) tok_json = (*tj)["tokenizer"].dump();
+  nlohmann::json extra;
+  extra["holdout"] = 0.1;  // default val slice for `lm eval`
+  extra["source"] = "huggingface:" + hf_dir.filename().string();
+  if (log)
+    log("converted " + std::to_string(model->n_params()) + " parameters  L=" + std::to_string(c.n_layer) +
+        " d=" + std::to_string(c.d_model) + " heads=" + std::to_string(c.n_head) + "/" + std::to_string(c.n_kv_head) +
+        " d_ff=" + std::to_string(c.d_ff) + " vocab=" + std::to_string(c.vocab) + " tok=" + (*tok)->pretok_name());
+  auto s = model->save_gyre(out, tok_json, extra.dump());
+  if (!s) return s;
+  if (log) log("saved " + out.string());
+  return {};
+}
+
+namespace {
+
+Result<std::pair<LlamaLM, std::unique_ptr<Tokenizer>>> open_llama(const std::filesystem::path& ckpt, LogFn log) {
+  if (log) log("loading " + ckpt.string() + " …");
+  auto doc = peek_gyre(ckpt);
+  if (!doc) return std::unexpected(doc.error());
+  auto tok = Tokenizer::from_json(doc->to_json());
+  if (!tok) return std::unexpected(tok.error());
+  auto m = LlamaLM::load_gyre(ckpt);
+  if (!m) return std::unexpected(m.error());
+  const auto& c = m->config();
+  if (log)
+    log("llama params " + std::to_string(m->n_params()) + " L=" + std::to_string(c.n_layer) + " d=" +
+        std::to_string(c.d_model) + " heads=" + std::to_string(c.n_head) + "/" + std::to_string(c.n_kv_head) +
+        " vocab " + std::to_string(c.vocab));
+  return std::pair{std::move(*m), std::move(*tok)};
+}
+
+}  // namespace
+
+Result<EvalReport> run_llama_eval(const CharLMOpts& opts, double split, LogFn log) {
+  auto peek = peek_gyre(opts.ckpt);
+  if (!peek) return std::unexpected(peek.error());
+  if (split <= 0.0 || split >= 1.0) {
+    split = peek->holdout();
+    if (split <= 0.0 || split >= 1.0) split = 0.1;
+  }
+  auto mt = open_llama(opts.ckpt, log);
+  if (!mt) return std::unexpected(mt.error());
+  auto& [model, tok] = *mt;
+  const auto& c = model.config();
+  auto text = load_text(opts.data);
+  if (text.size() < 64) return std::unexpected(make_error(Errc::io, "data too short to eval"));
+  const auto split_at = static_cast<std::size_t>((1.0 - split) * static_cast<double>(text.size()));
+  const std::string val = text.substr(split_at);
+  auto enc = tok->encode(val);
+  if (!enc) return std::unexpected(enc.error());
+  // Sequence = [bos] + val tokens, so every val token (hence every val char) is predicted once.
+  std::vector<std::int32_t> seq;
+  if (c.bos_id >= 0) seq.push_back(c.bos_id);
+  seq.insert(seq.end(), enc->begin(), enc->end());
+  const std::int64_t N = static_cast<std::int64_t>(seq.size());
+  const std::int64_t W = std::min<std::int64_t>(opts.eval_window, c.max_seq);
+  const std::int64_t S = std::clamp<std::int64_t>(opts.eval_stride, 1, W - 1);
+  if (W < 2) return std::unexpected(make_error(Errc::invalid_shape, "eval window must be >= 2"));
+  if (log)
+    log("eval split=" + std::to_string(split) + " val_chars=" + std::to_string(val.size()) + " tokens=" +
+        std::to_string(enc->size()) + " window=" + std::to_string(W) + " stride=" + std::to_string(S) +
+        (c.bos_id >= 0 ? " (bos-prefixed)" : ""));
+  auto cache = model.make_cache(W);
+  if (!cache) return std::unexpected(cache.error());
+  const std::int64_t V = c.vocab;
+  double nll = 0;
+  std::uint64_t n_pred = 0, n_win = 0;
+  std::int64_t first_target = 1;  // seq[0] (bos) is context only
+  const auto t0 = std::chrono::steady_clock::now();
+  for (std::int64_t begin = 0;; begin += S) {
+    const std::int64_t end = std::min(begin + W, N);
+    if (first_target >= end) break;
+    cache->clear();
+    auto h = model.forward_hidden(*cache, std::span<const std::int32_t>(seq.data() + begin, static_cast<std::size_t>(end - begin)));
+    if (!h) return std::unexpected(h.error());
+    // targets j in [first_target, end) are predicted by window row j - 1 - begin
+    constexpr std::int64_t kChunk = 256;
+    for (std::int64_t j0 = first_target; j0 < end; j0 += kChunk) {
+      const std::int64_t n = std::min(kChunk, end - j0);
+      auto lg = model.logits_from_hidden(*h, j0 - 1 - begin, n);
+      if (!lg) return std::unexpected(lg.error());
+      for (std::int64_t r = 0; r < n; ++r) {
+        const float* row = lg->data() + r * V;
+        float mx = row[0];
+        for (std::int64_t v = 1; v < V; ++v) mx = std::max(mx, row[v]);
+        double z = 0;
+        for (std::int64_t v = 0; v < V; ++v) z += std::exp(static_cast<double>(row[v] - mx));
+        const auto y = seq[static_cast<std::size_t>(j0 + r)];
+        nll += std::log(z) - static_cast<double>(row[y] - mx);
+      }
+      n_pred += static_cast<std::uint64_t>(n);
+    }
+    first_target = end;
+    ++n_win;
+    if (log) {
+      const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      log(progress_bar("eval", static_cast<std::uint64_t>(end), static_cast<std::uint64_t>(N),
+                       "~nats/char=" + std::to_string(nll * static_cast<double>(N - 1) /
+                                                      (static_cast<double>(val.size()) * static_cast<double>(n_pred))) +
+                           " " + std::to_string(static_cast<int>(el)) + "s"));
+    }
+    if (end == N) break;
+  }
+  EvalReport r;
+  r.n_pred = n_pred;
+  r.n_chars = val.size();
+  r.n_windows = n_win;
+  r.vocab = c.vocab;
+  r.block = W;
+  r.n_params = static_cast<std::uint64_t>(model.n_params());
+  r.d_model = c.d_model;
+  r.d_ff = c.d_ff;
+  {
+    std::error_code ec;
+    r.file_bytes = std::filesystem::file_size(opts.ckpt, ec);
+  }
+  r.nats_per_token = nll / static_cast<double>(n_pred);
+  r.nats_per_char = nll / static_cast<double>(r.n_chars);
+  r.bpc = r.nats_per_char / 0.6931471805599453;  // ln 2
+  r.chars_per_token = static_cast<double>(r.n_chars) / static_cast<double>(n_pred);
+  if (log) {
+    const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    log("eval done windows=" + std::to_string(n_win) + " predicted=" + std::to_string(n_pred) + " in " +
+        std::to_string(el) + " s");
+    log("params " + std::to_string(r.n_params) + " file_bytes=" + std::to_string(r.file_bytes) + " vocab " +
+        std::to_string(r.vocab) + " window=" + std::to_string(W) + " stride=" + std::to_string(S));
+    log("nats/token " + std::to_string(r.nats_per_token) + "  nats/char " + std::to_string(r.nats_per_char) +
+        "  BPC " + std::to_string(r.bpc) + "  chars/tok " + std::to_string(r.chars_per_token));
+    log("compare: nanoGPT shakespeare-char ~10.7M  val ~1.47 nats/char  (~2.12 BPC) on last 10% of the same file");
+  }
+  return r;
+}
+
+Result<std::string> run_llama_generate(const CharLMOpts& opts, std::string prompt, int max_new, LogFn log) {
+  auto mt = open_llama(opts.ckpt, log);
+  if (!mt) return std::unexpected(mt.error());
+  auto& [model, tok] = *mt;
+  if (prompt.empty()) prompt = " ";
+  auto ids = tok->encode(prompt);
+  if (!ids) return std::unexpected(ids.error());
+  if (ids->empty()) return std::unexpected(make_error(Errc::invalid_shape, "prompt encodes to no tokens"));
+  const auto n_prompt = ids->size();
+  Rng sample_rng(2);
+  LlamaLM::GenStats st;
+  auto gen = model.generate(*ids, max_new, opts.temperature, &sample_rng, opts.kv_cache, model.config().eos_id, &st);
+  if (!gen) return std::unexpected(gen.error());
+  auto out = tok->decode(*gen);
+  if (log) {
+    log(out);
+    const auto nt = st.new_tokens;
+    if (opts.kv_cache) {
+      log("prompt " + std::to_string(n_prompt) + " tok prefill " + std::to_string(st.prefill_s) + " s; " +
+          std::to_string(nt) + " new tok, decode " +
+          (nt > 1 ? std::to_string(st.decode_s / static_cast<double>(nt - 1)) : std::string("n/a")) +
+          " s/token (KV cache)");
+    } else {
+      log("prompt " + std::to_string(n_prompt) + " tok; " + std::to_string(nt) + " new tok, " +
+          (nt > 0 ? std::to_string((st.prefill_s + st.decode_s) / static_cast<double>(nt)) : std::string("n/a")) +
+          " s/token (no KV cache: full recompute per token)");
+    }
+  }
+  return out;
+}
+
+Result<void> run_llama_logits(const CharLMOpts& opts, const std::string& prompt, const std::filesystem::path& out,
+                              LogFn log) {
+  auto mt = open_llama(opts.ckpt, log);
+  if (!mt) return std::unexpected(mt.error());
+  auto& [model, tok] = *mt;
+  auto ids = tok->encode(prompt);
+  if (!ids) return std::unexpected(ids.error());
+  if (ids->empty()) return std::unexpected(make_error(Errc::invalid_shape, "prompt encodes to no tokens"));
+  auto lg = model.forward_full(*ids);
+  if (!lg) return std::unexpected(lg.error());
+  std::ofstream f(out, std::ios::binary);
+  if (!f) return std::unexpected(make_error(Errc::io, out.string()));
+  f.write(reinterpret_cast<const char*>(lg->data()), static_cast<std::streamsize>(lg->size() * sizeof(float)));
+  if (log) {
+    std::string s = "ids";
+    for (auto id : *ids) s += " " + std::to_string(id);
+    log(s);
+    log("wrote " + std::to_string(ids->size()) + " x " + std::to_string(model.config().vocab) + " f32 logits to " +
+        out.string());
+  }
+  return {};
 }
 
 static CharLMConfig charlm_cfg_from_doc(const GyreDoc& d, const CharLMOpts& opts, std::int64_t vocab) {
@@ -332,7 +543,7 @@ Result<std::string> run_charlm_train(const CharLMOpts& opts, LogFn log) {
 
   auto run_steps = [&](std::uint32_t nsteps, Adam* adam) -> Result<void> {
     if (nsteps == 0) return {};
-    auto doc = make_charlm_doc(opts, model->config(), **tok, generation, param_count(*model), 0);
+    auto doc = make_charlm_doc(opts, model->config(), **tok, generation, param_count(*model), 0, holdout);
     doc.train_step = global_step;
     TrainConfig tc;
     tc.steps = nsteps;
@@ -379,7 +590,8 @@ Result<std::string> run_charlm_train(const CharLMOpts& opts, LogFn log) {
   auto persist = [&](const std::filesystem::path& path, std::uint64_t parent_n,
                      const Adam* adam) -> Result<void> {
     if (path.empty()) return {};
-    auto doc = make_charlm_doc(opts, model->config(), **tok, generation, param_count(*model), parent_n);
+    auto doc =
+        make_charlm_doc(opts, model->config(), **tok, generation, param_count(*model), parent_n, holdout);
     doc.train_step = global_step;
     return save_charlm_ckpt(*model, doc, global_step, adam, path, log);
   };
@@ -458,6 +670,7 @@ Result<std::string> run_charlm_generate(const CharLMOpts& opts_in, std::string p
                                         LogFn log) {
   CharLMOpts opts = opts_in;
   apply_charlm_preset(opts);
+  if (auto pk = peek_gyre(opts.ckpt); pk && pk->arch == "llama") return run_llama_generate(opts_in, prompt, max_new, log);
   auto dev = Device::open(opts.device);
   if (!dev) return std::unexpected(dev.error());
   auto peek = peek_gyre(opts.ckpt);
@@ -496,31 +709,33 @@ Result<std::string> run_charlm_generate(const CharLMOpts& opts_in, std::string p
 
 Result<void> run_charlm_export_onnx(const CharLMOpts& opts_in, const std::filesystem::path& onnx_path,
                                    LogFn log) {
-  CharLMOpts opts = opts_in;
-  apply_charlm_preset(opts);
+  // The checkpoint's own document decides the architecture (pruned widths,
+  // block, recency), the same way generate/eval do. The CLI options (already
+  // preset + overrides from main) only fill in fields an old doc lacks; we do
+  // not re-apply the preset here, which would drop --d-model etc.
+  const CharLMOpts& opts = opts_in;
   auto dev = Device::cpu();
   if (!dev) return std::unexpected(dev.error());
-  CharLMConfig cfg;
-  cfg.vocab = (opts.preset == "tinygpt") ? 256 : 0;
-  if (cfg.vocab == 0) {
-    auto peek = peek_gyre1(opts.ckpt);
-    if (peek) {
-      auto t = Tokenizer::from_json(peek->json);
-      if (t) cfg.vocab = (*t)->vocab_size();
-    }
-    if (cfg.vocab == 0) {
-      auto text = load_text(opts.data);
-      auto tok = Tokenizer::chars_from_text(text);
-      if (!tok) return std::unexpected(tok.error());
-      cfg.vocab = (*tok)->vocab_size();
-    }
+  auto peek = peek_gyre(opts.ckpt);
+  if (!peek) return std::unexpected(peek.error());
+  std::int64_t vocab = 0;
+  if (auto t = Tokenizer::from_json(peek->to_json()); t) vocab = (*t)->vocab_size();
+  if (vocab == 0) {
+    if (auto c = parse_json(peek->config_json); c) vocab = c->value("vocab_size", std::int64_t{0});
   }
-  cfg.block_size = opts.block;
-  cfg.n_layer = opts.n_layer;
-  cfg.n_head = opts.n_head;
-  cfg.d_model = opts.d_model;
-  cfg.d_ff = opts.d_ff;
-  cfg.recency_alibi = opts.recency_alibi;
+  if (vocab == 0 && opts.preset == "tinygpt") vocab = 256;
+  if (vocab == 0) {
+    auto text = load_text(opts.data);
+    auto tok = Tokenizer::chars_from_text(text);
+    if (!tok) return std::unexpected(tok.error());
+    vocab = (*tok)->vocab_size();
+  }
+  auto cfg = charlm_cfg_from_doc(*peek, opts, vocab);
+  cfg.dropout = 0.f;  // export is inference only
+  if (log)
+    log("export vocab " + std::to_string(cfg.vocab) + " T=" + std::to_string(cfg.block_size) +
+        " L=" + std::to_string(cfg.n_layer) + " d=" + std::to_string(cfg.d_model) +
+        " d_ff=" + std::to_string(cfg.d_ff) + (cfg.recency_alibi ? " recency=alibi" : " recency=none"));
   Rng rng(1);
   auto model = CharLM::create(cfg, *dev, rng);
   if (!model) return std::unexpected(model.error());
@@ -536,6 +751,7 @@ Result<void> run_charlm_export_onnx(const CharLMOpts& opts_in, const std::filesy
 Result<EvalReport> run_charlm_eval(const CharLMOpts& opts_in, double split, LogFn log) {
   CharLMOpts opts = opts_in;
   apply_charlm_preset(opts);
+  if (auto pk = peek_gyre(opts.ckpt); pk && pk->arch == "llama") return run_llama_eval(opts_in, split, log);
   auto dev = Device::open(opts.device);
   if (!dev) return std::unexpected(dev.error());
   auto peek = peek_gyre(opts.ckpt);

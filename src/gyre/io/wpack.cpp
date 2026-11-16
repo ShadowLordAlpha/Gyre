@@ -3,6 +3,7 @@
 #include "gyre/io/compress_probe.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 
@@ -139,10 +140,15 @@ std::vector<std::byte> encode_plane_exc(std::span<const std::uint16_t> w) {
   return o;
 }
 
-Result<std::vector<std::byte>> decode_plane_exc(std::span<const std::byte> p) {
+// Decoders take max_bytes: the output size the caller expects at most. Counts in
+// the payload are untrusted and must not drive an unbounded allocation.
+Result<std::vector<std::byte>> decode_plane_exc(std::span<const std::byte> p, std::size_t max_bytes) {
   std::size_t i = 0;
   if (p.size() < 6) return std::unexpected(make_error(Errc::ckpt_corrupt, "plane_exc"));
   const auto n = rd_u32(p, i);
+  if (static_cast<std::uint64_t>(n) * 2 > max_bytes) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "plane_exc size"));
+  }
   const auto majority = rd_u16(p, i);
   std::vector<std::uint16_t> w(n, 0);
   const auto dense_bytes = (static_cast<std::size_t>(n) + 7) / 8;
@@ -154,16 +160,16 @@ Result<std::vector<std::byte>> decode_plane_exc(std::span<const std::byte> p) {
       for (auto& x : w) x = static_cast<std::uint16_t>(x | (1u << b));
     }
     if (kind == kPlaneList) {
-      if (i + 4 > p.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "plane"));
+      if (p.size() - i < 4) return std::unexpected(make_error(Errc::ckpt_corrupt, "plane"));
       const auto ne = rd_u32(p, i);
       for (std::uint32_t e = 0; e < ne; ++e) {
-        if (i + 4 > p.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "exc"));
+        if (p.size() - i < 4) return std::unexpected(make_error(Errc::ckpt_corrupt, "exc"));
         auto idx = rd_u32(p, i);
         if (idx >= n) return std::unexpected(make_error(Errc::ckpt_corrupt, "exc idx"));
         w[idx] ^= static_cast<std::uint16_t>(1u << b);
       }
     } else if (kind == kPlaneDense) {
-      if (i + dense_bytes > p.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "dense"));
+      if (dense_bytes > p.size() - i) return std::unexpected(make_error(Errc::ckpt_corrupt, "dense"));
       for (std::uint32_t k = 0; k < n; ++k) {
         const auto by = static_cast<std::uint8_t>(p[i + k / 8]);
         if (by & (1u << (k % 8))) w[k] ^= static_cast<std::uint16_t>(1u << b);
@@ -211,16 +217,28 @@ std::vector<std::byte> encode_exp_alpha(std::span<const std::uint16_t> w) {
   return o;
 }
 
-Result<std::vector<std::byte>> decode_exp_alpha(std::span<const std::byte> p) {
+Result<std::vector<std::byte>> decode_exp_alpha(std::span<const std::byte> p, std::size_t max_bytes) {
   std::size_t i = 0;
   if (p.size() < 6) return std::unexpected(make_error(Errc::ckpt_corrupt, "exp_alpha"));
   const auto n = rd_u32(p, i);
-  std::uint16_t nalpha = rd_u8(p, i);
-  const auto ebits = rd_u8(p, i);
+  if (static_cast<std::uint64_t>(n) * 2 > max_bytes) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "exp_alpha size"));
+  }
+  std::size_t nalpha = rd_u8(p, i);
+  const int ebits = rd_u8(p, i);
+  // A full 256-symbol alphabet is written as 0 with ebits 8. ebits never
+  // exceeds 8 (the alphabet has at most 256 entries).
+  if (ebits > 8) return std::unexpected(make_error(Errc::ckpt_corrupt, "exp_alpha bits"));
   if (nalpha == 0 && ebits == 8) nalpha = 256;
-  if (i + nalpha > p.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "alphabet"));
+  if (nalpha > p.size() - i) return std::unexpected(make_error(Errc::ckpt_corrupt, "alphabet"));
   std::vector<std::uint8_t> alpha(nalpha);
-  for (std::uint8_t k = 0; k < nalpha; ++k) alpha[k] = rd_u8(p, i);
+  for (std::size_t k = 0; k < nalpha; ++k) alpha[k] = rd_u8(p, i);
+  // Each value takes 1 + ebits + 7 bits; refuse counts the payload cannot hold
+  // before allocating the output.
+  const auto need_bits = static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(8 + ebits);
+  if (need_bits > static_cast<std::uint64_t>(p.size() - i) * 8) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "exp_alpha count"));
+  }
   BitReader br;
   br.s = p.subspan(i);
   std::vector<std::uint16_t> w(n);
@@ -354,25 +372,31 @@ std::vector<std::byte> encode_lfsr_pred(std::span<const std::uint16_t> w) {
   return o;
 }
 
-Result<std::vector<std::byte>> decode_lfsr_pred(std::span<const std::byte> p) {
+Result<std::vector<std::byte>> decode_lfsr_pred(std::span<const std::byte> p, std::size_t max_bytes) {
   std::size_t i = 0;
   if (p.size() < 12) return std::unexpected(make_error(Errc::ckpt_corrupt, "lfsr_pred"));
   const auto n = rd_u32(p, i);
   const auto C = rd_u16(p, i);
   const auto nblocks = rd_u16(p, i);
-  if (!C || nblocks != (n + C - 1) / C) return std::unexpected(make_error(Errc::ckpt_corrupt, "lfsr blocks"));
-  if (i + static_cast<std::size_t>(nblocks) * 2 + 5 > p.size()) {
+  if (static_cast<std::uint64_t>(n) * 2 > max_bytes) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "lfsr size"));
+  }
+  if (!C || nblocks != (static_cast<std::uint64_t>(n) + C - 1) / C) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "lfsr blocks"));
+  }
+  if (static_cast<std::size_t>(nblocks) * 2 + 5 > p.size() - i) {
     return std::unexpected(make_error(Errc::ckpt_corrupt, "lfsr seeds"));
   }
   std::vector<std::uint16_t> seeds(nblocks);
   for (std::uint16_t b = 0; b < nblocks; ++b) seeds[b] = rd_u16(p, i);
   const auto inner_c = rd_u8(p, i);
   const auto ilen = rd_u32(p, i);
-  if (i + ilen > p.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "lfsr inner"));
+  if (ilen > p.size() - i) return std::unexpected(make_error(Errc::ckpt_corrupt, "lfsr inner"));
   auto inner = p.subspan(i, ilen);
+  const auto want = static_cast<std::size_t>(n) * 2;
   Result<std::vector<std::byte>> dec = std::unexpected(make_error(Errc::unsupported, "lfsr inner"));
-  if (inner_c == static_cast<std::uint8_t>(WpackCodec::plane_exc)) dec = decode_plane_exc(inner);
-  else if (inner_c == static_cast<std::uint8_t>(WpackCodec::exp_alpha)) dec = decode_exp_alpha(inner);
+  if (inner_c == static_cast<std::uint8_t>(WpackCodec::plane_exc)) dec = decode_plane_exc(inner, want);
+  else if (inner_c == static_cast<std::uint8_t>(WpackCodec::exp_alpha)) dec = decode_exp_alpha(inner, want);
   else if (inner_c == static_cast<std::uint8_t>(WpackCodec::identity)) {
     dec = std::vector<std::byte>(inner.begin(), inner.end());
   }
@@ -548,10 +572,11 @@ std::vector<std::byte> encode_const_lane(std::span<const std::byte> raw) {
   return o;
 }
 
-Result<std::vector<std::byte>> decode_const_lane(std::span<const std::byte> p) {
+Result<std::vector<std::byte>> decode_const_lane(std::span<const std::byte> p, std::size_t max_bytes) {
   std::size_t i = 0;
   if (p.size() < 24) return std::unexpected(make_error(Errc::ckpt_corrupt, "const_lane"));
   const auto n = rd_u32(p, i);
+  if (n > max_bytes) return std::unexpected(make_error(Errc::ckpt_corrupt, "const_lane size"));
   const auto stride = rd_u8(p, i);
   const auto lane = rd_u8(p, i);
   const auto c = rd_u8(p, i);
@@ -562,8 +587,8 @@ Result<std::vector<std::byte>> decode_const_lane(std::span<const std::byte> p) {
   if (!stride || lane >= stride || (k != 2 && k != 4)) {
     return std::unexpected(make_error(Errc::ckpt_corrupt, "const_lane hdr"));
   }
-  const auto excsz = static_cast<std::size_t>(nexc) * (k + 1);
-  if (i + excsz + 5 > p.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "const_lane exc"));
+  const auto excsz = static_cast<std::uint64_t>(nexc) * (k + 1u);
+  if (excsz + 5 > p.size() - i) return std::unexpected(make_error(Errc::ckpt_corrupt, "const_lane exc"));
   std::vector<std::uint32_t> exc_i(nexc);
   std::vector<std::uint8_t> exc_v(nexc);
   for (std::uint32_t e = 0; e < nexc; ++e) {
@@ -573,17 +598,17 @@ Result<std::vector<std::byte>> decode_const_lane(std::span<const std::byte> p) {
   }
   const auto inner_c = rd_u8(p, i);
   const auto ilen = rd_u32(p, i);
-  if (i + ilen > p.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "const_lane left"));
+  if (ilen > p.size() - i) return std::unexpected(make_error(Errc::ckpt_corrupt, "const_lane left"));
   auto inner = p.subspan(i, ilen);
   std::vector<std::byte> leftover;
   if (inner_c == static_cast<std::uint8_t>(WpackCodec::identity)) {
     leftover.assign(inner.begin(), inner.end());
   } else if (inner_c == static_cast<std::uint8_t>(WpackCodec::plane_exc)) {
-    auto d = decode_plane_exc(inner);
+    auto d = decode_plane_exc(inner, n);
     if (!d) return std::unexpected(d.error());
     leftover = std::move(*d);
   } else if (inner_c == static_cast<std::uint8_t>(WpackCodec::exp_alpha)) {
-    auto d = decode_exp_alpha(inner);
+    auto d = decode_exp_alpha(inner, n);
     if (!d) return std::unexpected(d.error());
     leftover = std::move(*d);
   } else {
@@ -651,12 +676,19 @@ Result<WpackTensor> wpack_encode(std::string name, DType dtype, std::span<const 
 }
 
 Result<std::vector<std::byte>> wpack_decode(const WpackTensor& t) {
-  if (t.codec == WpackCodec::identity) return t.payload;
-  if (t.codec == WpackCodec::plane_exc) return decode_plane_exc(t.payload);
-  if (t.codec == WpackCodec::exp_alpha) return decode_exp_alpha(t.payload);
-  if (t.codec == WpackCodec::lfsr_pred) return decode_lfsr_pred(t.payload);
-  if (t.codec == WpackCodec::const_lane) return decode_const_lane(t.payload);
-  return std::unexpected(make_error(Errc::unsupported, "wpack codec"));
+  // raw_bytes caps every allocation the decoder makes, and the result must
+  // match it exactly.
+  const auto cap = static_cast<std::size_t>(std::min<std::uint64_t>(t.raw_bytes, SIZE_MAX));
+  Result<std::vector<std::byte>> out = std::unexpected(make_error(Errc::unsupported, "wpack codec"));
+  if (t.codec == WpackCodec::identity) out = t.payload;
+  else if (t.codec == WpackCodec::plane_exc) out = decode_plane_exc(t.payload, cap);
+  else if (t.codec == WpackCodec::exp_alpha) out = decode_exp_alpha(t.payload, cap);
+  else if (t.codec == WpackCodec::lfsr_pred) out = decode_lfsr_pred(t.payload, cap);
+  else if (t.codec == WpackCodec::const_lane) out = decode_const_lane(t.payload, cap);
+  if (out && out->size() != t.raw_bytes) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, "wpack decoded size"));
+  }
+  return out;
 }
 
 Result<void> wpack_save(const std::filesystem::path& path, const WpackFile& file) {
@@ -694,31 +726,51 @@ Result<WpackFile> wpack_load(const std::filesystem::path& path) {
   if (s.size() < 14 || std::memcmp(s.data(), "GYWP1", 5) != 0) {
     return std::unexpected(make_error(Errc::ckpt_corrupt, "wpack magic"));
   }
+  // Every length and count below is untrusted: check that it fits in what is
+  // left of the file before reading or allocating.
   std::size_t i = 8;
+  const auto corrupt = [](const char* what) {
+    return std::unexpected(make_error(Errc::ckpt_corrupt, what));
+  };
+  const auto left = [&] { return s.size() - i; };
   auto ver = rd_u32(s, i);
   if (ver != 1) return std::unexpected(make_error(Errc::unsupported, "wpack version"));
   auto sl = rd_u16(s, i);
+  if (sl > left()) return corrupt("wpack source");
   WpackFile f;
   f.source.assign(reinterpret_cast<const char*>(s.data() + i), sl);
   i += sl;
+  if (left() < 4) return corrupt("wpack count");
   auto n = rd_u32(s, i);
+  // Fixed per-tensor header: name_len(2) dtype(1) ndim(1) dims(64) codec(1) raw(8) plen(8).
+  constexpr std::size_t kTensorHdr = 2 + 1 + 1 + 64 + 1 + 8 + 8;
+  if (n > left() / kTensorHdr) return corrupt("wpack count");
   f.tensors.reserve(n);
   for (std::uint32_t t = 0; t < n; ++t) {
     WpackTensor wt;
+    if (left() < 2) return corrupt("wpack name");
     auto nl = rd_u16(s, i);
+    if (nl > left() || left() - nl < kTensorHdr - 2) return corrupt("wpack name");
     wt.name.assign(reinterpret_cast<const char*>(s.data() + i), nl);
     i += nl;
-    wt.dtype = static_cast<DType>(rd_u8(s, i));
+    const auto dt = rd_u8(s, i);
+    if (dt < static_cast<std::uint8_t>(DType::f32) || dt > static_cast<std::uint8_t>(DType::u8)) {
+      return corrupt("wpack dtype");
+    }
+    wt.dtype = static_cast<DType>(dt);
     auto ndim = rd_u8(s, i);
+    if (ndim > 8) return corrupt("wpack rank");
     wt.shape.resize(ndim);
     for (int k = 0; k < 8; ++k) {
       auto v = static_cast<std::int64_t>(rd_u64(s, i));
       if (k < ndim) wt.shape[static_cast<std::size_t>(k)] = v;
     }
-    wt.codec = static_cast<WpackCodec>(rd_u8(s, i));
+    const auto codec = rd_u8(s, i);
+    if (codec > static_cast<std::uint8_t>(WpackCodec::const_lane)) return corrupt("wpack codec");
+    wt.codec = static_cast<WpackCodec>(codec);
     wt.raw_bytes = rd_u64(s, i);
     auto plen = rd_u64(s, i);
-    if (i + plen > s.size()) return std::unexpected(make_error(Errc::ckpt_corrupt, "wpack payload"));
+    if (plen > left()) return corrupt("wpack payload");
     wt.payload.assign(s.begin() + static_cast<std::ptrdiff_t>(i),
                       s.begin() + static_cast<std::ptrdiff_t>(i + plen));
     i += static_cast<std::size_t>(plen);

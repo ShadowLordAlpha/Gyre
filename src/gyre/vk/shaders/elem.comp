@@ -58,5 +58,7 @@ void main() {
     z[i] = pc.f0 * tanh(x[i] / pc.f0);
   } else if (op == 10u) {
     z[i] = x[i] + y[i % cols];
+  } else if (op == 11u) {
+    z[i] *= pc.f0;
   }
 }
